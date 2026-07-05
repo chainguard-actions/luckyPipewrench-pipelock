@@ -1,0 +1,298 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'  # Semver only — excludes floating tags like v1, v2
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: '1.25.11'
+          check-latest: true
+
+      - name: Verify Go version
+        run: |
+          got="$(go env GOVERSION)"
+          echo "GOVERSION=$got"
+          test "$got" = "go1.25.11"
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Run release audit
+        run: make release-audit
+
+      - name: Run runtime-critical packages
+        run: make test-runtime-critical
+
+      - name: Run runtime policy audit
+        run: make runtime-policy-audit
+
+      - name: Run tests
+        run: go test -race -count=1 ./...
+
+      - name: Run enterprise-tagged tests
+        run: go test -race -count=1 -tags enterprise ./...
+
+      - name: Login to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: 'v2.6.1'
+
+      - name: Set GOVERSION
+        run: echo "GOVERSION=$(go env GOVERSION)" >> "$GITHUB_ENV"
+
+      - name: Verify embedded public keys are configured
+        env:
+          LICENSE_PUBLIC_KEY: ${{ secrets.LICENSE_PUBLIC_KEY }}
+          RULES_KEYRING_HEX: ${{ secrets.RULES_KEYRING_HEX }}
+          RELEASE_KEYRING_HEX: ${{ secrets.RELEASE_KEYRING_HEX }}
+        run: |
+          test -n "$LICENSE_PUBLIC_KEY" || {
+            echo "::error::LICENSE_PUBLIC_KEY secret is required for release builds"
+            exit 1
+          }
+          test -n "$RULES_KEYRING_HEX" || {
+            echo "::error::RULES_KEYRING_HEX secret is required for release builds"
+            exit 1
+          }
+          test -n "$RELEASE_KEYRING_HEX" || {
+            echo "::error::RELEASE_KEYRING_HEX secret is required for self-update release verification"
+            exit 1
+          }
+          case "$LICENSE_PUBLIC_KEY" in
+            *[!0123456789abcdefABCDEF]*)
+              echo "::error::LICENSE_PUBLIC_KEY must be a raw Ed25519 public key encoded as hex"
+              exit 1
+              ;;
+          esac
+          test "${#LICENSE_PUBLIC_KEY}" -eq 64 || {
+            echo "::error::LICENSE_PUBLIC_KEY must be 64 hex characters"
+            exit 1
+          }
+          if [[ ! "$RULES_KEYRING_HEX" =~ ^[0-9A-Fa-f]{64}(,[0-9A-Fa-f]{64})*$ ]]; then
+            echo "::error::RULES_KEYRING_HEX must be one or more 64-hex Ed25519 public keys separated by commas"
+            exit 1
+          fi
+          if [[ ! "$RELEASE_KEYRING_HEX" =~ ^[0-9A-Fa-f]{64}(,[0-9A-Fa-f]{64})*$ ]]; then
+            echo "::error::RELEASE_KEYRING_HEX must be one or more 64-hex Ed25519 public keys separated by commas"
+            exit 1
+          fi
+          license_public_key_normalized="${LICENSE_PUBLIC_KEY,,}"
+          IFS=',' read -r -a rules_keys <<< "$RULES_KEYRING_HEX"
+          for key in "${rules_keys[@]}"; do
+            test -n "$key" || {
+              echo "::error::RULES_KEYRING_HEX contains an empty key entry"
+              exit 1
+            }
+            test "${#key}" -eq 64 || {
+              echo "::error::RULES_KEYRING_HEX entries must be 64 hex characters"
+              exit 1
+            }
+            test "${key,,}" != "$license_public_key_normalized" || {
+              echo "::error::LICENSE_PUBLIC_KEY must not appear in RULES_KEYRING_HEX"
+              exit 1
+            }
+          done
+          IFS=',' read -r -a release_keys <<< "$RELEASE_KEYRING_HEX"
+          for key in "${release_keys[@]}"; do
+            test -n "$key" || {
+              echo "::error::RELEASE_KEYRING_HEX contains an empty key entry"
+              exit 1
+            }
+            test "${#key}" -eq 64 || {
+              echo "::error::RELEASE_KEYRING_HEX entries must be 64 hex characters"
+              exit 1
+            }
+            test "${key,,}" != "$license_public_key_normalized" || {
+              echo "::error::LICENSE_PUBLIC_KEY must not appear in RELEASE_KEYRING_HEX"
+              exit 1
+            }
+            for rules_key in "${rules_keys[@]}"; do
+              test "${key,,}" != "${rules_key,,}" || {
+                echo "::error::RELEASE_KEYRING_HEX must not reuse a rules signing key"
+                exit 1
+              }
+            done
+          done
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@1a80836c5c9d9e5755a25cb59ec6f45a3b5f41a8 # v7.2.1
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GOVERSION: ${{ env.GOVERSION }}
+          LICENSE_PUBLIC_KEY: ${{ secrets.LICENSE_PUBLIC_KEY }}
+          RULES_KEYRING_HEX: ${{ secrets.RULES_KEYRING_HEX }}
+          RELEASE_KEYRING_HEX: ${{ secrets.RELEASE_KEYRING_HEX }}
+
+      - name: Generate and upload self-update release manifest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_KEYRING_HEX: ${{ secrets.RELEASE_KEYRING_HEX }}
+        run: |
+          go run ./cmd/pipelock-release-manifest \
+            -dist dist \
+            -tag "$GITHUB_REF_NAME" \
+            -commit "$GITHUB_SHA"
+          gh release upload "$GITHUB_REF_NAME" dist/release.json --clobber
+
+      - name: Generate SBOM
+        run: |
+          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.9.0
+          cyclonedx-gomod mod -json -output sbom.cdx.json
+
+      - name: Upload SBOM to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" sbom.cdx.json --clobber
+
+      # Attestation steps use continue-on-error so one failure doesn't
+      # cascade and kill the rest. The final verification step checks
+      # that ALL attestation steps succeeded (binaries, checksums,
+      # and all container images).
+      - name: Attest binary archives
+        id: attest-binaries
+        continue-on-error: true
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: dist/pipelock_*.tar.gz
+
+      - name: Attest checksums
+        id: attest-checksums
+        continue-on-error: true
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: dist/checksums.txt
+
+      - name: Attest SBOM
+        continue-on-error: true
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/pipelock_*.tar.gz
+          sbom-path: sbom.cdx.json
+
+      - name: Get container digest
+        id: digest
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          go install github.com/google/go-containerregistry/cmd/crane@v0.20.7
+          if ! DIGEST=$(crane digest "ghcr.io/luckypipewrench/pipelock:${TAG}" 2>/dev/null); then
+            echo "::warning::Failed to resolve container digest for tag ${TAG}"
+            echo "digest=" >> "$GITHUB_OUTPUT"
+          else
+            echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attest container image
+        id: attest-pipelock-container
+        if: steps.digest.outputs.digest != ''
+        continue-on-error: true
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ghcr.io/luckypipewrench/pipelock
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: true
+
+      - name: Get pipelock-init container digest
+        id: init-digest
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          if ! DIGEST=$(crane digest "ghcr.io/luckypipewrench/pipelock-init:${TAG}" 2>/dev/null); then
+            echo "::warning::Failed to resolve pipelock-init container digest for tag ${TAG}"
+            echo "digest=" >> "$GITHUB_OUTPUT"
+          else
+            echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attest pipelock-init container image
+        id: attest-pipelock-init-container
+        if: steps.init-digest.outputs.digest != ''
+        continue-on-error: true
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ghcr.io/luckypipewrench/pipelock-init
+          subject-digest: ${{ steps.init-digest.outputs.digest }}
+          push-to-registry: true
+
+      - name: Get license-service container digest
+        id: license-service-digest
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          if ! DIGEST=$(crane digest "ghcr.io/luckypipewrench/pipelock-license-service:${TAG}" 2>/dev/null); then
+            echo "::warning::Failed to resolve license-service container digest for tag ${TAG}"
+            echo "digest=" >> "$GITHUB_OUTPUT"
+          else
+            echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attest license-service container image
+        id: attest-license-service-container
+        if: steps.license-service-digest.outputs.digest != ''
+        continue-on-error: true
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ghcr.io/luckypipewrench/pipelock-license-service
+          subject-digest: ${{ steps.license-service-digest.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify attestation
+        if: >-
+          steps.attest-binaries.outcome == 'failure' ||
+          steps.attest-checksums.outcome == 'failure' ||
+          steps.attest-pipelock-container.outcome == 'failure' ||
+          steps.attest-pipelock-init-container.outcome == 'failure' ||
+          steps.attest-license-service-container.outcome == 'failure'
+        run: |
+          echo "::error::Attestation failed — release provenance is incomplete"
+          exit 1
+
+      # Move the v2 floating tag so `uses: luckyPipewrench/pipelock@v2`
+      # always resolves to the latest release. Safe because the trigger
+      # is v*.*.* which won't re-fire on the v2 push.
+      - name: Update v2 floating tag for GitHub Action
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # The ^{} suffix dereferences TAG_NAME (annotated tag) to its commit.
+          # Without it, git tag -fa v2 "${TAG_NAME}" creates a nested tag
+          # (v2 -> v2.2.0 -> commit) which clutters ls-remote and some tooling rejects it.
+          git tag -fa v2 "${TAG_NAME}^{}" -m "Update v2 to ${TAG_NAME}"
+          git push origin v2 --force

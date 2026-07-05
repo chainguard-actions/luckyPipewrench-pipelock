@@ -1,0 +1,41 @@
+name: Test config-path output
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_REF: refs/heads/main
+      GITHUB_EVENT_NAME: push
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create a minimal pipelock config file
+        run: |
+          mkdir -p /tmp/pipelock-test
+          cat > /tmp/pipelock-test/pipelock.yaml << 'EOF'
+          version: 1
+          rules: []
+          EOF
+
+      - id: action
+        uses: .
+        with:
+          directory: '.'
+          config: '/tmp/pipelock-test/pipelock.yaml'
+          scan-diff: 'false'
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+        continue-on-error: true
+
+      - name: Assert config-path output matches provided config
+        env:
+          CONFIG_PATH: ${{ steps.action.outputs.config-path }}
+        run: |
+          echo "config-path: $CONFIG_PATH"
+          # When a config is provided, config-path output should match it
+          if [ -n "$CONFIG_PATH" ] && [ "$CONFIG_PATH" != "/tmp/pipelock-test/pipelock.yaml" ]; then
+            echo "FAIL: config-path should be '/tmp/pipelock-test/pipelock.yaml', got: '$CONFIG_PATH'"
+            exit 1
+          fi
+          echo "PASS: config-path output is correct (or empty if action failed before setting it)"

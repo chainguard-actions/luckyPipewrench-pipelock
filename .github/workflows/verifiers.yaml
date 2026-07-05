@@ -1,0 +1,370 @@
+name: Verifiers
+
+# Gates the TypeScript and Rust reference verifiers under sdk/verifiers/.
+# The Go conformance suite under sdk/conformance/ is already gated by the
+# existing CI workflow's `test` job. This file adds matching CI coverage
+# for the non-Go reference verifiers so changes that break either one fail
+# at the PR stage instead of merging silently.
+#
+# Security note: no run: step in this workflow consumes untrusted
+# github.event.* input. Every command runs over repo-controlled paths.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'cmd/pipelock/**'
+      - 'cmd/pipelock-verifier/**'
+      - 'internal/aarp/**'
+      - 'internal/cli/contain/**'
+      - 'internal/jsonscan/**'
+      - 'internal/receipt/**'
+      - 'internal/recorder/**'
+      - 'sdk/verifiers/**'
+      - 'sdk/audit-packet/**'
+      - 'sdk/conformance/**'
+      - '.github/workflows/verifiers.yaml'
+  pull_request:
+    paths:
+      - 'cmd/pipelock/**'
+      - 'cmd/pipelock-verifier/**'
+      - 'internal/aarp/**'
+      - 'internal/cli/contain/**'
+      - 'internal/jsonscan/**'
+      - 'internal/receipt/**'
+      - 'internal/recorder/**'
+      - 'sdk/verifiers/**'
+      - 'sdk/audit-packet/**'
+      - 'sdk/conformance/**'
+      - '.github/workflows/verifiers.yaml'
+
+concurrency:
+  group: verifiers-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  typescript:
+    name: TypeScript verifier
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: sdk/verifiers/ts
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: sdk/verifiers/ts/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Format check
+        run: npm run format:check
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      # Regression guard for the publish path: assert the npm tarball actually
+      # contains the CLI entrypoint and the bundled Audit Packet v0 schema, so a
+      # consumer's `npm install` yields a working offline verifier.
+      - name: Verify npm package contents
+        run: |
+          npm pack --dry-run --json > pack-manifest.json
+          node -e "const pkg=require('./package.json'); const m=require('./pack-manifest.json')[0].files.map(f=>f.path); for (const need of ['dist/src/cli.js','dist/src/v0.schema.json']) { if(!m.includes(need)){ console.error('MISSING from npm package:',need); process.exit(1);} } if(pkg.bin?.['pipelock-verifier-ts']!=='dist/src/cli.js'){ console.error('bad bin mapping (npm strips a leading ./):',JSON.stringify(pkg.bin)); process.exit(1);} console.log('npm package contains CLI + bundled schema + valid bin');"
+          rm -f pack-manifest.json
+
+  rust:
+    name: Rust verifier
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sdk/verifiers/rust
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      # Pin to Rust 1.95.0 so local Fedora-packaged rustc/rustfmt (currently
+      # 1.95.0 / rustfmt 1.9.0) agrees with CI on fmt and clippy output.
+      # Bump in lockstep with `dnf` package updates; do not chase stable
+      # silently because rustfmt rules tighten each release.
+      - name: Set up Rust 1.95.0 + rustfmt + clippy
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.95.0
+
+      - name: Cache cargo
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sdk/verifiers/rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('sdk/verifiers/rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # The crate embeds the Audit Packet v0 schema at compile time and must be
+      # self-contained for `cargo publish` (cargo only packages files inside the
+      # crate root). The schema is therefore vendored at sdk/verifiers/rust/
+      # audit-packet-v0.json. Fail if it drifts from the canonical source so the
+      # published crate can never verify against a stale schema.
+      - name: Schema vendor drift guard
+        run: |
+          if ! cmp -s audit-packet-v0.json ../../audit-packet/v0.json; then
+            echo "::error::sdk/verifiers/rust/audit-packet-v0.json drifted from sdk/audit-packet/v0.json"
+            echo "Re-vendor with: cp sdk/audit-packet/v0.json sdk/verifiers/rust/audit-packet-v0.json"
+            diff -u ../../audit-packet/v0.json audit-packet-v0.json || true
+            exit 1
+          fi
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --release
+
+      - name: cargo build
+        run: cargo build --release
+
+      # Regression guard for the publish path: `cargo package` builds the crate
+      # from the packaged tarball in isolation, proving it is self-contained for
+      # `cargo install` (would have caught the out-of-crate schema include_str!).
+      - name: cargo package (verify crate is publishable + self-contained)
+        run: cargo package --locked
+
+  # Cross-language conformance gate: builds all four reference verifiers (Go,
+  # TypeScript, Rust, Python) and runs them over the vendored conformance corpus
+  # under sdk/conformance/testdata/corpus, failing if they disagree on any
+  # single-receipt fixture (a cross-language differential) or diverge from the
+  # fixture's expected verdict outside the documented policy carve-outs. It also
+  # guards the vendored corpus against drift from the agent-egress-bench master.
+  #
+  # The corpus master lives in agent-egress-bench and the Python verifier lives
+  # in pipelock-verify-python; both are public and checked out here at pinned
+  # commits. For coordinated corpus/verifier changes, land those repos first,
+  # then bump these refs deliberately in the pipelock PR.
+  conformance:
+    name: Cross-language conformance gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout pipelock
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Checkout agent-egress-bench (corpus master)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          repository: luckyPipewrench/agent-egress-bench
+          ref: 7f7601ce3c8eaa6182c01632ea7fb678fc0d2be9
+          path: _aeb
+          persist-credentials: false
+
+      - name: Checkout pipelock-verify-python (Python verifier)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          repository: luckyPipewrench/pipelock-verify-python
+          ref: dd900c05d6f1ea21e46cd01d3e1460d4c9a860c1
+          path: _pyverify
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: '1.26'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: sdk/verifiers/ts/package-lock.json
+
+      - name: Set up Rust 1.95.0
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Drift guard (vendored corpus vs agent-egress-bench master)
+        run: AEB_LOCAL="$GITHUB_WORKSPACE/_aeb" bash sdk/conformance/check-corpus-drift.sh
+
+      - name: Build Go verifier
+        run: go build -o "$RUNNER_TEMP/pipelock" ./cmd/pipelock
+
+      - name: Build TypeScript verifier
+        working-directory: sdk/verifiers/ts
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build Rust verifier
+        working-directory: sdk/verifiers/rust
+        run: cargo build --release
+
+      - name: Install Python verifier dependencies (hash-pinned)
+        # Scorecard Pinned-Dependencies: every dependency installed here is
+        # locked with --require-hashes. The verifier package itself is NOT
+        # pip-installed: a local `pip install .` cannot be hash-pinned, so
+        # Scorecard flags it on every run regardless of --no-deps. Instead the
+        # pure-Python package is run from its pinned checkout via PYTHONPATH in
+        # the conformance gate below, so no unpinned install command ever runs.
+        run: pip install --require-hashes -r "$GITHUB_WORKSPACE/sdk/conformance/pyverify-requirements.txt"
+
+      - name: Run cross-language conformance gate
+        env:
+          GO_VERIFY: ${{ runner.temp }}/pipelock verify-receipt
+          TS_VERIFY: node ${{ github.workspace }}/sdk/verifiers/ts/dist/src/cli.js receipt
+          RUST_VERIFY: ${{ github.workspace }}/sdk/verifiers/rust/target/release/pipelock-verifier-rs receipt
+          # -P keeps the repo root off sys.path so only the pinned checkout is used.
+          PY_VERIFY: python -P -m pipelock_verify
+          # Run the verifier from its pinned checkout without installing it.
+          PYTHONPATH: ${{ github.workspace }}/_pyverify
+        run: bash sdk/conformance/corpus-gate.sh
+
+  # Cross-language AARP gate: builds all four AARP reference verifiers (Go,
+  # TypeScript, Rust, Python) and runs them over the AARP assurance-envelope
+  # hostile corpus under sdk/conformance/testdata/aarp-corpus. It fails if the
+  # four verifiers disagree on a fixture's comparable appraisal (a cross-language
+  # claim-inflation differential) or if any verifier fails to reject a fatal
+  # fixture. The Python verifier here is the in-repo sdk/verifiers/python package
+  # (distinct from the external v1 pyverify repo used by the conformance job).
+  #
+  # Security note: no run: step consumes untrusted github.event.* input.
+  aarp-conformance:
+    name: AARP cross-language gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout pipelock
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: '1.26'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: sdk/verifiers/ts/package-lock.json
+
+      - name: Set up Rust 1.95.0
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Build Go AARP verifier
+        run: go build -o "$RUNNER_TEMP/pipelock-verifier" ./cmd/pipelock-verifier
+
+      - name: Build TypeScript verifier
+        working-directory: sdk/verifiers/ts
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build Rust verifier
+        working-directory: sdk/verifiers/rust
+        run: cargo build --release
+
+      - name: Install Python AARP verifier dependencies (hash-pinned)
+        working-directory: sdk/verifiers/python
+        # Scorecard Pinned-Dependencies: every dependency installed here is
+        # locked with --require-hashes. The verifier package itself is NOT
+        # pip-installed: a local `pip install .` cannot be hash-pinned, so
+        # Scorecard flags it on every run regardless of --no-deps. Instead the
+        # pure-Python package is run from its pinned checkout via PYTHONPATH in
+        # the conformance gate below, so no unpinned install command ever runs.
+        run: pip install --require-hashes -r requirements.txt
+
+      - name: Python EvidenceReceipt v2 span smoke
+        working-directory: sdk/verifiers/python
+        run: |
+          PYTHONPATH=src python -m pipelock_aarp_verify receipt \
+            ../../../internal/contract/testdata/golden/valid_evidence_receipt_proxy_decision_with_spans.json \
+            --key d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a \
+            --json > "$RUNNER_TEMP/python-v2-receipt.json"
+          python - "$RUNNER_TEMP/python-v2-receipt.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as fh:
+              report = json.load(fh)
+          if report.get("valid") is not True:
+              raise SystemExit(f"Python v2 receipt verifier failed: {report}")
+          PY
+
+      - name: Run AARP cross-language gate
+        env:
+          # All four verifiers implement --svid; require four-way agreement on the
+          # svid/ attestation corpus too (default-on in the gate; explicit here so
+          # the CI surface documents the requirement).
+          AARP_GATE_INCLUDE_SVID: 1
+          GO_AARP: ${{ runner.temp }}/pipelock-verifier aarp
+          TS_AARP: node ${{ github.workspace }}/sdk/verifiers/ts/dist/src/cli.js aarp
+          RUST_AARP: ${{ github.workspace }}/sdk/verifiers/rust/target/release/pipelock-verifier-rs aarp
+          PYTHONPATH: ${{ github.workspace }}/sdk/verifiers/python/src
+          PY_AARP: python -m pipelock_aarp_verify aarp
+        run: bash sdk/conformance/aarp-corpus-gate.sh
+
+  # Containment direct-egress conformance gate: packages pipelock's
+  # `contain verify` direct-egress probes (probe 8 — pipelock-agent must NOT
+  # reach the internet directly; probe 9 — the operator must still reach it) as
+  # a publishable conformance artifact and proves the egress-denied test is
+  # real. The gate runs the Go conformance test over the fixture pairs under
+  # sdk/conformance/testdata/containment, then asserts the must-fail property by
+  # temporarily marking the leaked-egress fixture as expected-pass and
+  # confirming the test then fails. Entirely offline — no real network, sudo,
+  # curl, or nftables. The probes run against a canned command-runner built
+  # from the fixtures.
+  #
+  # Security note: no run: step consumes untrusted github.event.* input.
+  containment-conformance:
+    name: Containment direct-egress gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout pipelock
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: '1.26'
+
+      - name: Run containment direct-egress conformance gate
+        run: bash sdk/conformance/containment-gate.sh

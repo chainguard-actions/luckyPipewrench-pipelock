@@ -1,0 +1,42 @@
+name: Test PR diff scan
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_REF: refs/pull/1/merge
+      GITHUB_EVENT_NAME: pull_request
+      GITHUB_HEAD_REF: feature-branch
+      GITHUB_BASE_REF: main
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - id: action
+        uses: .
+        with:
+          directory: '.'
+          scan-diff: 'true'
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+        continue-on-error: true
+
+      - name: Assert outputs are present
+        env:
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+          SCORE: ${{ steps.action.outputs.score }}
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+          CRITICALS: ${{ steps.action.outputs.critical-count }}
+        run: |
+          echo "audit-failed: $AUDIT_FAILED"
+          echo "score: $SCORE"
+          echo "findings-count: $FINDINGS"
+          echo "critical-count: $CRITICALS"
+          # The action should produce outputs regardless of findings
+          if [ "$AUDIT_FAILED" != "true" ] && [ "$AUDIT_FAILED" != "false" ]; then
+            echo "FAIL: audit-failed output should be 'true' or 'false', got: '$AUDIT_FAILED'"
+            exit 1
+          fi
+          echo "PASS: outputs are set"

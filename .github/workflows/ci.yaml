@@ -1,0 +1,305 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags-ignore: ['v*']
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # Pipelock scans the PR diff before anything else runs. If the scan
+  # finds credential leaks, injection patterns, or security misconfigs,
+  # all downstream jobs are skipped — no compromised code executes.
+  security-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pipelock Scan
+        uses: luckyPipewrench/pipelock@dcd25d8ea407f087fa9f2d4a0f8bddea5c997f07 # v2
+        with:
+          scan-diff: 'true'
+          fail-on-findings: 'true'
+          test-vectors: 'false'
+          exclude-paths: |
+            internal/scanner/scanner_test.go
+            internal/scanner/scan_env_test.go
+            internal/scanner/text_dlp_test.go
+            internal/scanner/validate_test.go
+            internal/proxy/intercept_test.go
+            internal/proxy/forward_test.go
+            internal/proxy/adaptive_escalation_test.go
+            internal/proxy/adaptive_coverage_test.go
+            internal/proxy/allowlist_scoring_test.go
+            internal/proxy/session_api.go
+            internal/cli/session/resolver.go
+            internal/gitprotect/diffscan_test.go
+            internal/config/config_test.go
+            internal/cli/test.go
+            internal/cli/license_test.go
+            internal/cli/support/bundle_test.go
+            enterprise/licenseservice/*_test.go
+            configs/*.yaml
+            test/secureiqlab/
+            README.md
+            assets/demo.cast
+            scripts/pr-review.py
+            docs/attacks-blocked.md
+            docs/bypass-resistance.md
+            docs/configuration.md
+            docs/scan-api.md
+            docs/guides/deployment-recipes.md
+            docs/guides/tls-interception.md
+            docs/guides/zed.md
+            examples/demo-readme.sh
+            examples/sample-events.jsonl
+            examples/quickstart/
+            internal/contract/testdata/golden/
+            internal/contract/testdata/invalid/
+            internal/signing/testdata/golden/
+            internal/cli/hermes/testdata/hermes_e2e_driver.py
+            internal/cli/hermes/hermes_e2e_test.go
+            sdk/conformance/testdata/aarp-corpus/
+
+  test:
+    needs: [security-scan]
+    runs-on: ubuntu-latest
+    # Bumped 15 -> 20 after the mcp-only/mcpwrap test suite (PR #610) landed
+    # ~1300 lines of new tests; Go 1.26 was hitting the 15m wall on a clean
+    # ubuntu-latest runner. 1.25 still finishes in ~9m so the headroom is
+    # for the slower 1.26 cell, not a general slowdown.
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        go-version: ['1.25', '1.26']
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Replay harness (deterministic regression)
+        run: make test-replay-harness
+
+      - name: Run tests (OSS)
+        run: go test -race -count=1 ./...
+
+      - name: Run tests (enterprise)
+        run: go test -tags enterprise -race -count=1 -coverprofile=coverage.out ./...
+
+      - name: Upload coverage
+        if: matrix.go-version == '1.25'
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        with:
+          files: ./coverage.out
+          fail_ci_if_error: false
+
+  test-macos:
+    needs: [security-scan]
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: '1.26'
+
+      - name: Run sandbox tests (macOS seatbelt)
+        run: go test -race -count=1 ./internal/sandbox/...
+
+      - name: Verify cross-platform build
+        run: go build ./...
+
+  # Native Windows smoke lane. Pipelock had zero Windows CI, which let the
+  # recorder signing-key perm gate (#695) and the key-free MCP capture path
+  # (#696) regress on real Windows undetected. This is a TARGETED lane, not full
+  # parity: the full suite asserts Unix file modes that Go can't report on
+  # Windows (it derives FileMode from the read-only attribute, never the ACL),
+  # and internal/config test files use unix-only syscalls. So we run the
+  # OS-split predicate plus the load/capture paths that #695/#696 touch, scoped
+  # with -run. config's perm behavior is proven transitively by the secperm
+  # Windows test (all masks skip when secperm.Enforced is false).
+  test-windows:
+    needs: [security-scan]
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: '1.26'
+
+      - name: Verify Windows build (OSS + enterprise)
+        run: |
+          go build ./...
+          go build -tags enterprise ./...
+
+      # -race is intentionally omitted: it needs a CGO C compiler on the runner,
+      # a common source of unrelated red CI on Windows. The Linux matrix already
+      # runs the race detector across all code; this lane proves Windows
+      # functional behavior, not data races.
+      - name: secperm OS split (mode checks skipped on Windows)
+        run: go test -count=1 ./internal/secperm/...
+
+      - name: Signing key / salt / header-file load at any reported mode (#695)
+        run: go test -count=1 -run "TestWindows" ./internal/signing/... ./internal/contract/privacy/... ./internal/cli/runtime/...
+
+      - name: Key-free MCP capture writer smoke (#696)
+        run: go test -count=1 -run "TestBuildCaptureWriter|TestParseCaptureEscrowKey" ./internal/cli/runtime/...
+
+  lint:
+    needs: [security-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: '1.25'
+
+      - name: golangci-lint (OSS)
+        uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9
+        with:
+          version: v2.12.2
+          skip-cache: true
+
+      - name: golangci-lint (enterprise)
+        run: golangci-lint run --build-tags enterprise ./...
+
+      - name: Python pin policy
+        run: bash scripts/check-python-pins.sh
+
+      - name: Test stability policy
+        run: bash scripts/check-test-stability.sh
+
+  helm:
+    needs: [security-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Helm
+        uses: Azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2 # v5.0.0
+        with:
+          version: v3.20.0
+
+      - name: Verify Helm chart
+        run: bash scripts/check-helm-chart.sh
+
+  govulncheck:
+    needs: [security-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          # Pin the exact patched release. govulncheck analyzes the active
+          # toolchain's stdlib (go env GOVERSION), so the setup-go version is the
+          # lever, not the go.mod directive. go1.26.4 (2026-05-29) fixes
+          # GO-2026-5039 net/textproto + GO-2026-5037 crypto/x509, but it is not
+          # yet in the actions/go-versions manifest, so a float to '1.26' resolves
+          # to the stale 1.26.3 and the scan stays red. An EXACT version makes
+          # setup-go fall back to a direct download from the official Go
+          # distribution, bypassing the manifest. Revert to '1.26' + check-latest
+          # for steady-state self-healing once the manifest includes 1.26.4.
+          go-version: '1.26.4'
+          check-latest: true
+
+      - name: Verify Go version
+        # Fail loud if setup-go silently resolved a different stdlib (e.g. a
+        # stale cached 1.26.3) instead of letting a wrong toolchain false-green.
+        run: |
+          got="$(go env GOVERSION)"
+          echo "GOVERSION=$got"
+          test "$got" = "go1.26.4"
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+
+      - name: Run govulncheck
+        run: govulncheck ./...
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [security-scan, test, lint, helm]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: '1.25'
+
+      - name: Build binary
+        run: |
+          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "0.1.0-dev")
+          go build -trimpath -ldflags "-s -w \
+            -X github.com/luckyPipewrench/pipelock/internal/cliutil.Version=$VERSION \
+            -X github.com/luckyPipewrench/pipelock/internal/proxy.Version=$VERSION" \
+            -o pipelock ./cmd/pipelock
+
+      - name: Verify binary runs
+        run: ./pipelock --version
+
+      - name: Build binary (enterprise)
+        run: |
+          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "0.1.0-dev")
+          go build -tags enterprise -trimpath -ldflags "-s -w \
+            -X github.com/luckyPipewrench/pipelock/internal/cliutil.Version=$VERSION \
+            -X github.com/luckyPipewrench/pipelock/internal/proxy.Version=$VERSION" \
+            -o pipelock-enterprise ./cmd/pipelock
+
+      - name: Verify enterprise binary runs
+        run: ./pipelock-enterprise --version
+
+      - name: Cross-build Windows binaries (enterprise)
+        run: |
+          GOOS=windows GOARCH=amd64 go build -tags enterprise -trimpath -o /tmp/pipelock-windows-amd64.exe ./cmd/pipelock
+          GOOS=windows GOARCH=arm64 go build -tags enterprise -trimpath -o /tmp/pipelock-windows-arm64.exe ./cmd/pipelock

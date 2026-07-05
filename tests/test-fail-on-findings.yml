@@ -1,0 +1,40 @@
+name: Test fail-on-findings behavior
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_REF: refs/heads/main
+      GITHUB_EVENT_NAME: push
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        with:
+          directory: '.'
+          scan-diff: 'false'
+          fail-on-findings: 'true'
+          test-vectors: 'false'
+        # The action may fail if audit fails (fail-closed) or if criticals found
+        continue-on-error: true
+
+      - name: Assert fail-closed behavior
+        env:
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+          CRITICALS: ${{ steps.action.outputs.critical-count }}
+          ACTION_OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "audit-failed: $AUDIT_FAILED"
+          echo "critical-count: $CRITICALS"
+          echo "action-outcome: $ACTION_OUTCOME"
+          # When fail-on-findings is true:
+          # - If audit itself failed (audit-failed=true), action should fail (fail-closed)
+          # - If criticals > 0, action should fail
+          # - If no criticals and audit succeeded, action should succeed
+          if [ "$AUDIT_FAILED" = "true" ] && [ "$ACTION_OUTCOME" = "success" ]; then
+            echo "FAIL: action should have failed when audit-failed=true and fail-on-findings=true"
+            exit 1
+          fi
+          echo "PASS: fail-on-findings behavior is correct"
