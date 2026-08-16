@@ -9,6 +9,7 @@ Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at
 | Version | Tag | Upstream commit |
 |---------|-----|-----------------|
 | v3.0.0 | [`v3.0.0`](https://github.com/chainguard-actions/luckyPipewrench-pipelock/tree/v3.0.0) | [`9d2e37d`](https://github.com/luckyPipewrench/pipelock/commit/9d2e37d296359c38e599525a0424cdc189a812e1) |
+| v3.1.0 | [`v3.1.0`](https://github.com/chainguard-actions/luckyPipewrench-pipelock/tree/v3.1.0) | [`e8a396d`](https://github.com/luckyPipewrench/pipelock/commit/e8a396d244af27b1367e116fa22fc61246884ab3) |
 
 ## Privacy
 
