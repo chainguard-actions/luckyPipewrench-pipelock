@@ -1,0 +1,1022 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package scanner
+
+import (
+	"context"
+	"encoding/base32"
+	"encoding/base64"
+	"encoding/hex"
+	"html"
+	"net/url"
+	"regexp"
+	"strings"
+	"unicode"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/normalize"
+	"github.com/luckyPipewrench/pipelock/internal/seedprotect"
+)
+
+// textURLTokenRe matches URL tokens (http/https/ws/wss/ftp) so their hostnames
+// can be run through the pre-DNS structural exfil check. Conservative on
+// purpose: only scheme-prefixed URLs are extracted, so arbitrary dotted text
+// is not treated as a hostname.
+var textURLTokenRe = regexp.MustCompile(`(?i)\b(?:https?|wss?|ftp)://[^\s"'<>\\]+`)
+
+// officialAWSExampleCredentialDocMarkers are documentation-context phrases that,
+// when present OUTSIDE the credential literal's own byte span, mark the AWS
+// example key/secret as documentation rather than a live secret. They are
+// deliberately DISTINCT phrases (each contains "credential" or an equally
+// specific doc cue) rather than bare common words: a bare "example" or "sample"
+// would match ordinary hostnames like api.vendor.example and non-doc prose,
+// exempting the example key in contexts that are not documentation.
+var officialAWSExampleCredentialDocMarkers = []string{
+	"example credential",
+	"example credentials",
+	"sample credential",
+	"dummy credential",
+	"placeholder credential",
+	"test credential",
+	"fake credential",
+	"not a real credential",
+	"official aws example",
+	"replace these with your actual credentials",
+}
+
+type textHostView struct {
+	host      string
+	start     int
+	end       int
+	viewLabel string
+}
+
+type textByteSpan struct {
+	start int
+	end   int
+}
+
+// extractHostsFromTextViews pulls de-duplicated hostnames out of URL tokens in
+// multiple text views. Callers pass both raw and DLP-normalized text so URL
+// extraction gets the same invisible/control/confusable hardening as pattern DLP.
+func extractHostsFromTextViews(views ...spanTextView) []textHostView {
+	seen := make(map[string]struct{})
+	var hosts []textHostView
+	for _, view := range views {
+		extractHostsFromOneText(view, seen, &hosts)
+	}
+	return hosts
+}
+
+func extractHostsFromOneText(view spanTextView, seen map[string]struct{}, hosts *[]textHostView) {
+	text := view.text
+	tokens := textURLTokenRe.FindAllString(text, -1)
+	if len(tokens) == 0 {
+		return
+	}
+	locs := textURLTokenRe.FindAllStringIndex(text, -1)
+	for i, tok := range tokens {
+		u, err := url.Parse(tok)
+		if err != nil {
+			continue
+		}
+		host := u.Hostname()
+		if host == "" {
+			continue
+		}
+		if _, dup := seen[host]; dup {
+			continue
+		}
+		hostStart := hostOffsetInURLToken(tok, u)
+		if hostStart < 0 {
+			continue
+		}
+		seen[host] = struct{}{}
+		start := locs[i][0] + hostStart
+		*hosts = append(*hosts, textHostView{
+			host:      host,
+			start:     start,
+			end:       start + len(host),
+			viewLabel: view.viewLabel,
+		})
+	}
+}
+
+func hostOffsetInURLToken(token string, u *url.URL) int {
+	host := u.Hostname()
+	if host == "" {
+		return -1
+	}
+	schemeEnd := strings.Index(token, "://")
+	if schemeEnd < 0 {
+		return -1
+	}
+	authorityStart := schemeEnd + len("://")
+	authorityEnd := authorityStart
+	for authorityEnd < len(token) && !strings.ContainsRune("/?#", rune(token[authorityEnd])) {
+		authorityEnd++
+	}
+	authority := token[authorityStart:authorityEnd]
+	if at := strings.LastIndexByte(authority, '@'); at >= 0 {
+		authorityStart += at + 1
+		authority = authority[at+1:]
+	}
+	hostStart := indexFold(authority, host)
+	if hostStart < 0 {
+		return -1
+	}
+	return authorityStart + hostStart
+}
+
+func indexFold(s, substr string) int {
+	if substr == "" || len(substr) > len(s) {
+		return -1
+	}
+	lowerSubstr := strings.ToLower(substr)
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if strings.ToLower(s[i:i+len(substr)]) == lowerSubstr {
+			return i
+		}
+	}
+	return -1
+}
+
+// textDLPHostnameExfil is the pattern name reported when a URL embedded in
+// scanned text carries an encoded-subdomain exfiltration hostname.
+const textDLPHostnameExfil = "Hostname Exfiltration"
+
+// IsHostnameExfilMatch reports whether a text-DLP match came from the
+// structural hostname-exfil detector. Transports use this to keep hostname
+// exfiltration fail-closed even when generic DLP is configured in warn mode.
+func IsHostnameExfilMatch(m TextDLPMatch) bool {
+	return m.PatternName == textDLPHostnameExfil && m.Encoded == "subdomain"
+}
+
+// ContainsHostnameExfilMatch reports whether matches include a structural
+// hostname-exfil finding.
+func ContainsHostnameExfilMatch(matches []TextDLPMatch) bool {
+	for _, m := range matches {
+		if IsHostnameExfilMatch(m) {
+			return true
+		}
+	}
+	return false
+}
+
+// strictAWSAccessIDRe compiles the canonical AWS Access ID pattern without the
+// scanner's runtime (?i) prefix: it matches only a genuine uppercase/digit ID,
+// not lowercase prose the core pattern also matches after case-folding.
+var strictAWSAccessIDRe = regexp.MustCompile(config.AWSAccessIDRegex)
+
+// EnforceableInboundTextDLPMatches returns the subset of inbound text-DLP
+// matches that should block an inbound surface. ScanTextForDLPInbound still
+// returns all evidence; this helper owns the narrower enforcement decision so
+// callers do not need local one-off exceptions.
+func EnforceableInboundTextDLPMatches(text string, matches []TextDLPMatch) []TextDLPMatch {
+	if len(matches) == 0 {
+		return nil
+	}
+
+	var awsCtx inboundAWSAccessIDContext
+	haveAWSCtx := false
+	enforceable := make([]TextDLPMatch, 0, len(matches))
+	for _, match := range matches {
+		if isInboundAWSAccessIDWhitespaceMatch(match) {
+			if !haveAWSCtx {
+				awsCtx = newInboundAWSAccessIDContext(text)
+				haveAWSCtx = true
+			}
+			if isLowConfidenceInboundAWSAccessID(awsCtx, match) {
+				continue
+			}
+		}
+		enforceable = append(enforceable, match)
+	}
+	return enforceable
+}
+
+// IsLowConfidenceInboundAWSAccessID reports whether match is an inbound-only
+// AWS Access ID finding produced by the whitespace-collapsed DLP view joining
+// ordinary lowercase prose into a credential-shaped token.
+//
+// This is deliberately narrow. Outbound scans must still block these because an
+// agent can leak a real key by changing case or adding spaces. Inbound Hermes
+// surfaces, however, include OCR/vision prose and operator messages; blocking a
+// result like "AIDA in product name generated..." blocks normal operation even
+// though the candidate cannot be a valid AWS access key ID. Real contiguous
+// tokens, uppercase/digit whitespace-split tokens, decoded tokens, and nearby
+// credential-context text stay high-confidence and must still be blocked by the
+// caller.
+func IsLowConfidenceInboundAWSAccessID(text string, match TextDLPMatch) bool {
+	if !isInboundAWSAccessIDWhitespaceMatch(match) {
+		return false
+	}
+	return isLowConfidenceInboundAWSAccessID(newInboundAWSAccessIDContext(text), match)
+}
+
+type inboundAWSAccessIDContext struct {
+	cleaned          string
+	compacted        string
+	compactedOffsets []int
+}
+
+func newInboundAWSAccessIDContext(text string) inboundAWSAccessIDContext {
+	cleaned := normalize.ForDLP(text)
+	compacted, compactedOffsets := compactTextDLPWhitespaceWithOffsets(cleaned)
+	return inboundAWSAccessIDContext{
+		cleaned:          cleaned,
+		compacted:        compacted,
+		compactedOffsets: compactedOffsets,
+	}
+}
+
+func isInboundAWSAccessIDWhitespaceMatch(match TextDLPMatch) bool {
+	return match.PatternName == patternNameAWSAccessID && match.Encoded == "whitespace"
+}
+
+func isLowConfidenceInboundAWSAccessID(ctx inboundAWSAccessIDContext, match TextDLPMatch) bool {
+	if !isInboundAWSAccessIDWhitespaceMatch(match) {
+		return false
+	}
+	span := match.Span()
+	if !span.Valid() {
+		return false
+	}
+
+	if ctx.compacted == ctx.cleaned || span.ByteStart < 0 || span.ByteEnd > len(ctx.compacted) || span.ByteStart >= span.ByteEnd {
+		return false
+	}
+
+	candidate := ctx.compacted[span.ByteStart:span.ByteEnd]
+	if !containsASCIILower(candidate) {
+		return false
+	}
+
+	// The core AWS pattern is force-prefixed with (?i), so a genuine uppercase
+	// key can greedily extend into a trailing lowercase run, putting a lowercase
+	// byte in the span while a real credential is still present. A real AWS
+	// access key ID is uppercase/digits, so re-check the span with the
+	// case-sensitive pattern: if a real key is embedded, keep blocking.
+	if strictAWSAccessIDRe.MatchString(candidate) {
+		return false
+	}
+
+	rawStart := ctx.compactedOffsets[span.ByteStart]
+	rawEnd := ctx.compactedOffsets[span.ByteEnd-1] + 1
+	windowStart := max(0, rawStart-96)
+	windowEnd := min(len(ctx.cleaned), rawEnd+96)
+	return !containsCredentialContext(ctx.cleaned[windowStart:windowEnd])
+}
+
+// TextDLPMatch describes a single DLP pattern match in arbitrary text.
+type TextDLPMatch struct {
+	PatternName   string `json:"pattern_name"`
+	Severity      string `json:"severity"`
+	Encoded       string `json:"encoded,omitempty"` // "", "base64", "hex", "base32", "env", "url", "subdomain", "whitespace"
+	Bundle        string `json:"bundle,omitempty"`
+	BundleVersion string `json:"bundle_version,omitempty"`
+	Warn          bool   `json:"warn,omitempty"` // true for warn-mode patterns (informational only)
+	span          MatchSpan
+}
+
+// Span returns retained coordinates for this match in the normalized scanner
+// view named by MatchSpan.ViewLabel. It never includes matched bytes.
+func (m TextDLPMatch) Span() MatchSpan {
+	return m.span
+}
+
+// TextDLPResult describes the outcome of scanning text for DLP patterns.
+type TextDLPResult struct {
+	Clean                bool           `json:"clean"`
+	Matches              []TextDLPMatch `json:"matches,omitempty"`
+	InformationalMatches []TextDLPMatch `json:"informational_matches,omitempty"` // warn-mode matches (non-blocking)
+}
+
+// textDLPOptions tunes a text-DLP scan. emitWarns controls warn-hook telemetry.
+// scanSecretLeak controls whether the agent's-own-secret exfil checks run —
+// the environment-variable and file-secret value matchers. Those checks detect
+// a secret VALUE the proxy holds (env or secrets-file) appearing in the text,
+// which only indicates exfiltration when the text is OUTBOUND. Callers scanning
+// inbound content (operator->agent messages, tool results flowing back) set it
+// false: a value the agent is receiving is not a leak, and matching it there
+// produces false positives that gag normal operation. Generic detectors
+// (regex patterns, seed phrases, canary tokens, hostname-exfil) are unaffected
+// and run in both directions.
+type textDLPOptions struct {
+	emitWarns      bool
+	scanSecretLeak bool
+}
+
+// ScanTextForDLP checks arbitrary text for DLP pattern matches and env secret leaks.
+// Unlike checkDLP (which operates on URLs), this method works on raw text strings
+// from MCP tool arguments. It applies zero-width stripping, NFKC normalization,
+// and checks encoded variants (base64, hex, base32) of the text for patterns.
+// This is the full OUTBOUND scan: it runs the agent's-own-secret exfil checks.
+func (s *Scanner) ScanTextForDLP(ctx context.Context, text string) TextDLPResult {
+	return s.scanTextForDLP(ctx, text, textDLPOptions{emitWarns: true, scanSecretLeak: true})
+}
+
+// ScanTextForDLPQuiet runs the same text-DLP detection logic as ScanTextForDLP
+// but suppresses warn-hook emission. Callers use this when they need to compare
+// multiple related scans without duplicating warn telemetry.
+func (s *Scanner) ScanTextForDLPQuiet(ctx context.Context, text string) TextDLPResult {
+	return s.scanTextForDLP(ctx, text, textDLPOptions{emitWarns: false, scanSecretLeak: true})
+}
+
+// ScanTextForDLPInbound runs text DLP for INBOUND content — text the agent is
+// receiving rather than sending (operator->agent messages, tool results flowing
+// back). It runs the full pattern / seed / canary / hostname-exfil detection but
+// SKIPS the agent's-own-secret exfil checks (environment-variable and
+// file-secret value matching). Those only indicate exfiltration on an outbound
+// surface; on inbound content the same value appearing is legitimately-received
+// data, not a leak, and scanning for it false-positives. Exfil protection is
+// untouched: the outbound surfaces still call ScanTextForDLP.
+func (s *Scanner) ScanTextForDLPInbound(ctx context.Context, text string) TextDLPResult {
+	return s.scanTextForDLP(ctx, text, textDLPOptions{emitWarns: true, scanSecretLeak: false})
+}
+
+// EmitTextDLPWarnMatches replays the warn hook for the provided informational
+// matches after a caller has filtered or deduplicated them.
+func (s *Scanner) EmitTextDLPWarnMatches(ctx context.Context, matches []TextDLPMatch) {
+	if len(matches) == 0 {
+		return
+	}
+
+	warns := make([]WarnMatch, 0, len(matches))
+	for _, m := range matches {
+		if !m.Warn {
+			continue
+		}
+		warns = append(warns, WarnMatch{
+			PatternName: m.PatternName,
+			Severity:    m.Severity,
+			span:        m.Span(),
+		})
+	}
+	s.emitDLPWarns(ctx, deduplicateWarnMatches(warns))
+}
+
+func (s *Scanner) scanTextForDLP(ctx context.Context, text string, opts textDLPOptions) TextDLPResult {
+	text = exciseImagesRetainingDecodedForDLP(text)
+	text = redactOfficialAWSExampleCredentialsForDocs(text)
+
+	// Core DLP runs FIRST - immutable safety floor. Core matches are
+	// prepended to results; main scanner also runs to capture additional
+	// findings (env leaks, seed phrases, non-core patterns).
+	coreMatches := s.scanCoreDLP(text)
+
+	if len(s.dlpPatterns) == 0 &&
+		len(s.canaryTokens) == 0 &&
+		len(s.envSecrets) == 0 &&
+		len(s.fileSecrets) == 0 &&
+		!s.seedEnabled {
+		if len(coreMatches) > 0 {
+			return TextDLPResult{Clean: false, Matches: coreMatches}
+		}
+		return TextDLPResult{Clean: true}
+	}
+
+	var matches []TextDLPMatch
+
+	// Seed phrase detection runs FIRST so seed phrases get the correct label
+	// ("BIP-39 Seed Phrase") instead of an accidental regex DLP match.
+	// A base64-encoded seed phrase can decode to text matching WIF/xprv regex,
+	// so seed detection must win the race.
+	// Uses ForMatching() normalization (preserves whitespace for word boundaries)
+	// instead of ForDLP() (strips whitespace, destroying word boundaries).
+	if s.seedEnabled {
+		seedText := normalize.ForMatching(text)
+		type seedCandidate struct {
+			text      string
+			encoded   string
+			viewLabel string
+		}
+		candidates := []seedCandidate{{seedText, "", ViewForMatching}}
+		appendInvisibleSpacedSeedCandidate := func(candidateText, encoded, viewLabel string) {
+			// Invisible-separator reassembly: ForMatching STRIPS zero-width chars, so
+			// a seed whose inter-word spaces are zero-width (U+200B, U+1160, U+3164)
+			// collapses to one merged token with no word boundaries and evades
+			// DetectSpans. Replace invisibles with spaces FIRST to restore the
+			// boundaries. Mirrors scanCoreResponse's spaced pass. (Space-LIKE
+			// separators such as NBSP/en-dash survive ForMatching already; this
+			// covers the zero-width class they do not.)
+			matching := normalize.ForMatching(candidateText)
+			spaced := normalize.ForMatching(normalize.ReplaceInvisibleWithSpace(candidateText))
+			if spaced != matching {
+				candidates = append(candidates, seedCandidate{spaced, encoded, spanViewLabel("invisible_spaced", viewLabel)})
+			}
+		}
+		appendInvisibleSpacedSeedCandidate(text, "", ViewForMatching)
+		// URL-decoded variant
+		if decoded := IterativeDecode(seedText); decoded != seedText {
+			candidates = append(candidates, seedCandidate{decoded, "url", spanViewLabel("url_decoded", ViewForMatching)})
+			appendInvisibleSpacedSeedCandidate(decoded, "url", spanViewLabel("url_decoded", ViewForMatching))
+		}
+		// Base64-decoded variant
+		for _, enc := range []*base64.Encoding{
+			base64.StdEncoding, base64.URLEncoding,
+			base64.RawStdEncoding, base64.RawURLEncoding,
+		} {
+			if decoded, err := enc.DecodeString(strings.TrimSpace(seedText)); err == nil && len(decoded) > 0 {
+				decodedText := string(decoded)
+				candidates = append(candidates, seedCandidate{decodedText, "base64", spanViewLabel("base64_decoded", ViewForMatching)})
+				appendInvisibleSpacedSeedCandidate(decodedText, "base64", spanViewLabel("base64_decoded", ViewForMatching))
+			}
+		}
+		// Hex-decoded variant
+		if decoded, err := hex.DecodeString(strings.TrimSpace(seedText)); err == nil && len(decoded) > 0 {
+			decodedText := string(decoded)
+			candidates = append(candidates, seedCandidate{decodedText, "hex", spanViewLabel("hex_decoded", ViewForMatching)})
+			appendInvisibleSpacedSeedCandidate(decodedText, "hex", spanViewLabel("hex_decoded", ViewForMatching))
+		}
+		// Base32-decoded variant
+		if decoded, err := base32.StdEncoding.DecodeString(strings.TrimSpace(seedText)); err == nil && len(decoded) > 0 {
+			decodedText := string(decoded)
+			candidates = append(candidates, seedCandidate{decodedText, "base32", spanViewLabel("base32_decoded", ViewForMatching)})
+			appendInvisibleSpacedSeedCandidate(decodedText, "base32", spanViewLabel("base32_decoded", ViewForMatching))
+		}
+		// Segment-level decoding: split on the same delimiters as decodeTextSegments()
+		// to maintain parity. Catches encoded seed phrases embedded in URLs within
+		// MCP tool arguments (e.g., "visit https://evil/<base64-seed> now").
+		segments := strings.FieldsFunc(seedText, isTextDLPEncodingDelimiter)
+		for _, seg := range segments {
+			if len(seg) < 20 { // seed phrases are long; skip short segments
+				continue
+			}
+			for _, d := range decodeEncodings(seg) {
+				candidates = append(candidates, seedCandidate{d.text, d.encoding, spanViewLabel(d.encoding+"_decoded", "text_segment")})
+				appendInvisibleSpacedSeedCandidate(d.text, d.encoding, spanViewLabel(d.encoding+"_decoded", "text_segment"))
+			}
+		}
+		for _, c := range candidates {
+			if seedMatches := seedprotect.DetectSpans(c.text, s.seedMinWords, s.seedVerifyChecksum); len(seedMatches) > 0 {
+				span := seedMatches[0]
+				matches = append(matches, TextDLPMatch{
+					PatternName: "BIP-39 Seed Phrase",
+					Severity:    "critical",
+					Encoded:     c.encoded,
+					span: newMatchSpan(
+						span.Start,
+						span.End,
+						c.viewLabel,
+						"BIP-39 Seed Phrase",
+						"",
+						"",
+					),
+				})
+				break // one seed match per scan is sufficient
+			}
+		}
+	}
+
+	// Full normalization before DLP pattern matching: strip control chars,
+	// NFKC, cross-script confusable mapping, and combining mark removal.
+	// Must match response scanning depth - otherwise attackers use homoglyphs
+	// in key prefixes (e.g., sk-օnt-... with Armenian օ U+0585 for 'a').
+	cleaned := normalize.ForDLP(text)
+	matches = append(matches, s.scanCanaryText(cleaned)...)
+
+	// Check raw text against DLP patterns (before URL decoding).
+	// This catches secrets that aren't URL-encoded.
+	for _, idx := range s.dlpPreFilter.patternsToCheck(cleaned) {
+		p := s.dlpPatterns[idx]
+		if start, end, ok := p.matchSpan(cleaned); ok {
+			matches = append(matches, TextDLPMatch{
+				PatternName:   p.name,
+				Severity:      p.severity,
+				Bundle:        p.bundle,
+				BundleVersion: p.bundleVersion,
+				Warn:          p.warn,
+				span:          newMatchSpan(start, end, ViewDLPNormalized, p.name, p.bundle, p.bundleVersion),
+			})
+		}
+	}
+
+	// Iterative URL-decode and re-check DLP patterns (catches %2D → - etc.).
+	// Uses IterativeDecode to defeat multi-layer encoding.
+	if decoded := IterativeDecode(cleaned); decoded != cleaned {
+		matches = append(matches, s.matchDLPPatterns(decoded, "url")...)
+	}
+
+	segmentViews := textDLPEncodingSegmentViews(cleaned)
+	segmentDecodeViews := segmentViews
+	if decoded := decodeHTMLEntities(cleaned); decoded != cleaned {
+		matches = append(matches, s.matchDLPPatterns(decoded, encodingHTML)...)
+		matches = append(matches, s.decodeAndMatchRecursive(decoded, 0)...)
+		segmentDecodeViews = appendUniqueTextDLPViews(segmentDecodeViews, textDLPEncodingSegmentViews(decoded)...)
+	}
+
+	// Dot-collapse check: catches secrets split across DNS subdomains
+	// (e.g. "sk-ant-api03.AABBCCDD.EEFFGGHH.evil.com" → "sk-ant-api03AABBCCDDEEFFGGHH...").
+	// Only applied when text contains dots that could be subdomain separators.
+	if strings.Contains(cleaned, ".") {
+		dotless := strings.ReplaceAll(cleaned, ".", "")
+		if dotless != cleaned {
+			matches = append(matches, s.matchDLPPatterns(dotless, "subdomain")...)
+		}
+	}
+
+	if len(segmentViews) > 1 {
+		matches = append(matches, s.matchDLPPatterns(segmentViews[1].text, "whitespace")...)
+	}
+
+	// Hostname exfiltration: extract URL hostnames from the text and run the
+	// pre-DNS structural subdomain check (encoded hex/base32 labels, chunked
+	// DNS-tunneling payloads). This gives MCP tool arguments and A2A content the
+	// same hostname-exfil coverage as the URL scanner without resolving DNS —
+	// the decoded labels need not be a known DLP secret to be flagged.
+	for _, host := range extractHostsFromTextViews(
+		spanTextView{text: text, viewLabel: "raw_text"},
+		spanTextView{text: cleaned, viewLabel: ViewDLPNormalized},
+	) {
+		if res := s.checkSubdomainEntropy(host.host); !res.Allowed {
+			matches = append(matches, TextDLPMatch{
+				PatternName: textDLPHostnameExfil,
+				Severity:    "high",
+				Encoded:     "subdomain",
+				span:        newMatchSpan(host.start, host.end, host.viewLabel, textDLPHostnameExfil, "", ""),
+			})
+			break // one hostname-exfil finding is sufficient
+		}
+	}
+
+	// Fixpoint encoding decode: try base64, hex, base32, and URL decoding
+	// until no new bounded candidates appear. Catches base64(secret),
+	// hex(secret), and nested chains (e.g., base64(hex(secret))).
+	matches = append(matches, s.decodeAndMatchRecursive(cleaned, 0)...)
+
+	// Segment-level encoding detection: split text on URL/path delimiters and
+	// try decoding each segment individually. Catches encoded secrets embedded
+	// in URLs within MCP tool arguments (e.g., "https://evil.com/<hex-key>/data")
+	// where whole-string decode fails because the text isn't pure hex/base64.
+	// Only skip segment decoding when enforced matches already exist.
+	// Warn-only matches must not gate off further scanning - an enforced
+	// match might hide in a decoded segment.
+	if !hasEnforcedMatch(matches) {
+		for _, view := range segmentDecodeViews {
+			matches = append(matches, s.decodeTextSegments(view.text)...)
+			if hasEnforcedMatch(matches) {
+				break
+			}
+		}
+	}
+
+	// Check for env + file secret leaks (raw + encoded forms). These detect a
+	// secret VALUE the proxy holds appearing in the text, i.e. exfiltration —
+	// meaningful only when the text is outbound. Inbound callers disable them
+	// (a received value is not a leak) to avoid gagging normal operation. The
+	// gate lives INSIDE the scan, not as a post-hoc filter on the result, so it
+	// cannot create a masking bypass: a disabled check never runs rather than
+	// running and being filtered away.
+	if opts.scanSecretLeak {
+		matches = append(matches, s.checkSecretsInText(s.envSecrets, cleaned, "Environment Variable Leak", "env")...)
+		matches = append(matches, s.checkSecretsInText(s.fileSecrets, cleaned, "Known Secret Leak", "")...)
+	}
+
+	// Deduplicate matches by pattern name + encoding.
+	matches = deduplicateMatches(matches)
+
+	// Prepend core matches - core findings cannot be overridden.
+	if len(coreMatches) > 0 {
+		matches = append(coreMatches, matches...)
+		matches = deduplicateMatches(matches)
+	}
+
+	if len(matches) == 0 {
+		return TextDLPResult{Clean: true}
+	}
+
+	// Partition matches: warn-mode patterns go to InformationalMatches,
+	// enforced patterns go to Matches. Warn-only results are Clean=true
+	// so transports take no enforcement action.
+	var enforced, informational []TextDLPMatch
+	for _, m := range matches {
+		if m.Warn {
+			informational = append(informational, m)
+		} else {
+			enforced = append(enforced, m)
+		}
+	}
+
+	// Emit warn events through the shared helper so warn-hook behavior stays centralized.
+	if opts.emitWarns && len(informational) > 0 {
+		warns := make([]WarnMatch, 0, len(informational))
+		for _, m := range informational {
+			warns = append(warns, WarnMatch{
+				PatternName: m.PatternName,
+				Severity:    m.Severity,
+				span:        m.Span(),
+			})
+		}
+		s.emitDLPWarns(ctx, deduplicateWarnMatches(warns))
+	}
+
+	return TextDLPResult{
+		Clean:                len(enforced) == 0,
+		Matches:              enforced,
+		InformationalMatches: informational,
+	}
+}
+
+// decodeAndMatchRecursive runs DLP patterns over every bounded fixpoint decode
+// candidate. The second parameter is kept for older call sites; decode bounding
+// is now candidate-count and candidate-size based instead of depth based.
+func (s *Scanner) decodeAndMatchRecursive(text string, _ int) []TextDLPMatch {
+	var matches []TextDLPMatch
+	for _, d := range decodeEncodingsRecursiveWithURL(text) {
+		matches = append(matches, s.matchDLPPatterns(d.text, d.encoding)...)
+	}
+	return matches
+}
+
+// matchDLPPatterns runs DLP regex patterns against text, tagging matches with encoding.
+// Applies full normalization to decoded text, since URL/base64/hex decoding can
+// reintroduce control chars and confusable characters after the initial pass.
+func (s *Scanner) matchDLPPatterns(text, encoding string) []TextDLPMatch {
+	text = normalize.ForDLP(text)
+	var matches []TextDLPMatch
+	for _, idx := range s.dlpPreFilter.patternsToCheck(text) {
+		p := s.dlpPatterns[idx]
+		if start, end, ok := p.matchSpan(text); ok {
+			matches = append(matches, TextDLPMatch{
+				PatternName:   p.name,
+				Severity:      p.severity,
+				Encoded:       encoding,
+				Bundle:        p.bundle,
+				BundleVersion: p.bundleVersion,
+				Warn:          p.warn,
+				span:          newMatchSpan(start, end, dlpViewLabel(encoding), p.name, p.bundle, p.bundleVersion),
+			})
+		}
+	}
+	return matches
+}
+
+func compactTextDLPWhitespace(text string) string {
+	if !strings.ContainsFunc(text, unicode.IsSpace) {
+		return text
+	}
+	return strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, text)
+}
+
+func compactTextDLPWhitespaceWithOffsets(text string) (string, []int) {
+	if !strings.ContainsFunc(text, unicode.IsSpace) {
+		offsets := make([]int, len(text))
+		for i := 0; i < len(text); i++ {
+			offsets[i] = i
+		}
+		return text, offsets
+	}
+
+	var out strings.Builder
+	out.Grow(len(text))
+	offsets := make([]int, 0, len(text))
+	for i, r := range text {
+		if unicode.IsSpace(r) {
+			continue
+		}
+		s := string(r)
+		out.WriteString(s)
+		for range len(s) {
+			offsets = append(offsets, i)
+		}
+	}
+	return out.String(), offsets
+}
+
+func containsASCIILower(text string) bool {
+	for i := 0; i < len(text); i++ {
+		if text[i] >= 'a' && text[i] <= 'z' {
+			return true
+		}
+	}
+	return false
+}
+
+func containsCredentialContext(text string) bool {
+	lower := strings.ToLower(text)
+	for _, term := range []string{
+		"access key",
+		"access-key",
+		"access_key",
+		"api key",
+		"api-key",
+		"api_key",
+		"aws_access_key_id",
+		"credential",
+		"credentials",
+		"key id",
+		"key-id",
+		"key_id",
+		"secret",
+		"token",
+		"x-amz-credential",
+	} {
+		if strings.Contains(lower, term) {
+			return true
+		}
+	}
+	return false
+}
+
+func textDLPEncodingSegmentViews(cleaned string) []spanTextView {
+	views := []spanTextView{{text: cleaned, viewLabel: ViewDLPNormalized}}
+	if compacted := compactTextDLPWhitespace(cleaned); compacted != cleaned {
+		views = append(views, spanTextView{
+			text:      compacted,
+			viewLabel: spanViewLabel("whitespace", ViewDLPNormalized),
+		})
+	}
+	return views
+}
+
+func appendUniqueTextDLPViews(views []spanTextView, candidates ...spanTextView) []spanTextView {
+	seen := make(map[string]struct{}, len(views)+len(candidates))
+	for _, view := range views {
+		seen[view.text] = struct{}{}
+	}
+	for _, candidate := range candidates {
+		if _, ok := seen[candidate.text]; ok {
+			continue
+		}
+		seen[candidate.text] = struct{}{}
+		views = append(views, candidate)
+	}
+	return views
+}
+
+func decodeHTMLEntities(text string) string {
+	decoded, _ := decodeHTMLEntitiesWithPassCount(text)
+	return decoded
+}
+
+func decodeHTMLEntitiesWithPassCount(text string) (string, int) {
+	if !strings.Contains(text, "&") {
+		return text, 0
+	}
+	decoded := text
+	passes := 0
+	for range 16 {
+		next := html.UnescapeString(decoded)
+		if next == decoded {
+			return decoded, passes
+		}
+		passes++
+		decoded = next
+	}
+	return decoded, passes
+}
+
+// checkSecretsInText scans text for leaked secrets (env vars or file-based).
+// If encodedOverride is non-empty, all matches use that as the Encoded field (e.g. "env").
+// Otherwise, the actual encoding label from matchSecretEncodingSpan is used.
+func (s *Scanner) checkSecretsInText(secrets []string, text, patternName, encodedOverride string) []TextDLPMatch {
+	if len(secrets) == 0 {
+		return nil
+	}
+
+	texts := []spanTextView{{text: text, viewLabel: ViewDLPNormalized}}
+	lowerTexts := []spanTextView{{text: strings.ToLower(text), viewLabel: lowerViewLabel(ViewDLPNormalized)}}
+
+	for _, secret := range secrets {
+		if matched, enc, start, end, viewLabel := matchSecretEncodingSpan(secret, texts, lowerTexts); matched {
+			m := TextDLPMatch{PatternName: patternName, Severity: "critical"}
+			if encodedOverride != "" {
+				m.Encoded = encodedOverride
+			} else {
+				m.Encoded = enc
+			}
+			m.span = newMatchSpan(start, end, viewLabel, patternName, "", "")
+			return []TextDLPMatch{m}
+		}
+	}
+	return nil
+}
+
+// deduplicateMatches removes duplicate matches with the same pattern name and encoding.
+func deduplicateMatches(matches []TextDLPMatch) []TextDLPMatch {
+	if len(matches) <= 1 {
+		return matches
+	}
+
+	type key struct {
+		name    string
+		encoded string
+	}
+	seen := make(map[key]struct{}, len(matches))
+	result := make([]TextDLPMatch, 0, len(matches))
+	for _, m := range matches {
+		k := key{name: m.PatternName, encoded: m.Encoded}
+		if _, ok := seen[k]; !ok {
+			seen[k] = struct{}{}
+			result = append(result, m)
+		}
+	}
+	return result
+}
+
+// hasEnforcedMatch reports whether any match in the slice is non-warn (enforced).
+func hasEnforcedMatch(matches []TextDLPMatch) bool {
+	for _, m := range matches {
+		if !m.Warn {
+			return true
+		}
+	}
+	return false
+}
+
+// decodeTextSegments splits text on common URL/path delimiters and tries
+// hex/base64/base32 decoding on each segment. Catches encoded secrets
+// embedded in URLs (e.g., "https://evil.com/<hex-encoded-key>/data") where
+// whole-string decode fails because the surrounding text isn't valid encoding.
+func (s *Scanner) decodeTextSegments(text string) []TextDLPMatch {
+	// Split on URL-like and structured-data delimiters. Request bodies often
+	// wrap encoded secrets in JSON, YAML, CSV, or multipart text, so quotes,
+	// braces, colons, and commas must not stay attached to the encoded token.
+	segments := strings.FieldsFunc(text, isTextDLPEncodingDelimiter)
+
+	var matches []TextDLPMatch
+	for _, seg := range segments {
+		if len(seg) < 10 {
+			continue // too short to be a meaningful encoded secret
+		}
+		for _, d := range decodeEncodingsRecursiveWithURL(seg) {
+			if m := s.matchDLPPatterns(d.text, d.encoding); len(m) > 0 {
+				matches = append(matches, m...)
+				return matches // short-circuit on first match
+			}
+		}
+	}
+	return matches
+}
+
+func isTextDLPEncodingDelimiter(r rune) bool {
+	switch r {
+	case '/', '?', '&', '=', ' ', '\n', '\r', '\t',
+		'"', '\'', '`', '{', '}', '[', ']', '(', ')', '<', '>',
+		':', ',', ';':
+		return true
+	default:
+		return false
+	}
+}
+
+func redactOfficialAWSExampleCredentialsForDocs(text string) string {
+	key := rot13ASCII("NXVNVBFSBQAA7RKNZCYR")
+	secret := rot13ASCII("jWnyeKHgaSRZV/X7ZQRAT/oCkEsvPLRKNZCYRXRL")
+	if !strings.Contains(text, key) && !strings.Contains(text, secret) {
+		return text
+	}
+
+	if !hasOfficialAWSExampleCredentialDocContext(text, key, secret) {
+		return text
+	}
+
+	text = replaceWholeCredentialToken(text, key, "AWS_ACCESS_KEY_ID_EXAMPLE")
+	text = replaceWholeCredentialToken(text, secret, "AWS_SECRET_ACCESS_KEY_EXAMPLE")
+	return text
+}
+
+func hasOfficialAWSExampleCredentialDocContext(text, key, secret string) bool {
+	// Use a length-preserving ASCII lowercase, NOT strings.ToLower: some Unicode
+	// runes (e.g. U+212A KELVIN SIGN) change byte length when lowercased, which
+	// would shift marker offsets out of alignment with the credential byte spans
+	// computed from the original text below. A misaligned marker inside the key's
+	// own EXAMPLE suffix could then look like an out-of-span marker and
+	// self-exempt a bare key. All markers are ASCII, so ASCII-only folding is
+	// sufficient for matching and keeps every byte offset identical.
+	lower := asciiLowerPreserveLen(text)
+	credentialSpans := literalByteSpans(text, key, secret)
+
+	for _, marker := range officialAWSExampleCredentialDocMarkers {
+		searchFrom := 0
+		for {
+			idx := strings.Index(lower[searchFrom:], marker)
+			if idx < 0 {
+				break
+			}
+
+			start := searchFrom + idx
+			end := start + len(marker)
+			if !overlapsAnyTextByteSpan(start, end, credentialSpans) {
+				return true
+			}
+			searchFrom = start + 1
+		}
+	}
+
+	return false
+}
+
+func literalByteSpans(text string, literals ...string) []textByteSpan {
+	var spans []textByteSpan
+	for _, literal := range literals {
+		searchFrom := 0
+		for {
+			idx := strings.Index(text[searchFrom:], literal)
+			if idx < 0 {
+				break
+			}
+
+			start := searchFrom + idx
+			end := start + len(literal)
+			spans = append(spans, textByteSpan{start: start, end: end})
+			searchFrom = end
+		}
+	}
+	return spans
+}
+
+func overlapsAnyTextByteSpan(start, end int, spans []textByteSpan) bool {
+	for _, span := range spans {
+		if start < span.end && end > span.start {
+			return true
+		}
+	}
+	return false
+}
+
+func replaceWholeCredentialToken(text, literal, replacement string) string {
+	searchFrom := 0
+	copyFrom := 0
+	changed := false
+	var b strings.Builder
+
+	for {
+		idx := strings.Index(text[searchFrom:], literal)
+		if idx < 0 {
+			break
+		}
+
+		start := searchFrom + idx
+		end := start + len(literal)
+		if isWholeCredentialToken(text, start, end) {
+			if !changed {
+				b.Grow(len(text))
+				changed = true
+			}
+			b.WriteString(text[copyFrom:start])
+			b.WriteString(replacement)
+			copyFrom = end
+		}
+		searchFrom = end
+	}
+
+	if !changed {
+		return text
+	}
+	b.WriteString(text[copyFrom:])
+	return b.String()
+}
+
+func isWholeCredentialToken(text string, start, end int) bool {
+	return (start == 0 || !isCredentialTokenByte(text[start-1])) &&
+		(end == len(text) || !isCredentialTokenByte(text[end]))
+}
+
+func isCredentialTokenByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9') ||
+		b == '/' ||
+		b == '+' ||
+		b == '='
+}
+
+// asciiLowerPreserveLen lowercases ASCII A-Z only, leaving every other byte
+// (including multi-byte UTF-8 sequences) unchanged. Unlike strings.ToLower it
+// never changes the byte length, so offsets into the result line up exactly with
+// offsets into the input.
+func asciiLowerPreserveLen(s string) string {
+	b := []byte(s)
+	changed := false
+	for i := range b {
+		if b[i] >= 'A' && b[i] <= 'Z' {
+			b[i] += 'a' - 'A'
+			changed = true
+		}
+	}
+	if !changed {
+		return s
+	}
+	return string(b)
+}
+
+func rot13ASCII(s string) string {
+	out := []byte(s)
+	for i, b := range out {
+		switch {
+		case b >= 'a' && b <= 'z':
+			out[i] = 'a' + (b-'a'+13)%26
+		case b >= 'A' && b <= 'Z':
+			out[i] = 'A' + (b-'A'+13)%26
+		}
+	}
+	return string(out)
+}

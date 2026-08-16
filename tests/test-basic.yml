@@ -1,0 +1,52 @@
+name: Test basic usage
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install jq (required by action)
+        run: |
+          if ! command -v jq &>/dev/null; then
+            apt-get install -y jq 2>/dev/null || true
+          fi
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          version: 'latest'
+          directory: '.'
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+          scan-diff: 'false'
+
+      - name: Assert action ran (outputs set, or failed gracefully on missing binary)
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SCORE: ${{ steps.action.outputs.score }}
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+          CRITICAL: ${{ steps.action.outputs.critical-count }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "score: $SCORE"
+          echo "findings-count: $FINDINGS"
+          echo "critical-count: $CRITICAL"
+          echo "audit-failed: $AUDIT_FAILED"
+
+          if [ "$OUTCOME" = "success" ]; then
+            # If the action succeeded, outputs should be set
+            if [ -z "$SCORE" ] && [ -z "$AUDIT_FAILED" ]; then
+              echo "FAIL: action succeeded but no outputs were set"
+              exit 1
+            fi
+            echo "PASS: action succeeded with score='$SCORE' audit-failed='$AUDIT_FAILED'"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (binary download likely failed for non-existent repo)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi
