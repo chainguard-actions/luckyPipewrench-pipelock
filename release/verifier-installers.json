@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "release_blocked": false,
+  "verifiers": [
+    {
+      "language": "Go",
+      "package": "pipelock-verifier",
+      "version": "candidate tag",
+      "install_source": "candidate source build",
+      "artifact_digest": "computed at run time",
+      "publisher": {
+        "repository": "luckyPipewrench/pipelock",
+        "workflow": ".github/workflows/release.yaml",
+        "environment": "tagged product release",
+        "source_ref": "candidate tag",
+        "source_commit": "candidate commit"
+      }
+    },
+    {
+      "language": "TypeScript",
+      "package": "@pipelock/verifier-ts",
+      "version": "0.3.0",
+      "install_source": "npm",
+      "artifact_digest": "sha512-toSGcJXUjXWmEpFcByA+Q8PGP/WatIAqWYIvhR4WjAz3IbcURAWyc32k0Ev+tknUbNdyaykRwkxNKhwKS+2rFg==",
+      "publisher": {
+        "repository": "luckyPipewrench/pipelock",
+        "workflow": ".github/workflows/publish-verifiers.yaml",
+        "environment": "verifier-release",
+        "source_ref": "verifier-v0.3.0",
+        "source_commit": "a2bc6cb18d728841b0edd7f714aca67d234f2e52"
+      }
+    },
+    {
+      "language": "Rust",
+      "package": "pipelock-verifier-rs",
+      "version": "0.3.0",
+      "install_source": "crates.io",
+      "artifact_digest": "381ed98d8b945e05f06b98d1c432ab5f9920b7932e5381458224511864ce2c0e",
+      "publisher": {
+        "repository": "luckyPipewrench/pipelock",
+        "workflow": ".github/workflows/publish-verifiers.yaml",
+        "environment": "verifier-release",
+        "source_ref": "verifier-v0.3.0",
+        "source_commit": "a2bc6cb18d728841b0edd7f714aca67d234f2e52"
+      }
+    },
+    {
+      "language": "Python",
+      "package": "pipelock-verify",
+      "version": "0.4.0",
+      "install_source": "PyPI",
+      "artifact_digest": "sha256:b380cb3f51fadbbb34ddd264b588893c9ac1c676058225915a2679d0e34a47c6",
+      "publisher": {
+        "repository": "luckyPipewrench/pipelock-verify-python",
+        "workflow": ".github/workflows/release.yml",
+        "environment": "pypi",
+        "source_ref": "v0.4.0",
+        "source_commit": "f70bca2222466f1d8ce66a3c4a764ef43e57a5f0"
+      }
+    }
+  ]
+}

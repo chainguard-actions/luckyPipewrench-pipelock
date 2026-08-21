@@ -1,0 +1,241 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package sandbox
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"sync"
+)
+
+// bridgeListenAddr is the address the child-side bridge proxy listens on
+// inside the sandbox network namespace. Agent processes use this as
+// HTTP_PROXY/HTTPS_PROXY to route traffic through pipelock's scanner.
+const bridgeListenAddr = "127.0.0.1:8888"
+
+// BridgeProxy runs inside the sandboxed child process. It listens on
+// loopback and bridges each TCP connection to the parent's Unix domain
+// socket proxy. The parent runs pipelock's scanner on the traffic.
+//
+// Architecture:
+//
+//	Agent (HTTP_PROXY=127.0.0.1:8888)
+//	  → BridgeProxy (loopback, inside sandbox)
+//	  → Unix socket (/tmp/pipelock-sandbox-<pid>/proxy.sock)
+//	  → Parent (pipelock proxy + scanner, host namespace)
+//	  → Internet
+type BridgeProxy struct {
+	listener        net.Listener
+	socketPath      string // parent's Unix domain socket path
+	wg              sync.WaitGroup
+	mu              sync.Mutex
+	closed          bool
+	failure         error
+	failureOnce     sync.Once
+	done            chan struct{}
+	doneOnce        sync.Once
+	watcherDone     chan struct{}
+	watcherDoneOnce sync.Once
+	watcherStarted  bool
+	conns           map[net.Conn]struct{}
+	closeOnce       sync.Once
+}
+
+// NewBridgeProxy creates a bridge proxy inside the sandbox namespace.
+// socketPath is the Unix domain socket where the parent's proxy listens.
+// listenAddr overrides the default listen address if non-empty.
+func NewBridgeProxy(socketPath string, listenAddr ...string) (*BridgeProxy, error) {
+	addr := bridgeListenAddr
+	if len(listenAddr) > 0 && listenAddr[0] != "" {
+		addr = listenAddr[0]
+	}
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("bridge proxy listen: %w", err)
+	}
+	return &BridgeProxy{
+		listener:    ln,
+		socketPath:  socketPath,
+		done:        make(chan struct{}),
+		watcherDone: make(chan struct{}),
+		conns:       make(map[net.Conn]struct{}),
+	}, nil
+}
+
+// Addr returns the proxy's listen address.
+func (bp *BridgeProxy) Addr() string {
+	return bp.listener.Addr().String()
+}
+
+// Serve accepts connections and bridges them to the parent's Unix socket.
+// It returns nil only when ctx is cancelled or Close shuts down the listener.
+// An unexpected listener failure or an unavailable parent socket is fatal.
+func (bp *BridgeProxy) Serve(ctx context.Context) error {
+	bp.mu.Lock()
+	if bp.closed {
+		bp.mu.Unlock()
+		return nil
+	}
+	bp.watcherStarted = true
+	bp.mu.Unlock()
+	go func() {
+		defer bp.watcherDoneOnce.Do(func() { close(bp.watcherDone) })
+		select {
+		case <-ctx.Done():
+			_ = bp.listener.Close()
+		case <-bp.done:
+		}
+	}()
+
+	for {
+		conn, err := bp.listener.Accept()
+		if err != nil {
+			if failure := bp.getFailure(); failure != nil {
+				return failure
+			}
+			if bp.isShutdown(ctx) {
+				return nil
+			}
+			return fmt.Errorf("bridge listener accept: %w", err)
+		}
+		bp.mu.Lock()
+		if bp.closed {
+			bp.mu.Unlock()
+			_ = conn.Close()
+			return nil
+		}
+		bp.trackConnLocked(conn)
+		bp.wg.Add(1)
+		bp.mu.Unlock()
+		go func(conn net.Conn) {
+			defer bp.wg.Done()
+			defer bp.untrackConn(conn)
+			bp.handleConn(conn)
+		}(conn)
+	}
+}
+
+func (bp *BridgeProxy) isShutdown(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	return bp.closed
+}
+
+func (bp *BridgeProxy) getFailure() error {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	return bp.failure
+}
+
+// fail records the first fatal bridge failure and wakes Serve by closing the
+// listener. It intentionally does not call Close because this may run from an
+// active connection handler that Close waits on.
+func (bp *BridgeProxy) fail(err error) {
+	bp.failureOnce.Do(func() {
+		bp.mu.Lock()
+		if bp.closed {
+			bp.mu.Unlock()
+			return
+		}
+		bp.failure = err
+		bp.doneOnce.Do(func() { close(bp.done) })
+		_ = bp.listener.Close()
+		for conn := range bp.conns {
+			_ = conn.Close()
+		}
+		bp.mu.Unlock()
+	})
+}
+
+// Close shuts down the proxy and waits for active connections.
+func (bp *BridgeProxy) Close() {
+	bp.closeOnce.Do(func() {
+		bp.doneOnce.Do(func() { close(bp.done) })
+		bp.mu.Lock()
+		bp.closed = true
+		waitForWatcher := bp.watcherStarted
+		_ = bp.listener.Close()
+		for conn := range bp.conns {
+			_ = conn.Close()
+		}
+		bp.mu.Unlock()
+		bp.wg.Wait()
+		if waitForWatcher {
+			<-bp.watcherDone
+		} else {
+			// Serve may not have started yet even though the listener already
+			// accepted a queued connection. Complete the watcher lifecycle so
+			// a later Serve observes closed and callers never wait forever.
+			bp.watcherDoneOnce.Do(func() { close(bp.watcherDone) })
+		}
+	})
+}
+
+func (bp *BridgeProxy) trackConn(conn net.Conn) bool {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	if bp.closed {
+		return false
+	}
+	bp.trackConnLocked(conn)
+	return true
+}
+
+func (bp *BridgeProxy) trackConnLocked(conn net.Conn) {
+	bp.conns[conn] = struct{}{}
+}
+
+func (bp *BridgeProxy) untrackConn(conn net.Conn) {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	delete(bp.conns, conn)
+}
+
+// handleConn bridges a single TCP connection from the sandbox to the
+// parent's Unix domain socket proxy. Raw TCP forwarding - the parent's
+// proxy handles HTTP CONNECT, DLP scanning, etc.
+func (bp *BridgeProxy) handleConn(conn net.Conn) {
+	defer func() { _ = conn.Close() }()
+
+	// Connect to parent's proxy via Unix socket.
+	parentConn, err := (&net.Dialer{}).DialContext(context.Background(), "unix", bp.socketPath)
+	if err != nil {
+		bp.fail(fmt.Errorf("bridge connect to parent proxy: %w", err))
+		return
+	}
+	if !bp.trackConn(parentConn) {
+		_ = parentConn.Close()
+		return
+	}
+	defer bp.untrackConn(parentConn)
+	defer func() { _ = parentConn.Close() }()
+
+	// Bridge data bidirectionally.
+	var wg sync.WaitGroup
+	wg.Add(2) //nolint:mnd // two copy directions
+
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(parentConn, conn) // agent → parent
+		// Signal parent that agent is done sending.
+		if uc, ok := parentConn.(*net.UnixConn); ok {
+			_ = uc.CloseWrite()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(conn, parentConn) // parent → agent
+		// Signal agent that parent is done sending.
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.CloseWrite()
+		}
+	}()
+
+	wg.Wait()
+}

@@ -1,0 +1,164 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - gosec
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - bodyclose
+    - errname
+    - errorlint
+    - goconst
+    - godot
+    - misspell
+    - noctx
+    - predeclared
+    - revive
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - wastedassign
+  exclusions:
+    rules:
+      - path: internal/proxy/proxy\.go
+        linters: [gosec]
+        text: "G704"
+      # Descriptor-bound exec. Integrity verification hashes an opened file
+      # descriptor and must then execute THAT descriptor, so the bytes hashed
+      # and the bytes run are one inode rather than two independent name
+      # resolutions. golang.org/x/sys/unix at the pinned version exposes no
+      # Execveat wrapper, so the syscall is issued directly, which requires
+      # unsafe.Pointer for argv and env (G103), and the helper execs a path
+      # held in a variable (G204). Both are inherent to the mechanism. Scoped
+      # to this one file, and recorded here rather than as inline directives so
+      # the exception is reviewable in one place.
+      - path: internal/mcp/fdexec_linux\.go
+        linters: [gosec]
+        text: "G103|G204"
+      # An executable test fixture has to be executable, so 0600 is not an
+      # option for it.
+      - path: internal/mcp/fdexec_linux_test\.go
+        linters: [gosec]
+        text: "G302|G306"
+      # CLI stream routing is proved by re-executing this test binary and
+      # reading the child's real stdout and stderr, because a test that installs
+      # its own writers is exactly what hid the routing bug it exists to catch.
+      # Re-exec means passing the resolved executable path to exec (G204). The
+      # path comes from os.Executable and the argument vector is constant; the
+      # pipelock arguments under test travel in an environment variable.
+      - path: internal/cli/stdout_routing_test\.go
+        linters: [gosec]
+        text: "G204"
+      # The MCP server command is operator-supplied by construction: it is the
+      # server the operator asked Pipelock to wrap. G204 fires on every branch
+      # that launches it, and this file now has several (descriptor-bound,
+      # warn-only compatibility, and integrity-disabled). Recorded once here
+      # rather than as a directive on each call site.
+      - path: internal/mcp/proxy\.go
+        linters: [gosec]
+        text: "G204"
+      # Config schema holds YAML-bound container fields for user-supplied
+      # tokens (APIToken, AuthToken, BearerTokens). These are NOT hardcoded
+      # credentials — gosec G117's "field name matches secret pattern"
+      # check is a false positive for config containers.
+      - path: internal/config/schema\.go
+        linters: [gosec]
+        text: "G117"
+      # goconst fires on repeated literal test fixture data where extracting
+      # constants hurts readability without finding real bugs. noctx stays
+      # enforced on tests so context-aware request/listener patterns required
+      # by CLAUDE.md do not regress on tests.
+      - path: _test\.go$
+        linters: [goconst]
+      # Playground demo/evidence tooling launches only known local binaries:
+      # the web tool, toy agent, the model-agent wrapper, `pipelock contain`,
+      # and `go build`.
+      - path: cmd/pipelock-playground-toyagent/main\.go
+        linters: [gosec]
+        text: "G204"
+      - path: internal/playground/containment\.go
+        linters: [gosec]
+        text: "G204"
+      - path: internal/playground/containment_invm\.go
+        linters: [gosec]
+        text: "G204"
+      - path: internal/playground/liverun\.go
+        linters: [gosec]
+        text: "G204"
+      - path: internal/playground/liverun_test\.go
+        linters: [gosec]
+        text: "G204"
+      # live_llm_driver.go launches the model-agent wrapper binary (operator-
+      # configured path); the internal test builds + runs a local helper.
+      - path: internal/playground/live_llm_driver\.go
+        linters: [gosec]
+        text: "G204"
+      - path: internal/playground/live_llm_internal_test\.go
+        linters: [gosec]
+        text: "G204"
+      # shell_tools.go's run_command intentionally executes an arbitrary,
+      # model-supplied shell command. That is the demo's whole point: the agent
+      # has a real shell and Pipelock plus host kernel containment are the only
+      # controls. run_command is gated (AllowExec) so it is only ever offered on
+      # a host whose kernel contains the agent's egress.
+      - path: internal/playground/llmagent/shell_tools\.go
+        linters: [gosec]
+        text: "G204"
+      - path: internal/playground/orchestrate\.go
+        linters: [gosec]
+        text: "G204"
+      # The live-demo harness intentionally makes the temp binary directory
+      # cross-user executable so the contained agent user can run the built
+      # binaries after privilege drop. Artifact reads below are over freshly
+      # generated temp/packet dirs owned by the test/demo process.
+      - path: internal/playground/orchestrate\.go
+        linters: [gosec]
+        text: "(G302|G122)"
+      - path: internal/playground/liverun_test\.go
+        linters: [gosec]
+        text: "G122"
+      # liverun.go pins an RFC 5737 reserved IP literal as the bypass target;
+      # gosec G101 false-positives on the IP string — it is not a credential.
+      - path: internal/playground/liverun\.go
+        linters: [gosec]
+        text: "G101"
+      # The liveproof harness deliberately builds the shipped binary and runs
+      # it through customer-visible CLI/proxy surfaces.
+      - path: internal/liveproof/liveproof_test\.go
+        linters: [gosec]
+        text: "G204"
+  settings:
+    gosec:
+      excludes:
+        # Taint analysis rules — false positives for CLI tools and HTTP proxies.
+        # Pipelock IS a proxy; client.Do(req) is its core purpose. SSRF protection
+        # lives in the scanner pipeline, not the Go type system.
+        - G704 # SSRF via taint analysis
+        - G705 # XSS via taint analysis — CLI terminal output, not web
+        - G703 # Path traversal via taint analysis — paths are validated upstream
+    goconst:
+      # goconst v2.12 made the default (min-occurrences: 3, min-len: 3)
+      # much noisier without finding bugs. Raise both thresholds so the
+      # rule still surfaces egregious duplication of meaningfully-long
+      # strings — short tokens (install/remove/command/POST) and the
+      # prometheus namespace "pipelock" repeated across every metric file
+      # are routine API surfaces, not refactor opportunities. Truly
+      # repeated long strings (DLP pattern names, CIDR sentinels) still
+      # surface.
+      min-occurrences: 30
+      min-len: 12
+    revive:
+      rules:
+        - name: var-naming
+          disabled: true
+
+formatters:
+  enable:
+    - gofumpt
+
+issues:
+  max-issues-per-linter: 50
+  max-same-issues: 5

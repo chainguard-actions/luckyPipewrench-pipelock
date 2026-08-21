@@ -1,0 +1,356 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package coveragecertverify
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"encoding/hex"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/coveragecert"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
+)
+
+func writeCoverageCertVerifyFixture(t *testing.T) (certFile, pubHex string) {
+	t.Helper()
+	pub, priv, err := signing.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	cert, err := coveragecert.Sign(coveragecert.Body{
+		Schema:        coveragecert.Schema,
+		KeyPurpose:    coveragecert.KeyPurpose,
+		Agent:         "agent-a",
+		WindowStart:   start,
+		WindowEnd:     start.Add(time.Hour),
+		TotalReceipts: 2,
+		Sessions: []coveragecert.SessionCoverage{{
+			ID:                 "session-a",
+			ReceiptCount:       2,
+			ChainIntact:        true,
+			Anchored:           "local",
+			CompletenessStatus: "LIMITED",
+			CompletenessReason: "bounded_closed",
+		}},
+		SessionsCovered:    1,
+		ChainsIntact:       1,
+		TrustedSignerKey:   hex.EncodeToString(pub),
+		Boundary:           coveragecert.DefaultBoundary(),
+		StandingExclusions: coveragecert.DefaultStandingExclusions(),
+	}, priv)
+	if err != nil {
+		t.Fatalf("coveragecert.Sign: %v", err)
+	}
+	data, err := coveragecert.Marshal(cert)
+	if err != nil {
+		t.Fatalf("coveragecert.Marshal: %v", err)
+	}
+	certFile = filepath.Join(t.TempDir(), "cert.json")
+	if err := os.WriteFile(certFile, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	return certFile, hex.EncodeToString(pub)
+}
+
+func writeCoverageCertInvalidBodyFixture(t *testing.T) (certFile, pubHex string) {
+	t.Helper()
+	pub, priv, err := signing.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	pubHex = hex.EncodeToString(pub)
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	body := coveragecert.Body{
+		Schema:        coveragecert.Schema,
+		KeyPurpose:    coveragecert.KeyPurpose,
+		Agent:         "agent-a",
+		WindowStart:   start,
+		WindowEnd:     start.Add(time.Hour),
+		TotalReceipts: 2,
+		Sessions: []coveragecert.SessionCoverage{{
+			ID:                 "session-a",
+			ReceiptCount:       2,
+			ChainIntact:        true,
+			Anchored:           "local",
+			CompletenessStatus: "LIMITED",
+			CompletenessReason: "bounded_closed",
+		}},
+		SessionsCovered:    1,
+		ChainsIntact:       1,
+		TrustedSignerKey:   pubHex,
+		Boundary:           "Coverage of all agent activity and mediated egress inside the declared Pipelock boundary",
+		StandingExclusions: coveragecert.DefaultStandingExclusions(),
+	}
+	preimage, err := body.SignablePreimage()
+	if err != nil {
+		t.Fatalf("SignablePreimage: %v", err)
+	}
+	cert := coveragecert.Certificate{
+		Body:      body,
+		Signature: hex.EncodeToString(ed25519.Sign(priv, preimage)),
+		SignerKey: pubHex,
+	}
+	data, err := coveragecert.Marshal(cert)
+	if err != nil {
+		t.Fatalf("coveragecert.Marshal: %v", err)
+	}
+	certFile = filepath.Join(t.TempDir(), "invalid-body-cert.json")
+	if err := os.WriteFile(certFile, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	return certFile, pubHex
+}
+
+func TestRunTrustedSignerVerifies(t *testing.T) {
+	certFile, pubHex := writeCoverageCertVerifyFixture(t)
+	var out bytes.Buffer
+
+	if err := Run(Options{
+		CertFile:       certFile,
+		TrustedSigners: []string{"inline=" + pubHex},
+		Out:            &out,
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(out.String(), "Signature: valid") {
+		t.Fatalf("Run output = %q, want bounded verification lines", out.String())
+	}
+}
+
+func TestRunNoTrustedSignerFailsClosedByDefault(t *testing.T) {
+	certFile, _ := writeCoverageCertVerifyFixture(t)
+	var out bytes.Buffer
+
+	err := Run(Options{
+		CertFile: certFile,
+		Out:      &out,
+	})
+	if err == nil || !strings.Contains(err.Error(), "no trusted-signer set supplied") {
+		t.Fatalf("Run err = %v, want fail-closed missing trusted-signer error", err)
+	}
+	if strings.Contains(out.String(), "STRUCTURAL ONLY") {
+		t.Fatalf("Run output = %q, must not label default verification as structural-only opt-in", out.String())
+	}
+}
+
+func TestRunTrustModeTable(t *testing.T) {
+	certFile, pubHex := writeCoverageCertVerifyFixture(t)
+	otherPub, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	otherPubHex := hex.EncodeToString(otherPub)
+
+	tests := []struct {
+		name             string
+		trustedSigners   []string
+		allowStructural  bool
+		wantErrContains  string
+		wantOutContains  []string
+		rejectOutContain []string
+	}{
+		{
+			name:            "no trusted set no flag fails nonzero",
+			wantErrContains: "no trusted-signer set supplied",
+			wantOutContains: []string{"Signature: valid", "Signer: NOT TRUSTED"},
+		},
+		{
+			name:            "no trusted set structural flag exits zero",
+			allowStructural: true,
+			wantOutContains: []string{"Signature: valid", "Signer: NOT TRUSTED", "STRUCTURAL ONLY — signer NOT trusted"},
+		},
+		{
+			name:             "trusted set matching signer verifies",
+			trustedSigners:   []string{"inline=" + pubHex},
+			wantOutContains:  []string{"Signature: valid", "Signer: TRUSTED"},
+			rejectOutContain: []string{"STRUCTURAL ONLY"},
+		},
+		{
+			name:            "trusted set wrong signer fails",
+			trustedSigners:  []string{"inline=" + otherPubHex},
+			wantErrContains: "not in the trusted-signer set",
+			wantOutContains: []string{"Signature: valid", "Signer: NOT TRUSTED"},
+		},
+		{
+			name:            "forged self-signed cert fails by default",
+			wantErrContains: "no trusted-signer set supplied",
+			wantOutContains: []string{"Signature: valid", "Signer: NOT TRUSTED"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			err := Run(Options{
+				CertFile:       certFile,
+				TrustedSigners: tt.trustedSigners,
+				AllowUnpinned:  tt.allowStructural,
+				Out:            &out,
+			})
+			if tt.wantErrContains == "" {
+				if err != nil {
+					t.Fatalf("Run err = %v, want nil", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tt.wantErrContains) {
+				t.Fatalf("Run err = %v, want containing %q", err, tt.wantErrContains)
+			}
+			for _, want := range tt.wantOutContains {
+				if !strings.Contains(out.String(), want) {
+					t.Fatalf("Run output = %q, want containing %q", out.String(), want)
+				}
+			}
+			for _, reject := range tt.rejectOutContain {
+				if strings.Contains(out.String(), reject) {
+					t.Fatalf("Run output = %q, must not contain %q", out.String(), reject)
+				}
+			}
+		})
+	}
+}
+
+func TestRunUntrustedSignerFailsClosed(t *testing.T) {
+	certFile, _ := writeCoverageCertVerifyFixture(t)
+	otherPub, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	var out bytes.Buffer
+
+	err = Run(Options{
+		CertFile:       certFile,
+		TrustedSigners: []string{"inline=" + hex.EncodeToString(otherPub)},
+		Out:            &out,
+	})
+	if err == nil || !strings.Contains(err.Error(), "not in the trusted-signer set") {
+		t.Fatalf("Run err = %v, want fail-closed untrusted-signer error", err)
+	}
+	// The diagnostic line is still emitted before the fail-closed return.
+	if !strings.Contains(out.String(), "NOT TRUSTED") {
+		t.Fatalf("Run output = %q, want NOT TRUSTED diagnostic line", out.String())
+	}
+}
+
+func TestRunInvalidBodyFailsClosedEvenWithTrustedSignature(t *testing.T) {
+	certFile, pubHex := writeCoverageCertInvalidBodyFixture(t)
+	var out bytes.Buffer
+
+	err := Run(Options{
+		CertFile:       certFile,
+		TrustedSigners: []string{"inline=" + pubHex},
+		Out:            &out,
+	})
+	if err == nil || !strings.Contains(err.Error(), "body validation failed") {
+		t.Fatalf("Run invalid body err = %v, want body validation failure", err)
+	}
+}
+
+func TestRunRejectsSignedAgentLineInjection(t *testing.T) {
+	pub, priv, err := signing.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	pubHex := hex.EncodeToString(pub)
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	body := coveragecert.Body{
+		Schema:        coveragecert.Schema,
+		KeyPurpose:    coveragecert.KeyPurpose,
+		Agent:         "agent-a\nFORGED: sessions covered",
+		WindowStart:   start,
+		WindowEnd:     start.Add(time.Hour),
+		TotalReceipts: 2,
+		Sessions: []coveragecert.SessionCoverage{{
+			ID:                 "session-a",
+			ReceiptCount:       1,
+			ChainIntact:        true,
+			Anchored:           "local",
+			CompletenessStatus: "LIMITED",
+			CompletenessReason: "bounded_closed",
+		}},
+		SessionsCovered:    1,
+		ChainsIntact:       1,
+		TrustedSignerKey:   pubHex,
+		Boundary:           coveragecert.DefaultBoundary(),
+		StandingExclusions: coveragecert.DefaultStandingExclusions(),
+	}
+	preimage, err := body.SignablePreimage()
+	if err != nil {
+		t.Fatalf("SignablePreimage: %v", err)
+	}
+	cert := coveragecert.Certificate{
+		Body:      body,
+		Signature: hex.EncodeToString(ed25519.Sign(priv, preimage)),
+		SignerKey: pubHex,
+	}
+	data, err := coveragecert.Marshal(cert)
+	if err != nil {
+		t.Fatalf("coveragecert.Marshal: %v", err)
+	}
+	certFile := filepath.Join(t.TempDir(), "line-injection-cert.json")
+	if err := os.WriteFile(certFile, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	var out bytes.Buffer
+	err = Run(Options{
+		CertFile:       certFile,
+		TrustedSigners: []string{"inline=" + pubHex},
+		Out:            &out,
+	})
+	if err == nil || !strings.Contains(err.Error(), "control") {
+		t.Fatalf("Run line-injection err = %v, want fail-closed control-character error", err)
+	}
+	if strings.Contains(out.String(), "FORGED") {
+		t.Fatalf("Run output = %q, must not emit injected over-claim lines", out.String())
+	}
+}
+
+func TestRunFailsClosed(t *testing.T) {
+	certFile, pubHex := writeCoverageCertVerifyFixture(t)
+	data, err := os.ReadFile(filepath.Clean(certFile))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	tampered := strings.Replace(string(data), `"agent": "agent-a"`, `"agent": "agent-b"`, 1)
+	if tampered == string(data) {
+		t.Fatal("fixture did not contain agent field")
+	}
+	tamperedFile := filepath.Join(t.TempDir(), "tampered.json")
+	if err := os.WriteFile(tamperedFile, []byte(tampered), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	err = Run(Options{CertFile: tamperedFile, TrustedSigners: []string{"inline=" + pubHex}})
+	if err == nil || !strings.Contains(err.Error(), "signature is invalid") {
+		t.Fatalf("Run tampered error = %v, want invalid signature", err)
+	}
+
+	err = Run(Options{CertFile: filepath.Join(t.TempDir(), "missing.json")})
+	if err == nil || !strings.Contains(err.Error(), "--cert") {
+		t.Fatalf("Run missing file error = %v, want --cert", err)
+	}
+}
+
+func TestRunRejectsOversizedCertificate(t *testing.T) {
+	certFile := filepath.Join(t.TempDir(), "oversized.json")
+	if err := os.WriteFile(certFile, bytes.Repeat([]byte{'x'}, int(maxCertificateBytes)+1), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	err := Run(Options{CertFile: certFile})
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("Run oversized certificate err = %v, want bounded-read error", err)
+	}
+}
+
+func TestRunRejectsNonRegularCertificate(t *testing.T) {
+	err := Run(Options{CertFile: t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("Run directory certificate err = %v, want regular-file error", err)
+	}
+}

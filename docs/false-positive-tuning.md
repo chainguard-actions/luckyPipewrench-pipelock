@@ -1,0 +1,275 @@
+# False Positive Tuning
+
+When pipelock blocks or warns on legitimate traffic, this guide walks you through identifying the source, suppressing known-good findings, and tuning thresholds so the scanner stays useful without getting in the way.
+
+**Start in audit mode.** If you're seeing unexpected blocks, switch to audit first. Audit logs everything but blocks nothing, giving you a clear picture of what's firing before you make changes.
+
+```bash
+pipelock generate config --preset audit > pipelock.yaml
+```
+
+**Fastest path for a single URL.** Run [`pipelock explain <url>`](cli/explain.md) to see which scanner blocked a specific URL and the exact, narrowest config knob that scanner consults — without resolving DNS or fetching anything. It names the correct knob per scanner (for example, URL-DLP false positives point at `dlp.patterns[].exempt_domains`, not the top-level `suppress:` list, which URL DLP never reads).
+
+## Identifying Which Scanner Triggered
+
+Every pipelock log entry includes a `scanner` field and a `rule` field. These tell you exactly which layer flagged the request and which pattern matched.
+
+Scanner types:
+
+| Scanner | What it checks |
+|---------|---------------|
+| `dlp` | Secret patterns (API keys, tokens, credentials, crypto keys) |
+| `response_scan` | Injection patterns in content returned to the agent |
+| `entropy` | Path and subdomain entropy (high-randomness URL segments) |
+| `ssrf` | Private IPs, cloud metadata endpoints, DNS rebinding |
+| `tool_policy` | MCP tool call rules (destructive ops, credential access) |
+| `tool_chain` | Sequences of MCP tool calls matching attack patterns |
+| `blocklist` | Domain blocklist matches |
+
+Check recent findings:
+
+```bash
+pipelock logs --file pipelock-audit.log --last 50
+pipelock logs --file pipelock-audit.log --filter blocked
+```
+
+Each finding includes an `event` field and the `scanner` that triggered. For DLP findings, the `reason` field names the matched pattern (e.g., "AWS Access ID", "GitHub Token"). For response scanning, the `patterns` field lists which patterns matched. Use these names when writing suppressions.
+
+## Seeing What Matched
+
+Pipelock does not have a raw "dump the secret back to me" verbose mode. That would leak the same data the scanner is trying to protect.
+
+Use these instead:
+
+- `mode: audit` or `enforce: false` to let traffic through while logging what would have triggered.
+- Normal logs to see the `scanner`, `rule`/`pattern`, request ID, and verdict.
+- The flight recorder to preserve a tamper-evident decision trail with redacted detail.
+
+For example, enable the recorder:
+
+```yaml
+flight_recorder:
+  enabled: true
+  dir: /var/lib/pipelock/evidence
+  signing_key_path: /etc/pipelock/keys/flight-recorder-signing.key   # `pipelock init` writes this next to your config
+```
+
+The recorder keeps receipt and decision context, but sensitive content is redacted before it is written unless you explicitly configure raw escrow. Expect pattern names and redacted evidence, not plaintext secrets.
+
+## Suppressing Specific Findings
+
+Add suppressions to your config when you know a finding is safe. Each entry takes a `rule` (pattern name), `path` (URL or glob pattern), and optional `reason` for the audit trail.
+
+```yaml
+suppress:
+  - rule: "AWS Access ID"
+    path: "api.example.com/v2/*"
+    reason: "Internal service uses AKIA-prefixed keys for test accounts"
+  - rule: "AWS Access ID"
+    path: "internal-testing.example.com/*"
+    reason: "Test environment uses canary-format keys"
+```
+
+Suppressed findings still appear in logs with `suppressed: true`, so you can review them later.
+
+For inline suppression in git-scanned files, add a `pipelock:ignore` comment on the line above:
+
+```python
+# pipelock:ignore -- test fixture, not a real key
+TEST_KEY = "AKIA..."  # your test key here
+```
+
+See [docs/guides/suppression.md](guides/suppression.md) for the full suppression reference.
+
+## Tuning DLP Patterns
+
+### Using only your own patterns
+
+By default, pipelock merges your custom patterns with the 65 built-in defaults. To use only your own patterns (disabling all built-ins), set `include_defaults: false`:
+
+```yaml
+dlp:
+  include_defaults: false
+  patterns:
+    - name: "internal_api_key"
+      regex: "INTERNAL-[A-Z0-9]{32}"
+      severity: "high"
+```
+
+There is no top-level `dlp.action`. If you want DLP to stop blocking while you tune rules, use audit mode. If you want transport-level redaction, configure the specific surface that supports it, such as `request_body_scanning.action`.
+
+### Per-pattern domain exemptions
+
+Each DLP pattern supports an `exempt_domains` field. To exempt a domain for a specific pattern, add it as a custom pattern entry with the exemption. When `include_defaults` is true, custom patterns with the same name override the built-in:
+
+```yaml
+dlp:
+  include_defaults: true
+  patterns:
+    - name: "AWS Access ID"
+      regex: "(AKIA|A3T|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16,}"
+      severity: "critical"
+      exempt_domains:
+        - "internal-testing.example.com"
+```
+
+This keeps the pattern active everywhere else while skipping it for the specified domain.
+
+### Suppressing specific findings
+
+For URL-path-level suppression (finer than domain exemption), use `suppress` entries at the top level of your config. See the [Suppressing Specific Findings](#suppressing-specific-findings) section above.
+
+For custom provider API keys, use both controls together: add `exempt_domains` on the DLP pattern for URL scans to the provider's own host, and add a matching `suppress` entry for body/header findings on that provider URL. The built-in provider-key rules already do this for their documented hosts.
+
+## Tuning Entropy Thresholds
+
+Path entropy and subdomain entropy are the most common false positive sources. APIs that use UUIDs, base64-encoded IDs, or hash-based URLs in their paths trigger entropy checks. Defaults already exempt common package/object hosts with hash-based routing paths: `files.pythonhosted.org`, `pypi.org`, and `objects.githubusercontent.com`.
+
+The default threshold is `4.5` (balanced preset). Raising it reduces sensitivity:
+
+```yaml
+fetch_proxy:
+  monitoring:
+    entropy_threshold: 5.0
+```
+
+To exempt specific domains instead of raising the global threshold:
+
+```yaml
+fetch_proxy:
+  monitoring:
+    subdomain_entropy_exclusions:
+      - "api.example.com"
+      - "cdn.example.com"
+```
+
+**Guideline:** If the domain is trusted and uses high-entropy URLs by design (CDNs, object storage, API gateways), exempt it. If the domain is untrusted, keep the threshold and investigate the findings.
+
+### Structural hostname-exfiltration signals
+
+Subdomain scanning also flags two structural patterns that the entropy threshold cannot catch, because encoded data sits *at or below* the entropy ceiling (hex tops out at 4.0 bits/char):
+
+- A single subdomain label that is a long (14+ char) pure-hex or base32 token.
+- A DNS-tunneling shape with either three or more encoded chunks, or two or more encoded chunks in a four-plus-label subdomain. An encoded chunk is a hex/base32-looking label of 8+ chars.
+
+Both report `subdomain_entropy` and are independent of `subdomain_entropy_threshold`: **raising the threshold no longer allows hex/base32 subdomain labels.** Dictionary and hyphenated labels (`customer-production.us-east-1.api.example.com`) are not affected.
+
+To allow a legitimate service that uses hex/base32 subdomains by design, add it to `subdomain_entropy_exclusions` (the targeted escape hatch). Setting `subdomain_entropy_threshold: 0` disables subdomain scanning entirely, including these structural signals.
+
+**Residual gaps (by design, to bound false positives):** base32 labels with fewer than two digits, mixed-charset labels under 16 chars, and two-label chunks are not flagged. These are accepted false-negative tradeoffs; tighten with a custom domain blocklist if your threat model requires it.
+
+## Tuning Response Scanning
+
+Response injection patterns can flag legitimate content: documentation about AI safety, security research pages, or sites that discuss prompt engineering.
+
+There are two knobs here and they are not interchangeable. Start with the narrow one.
+
+**One pattern firing on one destination: use `suppress`.** This drops only the named pattern for URLs matching the path glob, and leaves every other response control on that host intact. It is the right fix for the common case of a single injection or solicitation pattern matching legitimate prose.
+
+```yaml
+suppress:
+  - rule: "Prompt Injection"
+    path: "*docs.vendor.example*"
+    reason: "vendor docs explain injection defenses in prose"
+```
+
+Suppressions apply per normalization pass, including the compiled-in core patterns, so a suppressed match cannot mask a later encoded finding on the same body. Suppressed findings still appear in logs with `suppressed: true`.
+
+**Whole-host trust: use `exempt_domains`, and know what it costs.** This is the broadest response-side control. For forward-proxy and TLS-intercepted traffic, an exempt host's response streams through untouched: no injection scan, and also no media metadata strip, no Browser Shield rewrite, and no response scan-cap block. Request-side DLP, redaction, SSRF, authority checks, and budget accounting still run. Reach for it when you trust the host wholesale or need large downloads byte-intact, not to silence one pattern.
+
+```yaml
+response_scanning:
+  enabled: true
+  action: warn
+  exempt_domains:
+    - "docs.vendor.example"
+    - "*.docs.vendor.example"
+```
+
+`exempt_domains` only takes effect while `response_scanning.enabled` is true. With response scanning off the list goes dormant and responses take the buffered path, which still applies media policy and Browser Shield. If a host cannot be intercepted at all, for example because of certificate pinning, prefer `tls_interception.passthrough_domains` instead. See [configuration.md](configuration.md) for the full response-scanning reference.
+
+Switching from `block` to `warn` for response scanning gives visibility without interrupting the agent. This is useful during initial deployment when you're learning what your agent fetches.
+
+## Rolling out a new DLP pattern safely
+
+When you add a custom DLP pattern, the pattern may trigger on traffic you didn't anticipate. Shipping a pattern in audit-only mode first lets you watch for false positives on real traffic without breaking legitimate workflows.
+
+Set `action: warn` on the individual pattern (not the top-level `dlp.action`, which is reserved):
+
+```yaml
+dlp:
+  patterns:
+    - name: "VendorInternalToken"
+      regex: "vendor_[A-Za-z0-9]{32}"
+      severity: high
+      action: warn        # audit-only for rollout
+      exempt_domains:
+        - "billing.vendor.example"
+```
+
+Warn matches from that pattern appear in your audit sink (webhook, syslog, OTLP) with the pattern name, severity, transport, and request context, but the request is not blocked. Tune the regex and `exempt_domains` until the signal is clean, then remove the `action` line to return the pattern to default blocking behavior.
+
+Only `action: warn` and empty string are accepted on DLP patterns. `block`, `strip`, `ask`, `redirect`, or any other value is rejected at config load.
+
+## Tuning Cross-Request Detection
+
+The entropy budget tracks cumulative high-entropy data across requests in a session. High-traffic API domains can exhaust the budget with legitimate traffic.
+
+Exempt trusted high-volume domains:
+
+```yaml
+cross_request_detection:
+  entropy_budget:
+    exempt_domains:
+      - "api.anthropic.com"
+      - "api.openai.com"
+```
+
+You can also increase the budget window:
+
+```yaml
+cross_request_detection:
+  entropy_budget:
+    bits_per_window: 1000000
+    window_minutes: 10
+```
+
+## Common False Positive Scenarios
+
+| Scenario | Scanner | Pattern | Fix |
+|----------|---------|---------|-----|
+| API returns docs about prompt injection | response | Prompt Injection | Add a `suppress` entry for `Prompt Injection` scoped to that host's URLs. Use `response_scanning.exempt_domains` only to trust the whole host, which also drops media stripping, Browser Shield, and the response size cap there |
+| URL contains UUID path segments | entropy | (path entropy) | Raise `entropy_threshold` or add to `subdomain_entropy_exclusions` |
+| Base64-encoded JWT in Authorization header | dlp | JWT Token | Add per-pattern `exempt_domains` for the auth provider |
+| High-entropy CDN URLs | entropy | (subdomain entropy) | Add CDN to `subdomain_entropy_exclusions` |
+| Service with long hex/base32 subdomain labels | subdomain_entropy | (structural hostname-exfil signal) | Add the host to `subdomain_entropy_exclusions` (raising the threshold does not allow encoded labels) |
+| Internal API keys matching AWS format, in a URL or query | dlp | AWS Access ID | Add `exempt_domains` to the `AWS Access ID` pattern, copying the built-in `regex` and `severity` into the override: a same-name entry REPLACES the built-in, so an override that omits them silently disables the detection instead of narrowing it. See [per-pattern domain exemptions](#per-pattern-domain-exemptions) for the complete form. URL scanning does not consult top-level `suppress`, so a `suppress` entry is inert for this case |
+| Internal API keys matching AWS format, in a request body or header | dlp | AWS Access ID | Add a `suppress` entry with the rule name, a path glob, and a reason |
+| GET to an AWS S3 presigned URL (issuer's bucket) | dlp | AWS Access ID | None required — handled automatically. The scanner detects a structurally valid SigV4 query set (all five parameters required exactly once: `X-Amz-Algorithm=AWS4-HMAC-SHA256`, `X-Amz-Credential=<KeyID>/<YYYYMMDD>/<region>/<service>/aws4_request`, `X-Amz-Date`, `X-Amz-Signature`, `X-Amz-Expires` as a positive integer) hosted on an `amazonaws.com` (or `amazonaws.com.cn`) endpoint, and exempts only the access-key component inside the credential value. The same access-key elsewhere in the URL — path, hostname, other query params, ordered subsequence concatenation — still blocks. Duplicate fields, mismatched scope dates, overlong key prefixes, non-AWS hosts, and bogus algorithms all fall back to normal DLP. SigV4 carve-outs are adaptive-neutral: they neither poison the threat score nor earn clean-decay. An `X-Amz-Expires` above 24h attaches an info-tier `SigV4 Long Expiry` warn finding for audit visibility but does not block. |
+| WebSocket frames with encoded binary data | dlp | Environment Variable Secret | Add `exempt_domains` to the `Environment Variable Secret` pattern for the WebSocket upstream host, or a `suppress` entry scoped to that upstream URL |
+| Test fixtures containing fake secrets | dlp | (multiple) | Use `pipelock:ignore` inline comments |
+| Security research site with injection examples | response | Credential Solicitation | Add a `suppress` entry for `Credential Solicitation` scoped to that host's URLs. Suppression reaches the core patterns, so overriding the pattern in `response_scanning.patterns` is not required and does not work on its own |
+| Hash-based object storage paths | entropy | (path entropy) | Add storage domain to `subdomain_entropy_exclusions` |
+
+## Transitioning from Audit to Enforcement
+
+1. Run audit mode for a full agent work session (at least a few hours of real usage)
+2. Review findings: `pipelock logs --file pipelock-audit.log --filter blocked`
+3. For each finding, decide: real threat or false positive?
+4. Add suppressions and exemptions for confirmed false positives
+5. Switch to balanced mode with `action: warn` on scanners you're less sure about
+6. After a week of clean warn-mode operation, switch to `action: block`
+
+## Reporting False Positives
+
+If you find a pattern that consistently produces false positives on common traffic, file an issue:
+
+**[github.com/luckyPipewrench/pipelock/issues](https://github.com/luckyPipewrench/pipelock/issues)**
+
+Include:
+- The log entry (scanner, rule, severity)
+- Your config (redact secrets and internal domains)
+- What the legitimate traffic looks like
+- Why the match is incorrect
+
+Every confirmed false positive becomes a regression test in the pipelock test suite.

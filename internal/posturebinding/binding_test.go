@@ -1,0 +1,334 @@
+//go:build !windows
+
+// The permission refusals asserted here depend on POSIX mode bits.
+// secperm.TooPermissive and OwnedGroupWritableAllowed are deliberate no-ops on
+// Windows, so these assertions cannot hold there.
+
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package posturebinding
+
+import (
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/posture"
+)
+
+// mintContainmentCapsule emits a valid, signed posture capsule carrying
+// containment evidence, using posture.Emit so signing is never hand-rolled.
+func mintContainmentCapsule(t *testing.T) (*posture.Capsule, []byte) {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	capsule, err := posture.Emit(config.Defaults(), posture.Options{
+		SigningKey: priv,
+		Containment: &posture.ContainmentEvidence{
+			Mode:                     posture.ContainmentModeKernelNFTOwnerMatch,
+			BoundaryVerified:         true,
+			ProbeRefusedDirectEgress: true,
+			KernelRuleHash:           "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			TargetUID:                "966",
+		},
+	})
+	if err != nil {
+		t.Fatalf("posture.Emit: %v", err)
+	}
+	data, err := json.Marshal(capsule)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	return capsule, data
+}
+
+// writeMutatedCapsule rewrites one or more top-level capsule fields in the
+// marshaled JSON while leaving the signature untouched, then writes it to a
+// fresh temp file. It preserves the exact field set so the capsule still
+// unmarshals under strict decoding.
+func writeMutatedCapsule(t *testing.T, data []byte, mutate map[string]string) string {
+	t.Helper()
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatalf("unmarshal capsule fields: %v", err)
+	}
+	for key, val := range mutate {
+		raw, err := json.Marshal(val)
+		if err != nil {
+			t.Fatalf("marshal mutation %q: %v", key, err)
+		}
+		fields[key] = raw
+	}
+	out, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("marshal mutated capsule: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "proof.json")
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	return path
+}
+
+func TestLoadFileTamperedBodyRejected(t *testing.T) {
+	_, data := mintContainmentCapsule(t)
+	// Mutate a signed field (config_hash) to a well-formed but different value,
+	// keeping the original signature: the load-time self-consistency verify must
+	// reject it fail-closed on the signature, not on field shape.
+	path := writeMutatedCapsule(t, data, map[string]string{
+		"config_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+	})
+	if _, err := LoadFile(path); err == nil {
+		t.Fatal("LoadFile error = nil, want signature verification failure on tampered body")
+	}
+}
+
+func TestLoadFileExpiredCapsuleRejected(t *testing.T) {
+	_, data := mintContainmentCapsule(t)
+	// Backdate the window so it is well-formed (generated < expires) but expired
+	// (expires < now). VerifyAt checks expiry before the signature, so the old
+	// signature does not need to cover the mutated times.
+	now := time.Now().UTC()
+	path := writeMutatedCapsule(t, data, map[string]string{
+		"generated_at": now.Add(-48 * time.Hour).Format(time.RFC3339Nano),
+		"expires_at":   now.Add(-24 * time.Hour).Format(time.RFC3339Nano),
+	})
+	_, err := LoadFile(path)
+	if err == nil {
+		t.Fatal("LoadFile error = nil, want expiry rejection")
+	}
+	// VerifyAt checks the expiry window BEFORE the signature, so this must fail
+	// specifically on expiry rather than passing on the (now-stale) signature -
+	// otherwise the test would prove signature rejection, not expiry rejection.
+	if !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("LoadFile error = %v, want an expiry rejection", err)
+	}
+}
+
+func TestLoadFileNonHexSignerKeyRejected(t *testing.T) {
+	_, data := mintContainmentCapsule(t)
+	// A signer_key_id that is not valid hex must fail closed at the key-decode
+	// step, before any signature verification.
+	path := writeMutatedCapsule(t, data, map[string]string{"signer_key_id": "not-hex-zz"})
+	if _, err := LoadFile(path); err == nil {
+		t.Fatal("LoadFile error = nil, want signer-key decode rejection")
+	}
+}
+
+func TestLoadFileValidContainmentCapsuleStillBinds(t *testing.T) {
+	capsule, data := mintContainmentCapsule(t)
+	path := filepath.Join(t.TempDir(), "proof.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	got, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	sum := sha256.Sum256(data)
+	if got.CapsuleSHA256 != hex.EncodeToString(sum[:]) ||
+		got.SignerKeyID != capsule.SignerKeyID ||
+		got.ContainmentNonce != capsule.Signature ||
+		got.ContainedUID != "966" {
+		t.Fatalf("binding = %+v, want fields from valid capsule", got)
+	}
+}
+
+func TestLoadFileRejectsGroupWritableProof(t *testing.T) {
+	_, data := mintContainmentCapsule(t)
+	path := filepath.Join(t.TempDir(), "proof.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write proof: %v", err)
+	}
+	groupWritableMode := os.FileMode(0o660)
+	if err := os.Chmod(path, groupWritableMode); err != nil {
+		t.Fatalf("Chmod() error = %v", err)
+	}
+
+	if _, err := LoadFile(path); err == nil || !strings.Contains(err.Error(), "permissions") {
+		t.Fatalf("LoadFile(group-writable proof) error = %v, want permission rejection", err)
+	}
+}
+
+func TestLoadRuntimeRelativeOverrideRejected(t *testing.T) {
+	t.Setenv(RuntimeProofEnv, "relative/proof.json")
+	if _, err := LoadRuntime(); err == nil {
+		t.Fatal("LoadRuntime error = nil, want absolute-path rejection")
+	}
+}
+
+func TestLoadRuntimeAbsoluteOverrideWorks(t *testing.T) {
+	capsule, data := mintContainmentCapsule(t)
+	path := filepath.Join(t.TempDir(), "proof.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv(RuntimeProofEnv, path)
+	got, err := LoadRuntime()
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	if got.SignerKeyID != capsule.SignerKeyID || got.ContainedUID != "966" {
+		t.Fatalf("binding = %+v, want fields from capsule at absolute override", got)
+	}
+}
+
+func TestLoadRuntimeUnsetUsesDefaultPath(t *testing.T) {
+	// With no override, LoadRuntime reads DefaultContainRunProofPath, so this
+	// assertion is only meaningful when that path is provably absent.
+	//
+	// Skipping on `err == nil` alone was not that check. It treats every error
+	// as absence, and the error a containment host actually returns is
+	// permission denied: `pipelock contain install` creates the posture
+	// directory 0o750 owned by pipelock-proxy, so an ordinary user's stat fails
+	// without the file being missing. The guard then declined to skip,
+	// LoadRuntime surfaced that refusal, and the test failed for a reason that
+	// has nothing to do with the missing-default behavior it asserts.
+	//
+	// A machine with containment installed is a production state, not an exotic
+	// one, so this must distinguish absence from refusal rather than collapse
+	// them.
+	_, statErr := os.Stat(DefaultContainRunProofPath)
+	switch {
+	case statErr == nil:
+		t.Skipf("default proof path %s exists; skipping missing-default assertion",
+			DefaultContainRunProofPath)
+	case errors.Is(statErr, fs.ErrNotExist):
+		// Provably absent, which is the state this assertion is about.
+	case errors.Is(statErr, fs.ErrPermission):
+		// `pipelock contain install` creates the posture directory 0o750 owned
+		// by pipelock-proxy, so an ordinary user cannot tell whether the proof
+		// is there. Absence is unprovable, so the assertion is skipped rather
+		// than failed: a machine with containment installed is a production
+		// state, and failing here would be the defect this test was fixed for.
+		t.Skipf("default proof path %s is unreadable (%v); absence cannot be established",
+			DefaultContainRunProofPath, statErr)
+	default:
+		// Anything else is a genuine filesystem fault and must not be hidden
+		// behind a skip.
+		t.Fatalf("stat default proof path %s: %v", DefaultContainRunProofPath, statErr)
+	}
+	t.Setenv(RuntimeProofEnv, "")
+	got, err := LoadRuntime()
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	if got.CapsuleSHA256 != "" || got.SignerKeyID != "" || got.ContainmentNonce != "" || got.ContainedUID != "" {
+		t.Fatalf("binding = %+v, want zero from missing default proof", got)
+	}
+}
+
+func TestLoadFileMissingReturnsZeroBinding(t *testing.T) {
+	got, err := LoadFile(filepath.Join(t.TempDir(), "missing-proof.json"))
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	if got.CapsuleSHA256 != "" || got.SignerKeyID != "" || got.ContainmentNonce != "" || got.ContainedUID != "" {
+		t.Fatalf("binding = %+v, want zero", got)
+	}
+}
+
+func TestLoadFileDerivesContainmentBinding(t *testing.T) {
+	capsule, data := mintContainmentCapsule(t)
+	path := filepath.Join(t.TempDir(), "proof.json")
+	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	got, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	canonicalSum := sha256.Sum256(data)
+	if got.CapsuleSHA256 != hex.EncodeToString(canonicalSum[:]) {
+		t.Fatalf("CapsuleSHA256 = %q, want canonical capsule hash", got.CapsuleSHA256)
+	}
+	raw, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	rawSum := sha256.Sum256(raw)
+	if got.CapsuleSHA256 == hex.EncodeToString(rawSum[:]) {
+		t.Fatal("CapsuleSHA256 unexpectedly matched raw proof file hash; want canonical capsule hash")
+	}
+	if got.SignerKeyID != capsule.SignerKeyID || got.ContainmentNonce != capsule.Signature || got.ContainedUID != "966" {
+		t.Fatalf("binding = %+v, want signer/signature/uid from capsule", got)
+	}
+}
+
+func TestLoadFileNoContainmentReturnsZeroBinding(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	capsule, err := posture.Emit(config.Defaults(), posture.Options{
+		SigningKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("posture.Emit: %v", err)
+	}
+	data, err := json.Marshal(capsule)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "proof.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	got, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	if got.CapsuleSHA256 != "" || got.SignerKeyID != "" || got.ContainmentNonce != "" || got.ContainedUID != "" {
+		t.Fatalf("binding = %+v, want zero (no containment evidence)", got)
+	}
+}
+
+func TestLoadFileMalformedReturnsError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proof.json")
+	if err := os.WriteFile(path, []byte("{not-json"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, err := LoadFile(path); err == nil {
+		t.Fatal("LoadFile error = nil, want parse error")
+	}
+}
+
+func TestLoadFileRejectsOversizedAndEscapingSymlink(t *testing.T) {
+	t.Run("oversized", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "proof.json")
+		if err := os.WriteFile(path, make([]byte, maxRuntimeProofBytes+1), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadFile(path); err == nil {
+			t.Fatal("LoadFile accepted oversized posture proof")
+		}
+	})
+	t.Run("escaping symlink", func(t *testing.T) {
+		root := t.TempDir()
+		target := filepath.Join(t.TempDir(), "proof.json")
+		if err := os.WriteFile(target, []byte(`{}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(root, "proof.json")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadFile(link); err == nil {
+			t.Fatal("LoadFile accepted symlink escaping the proof directory")
+		}
+	})
+}

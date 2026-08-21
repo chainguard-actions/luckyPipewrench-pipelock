@@ -1,0 +1,41 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package audit
+
+import (
+	"context"
+
+	scannerpkg "github.com/luckyPipewrench/pipelock/internal/scanner"
+)
+
+// EventDLPWarn is emitted when a warn-mode DLP pattern matches.
+// The match is informational only - no enforcement action is taken.
+const EventDLPWarn EventType = "dlp_warn"
+
+// LogDLPWarn emits an audit event for a DLP pattern match in warn mode.
+// Transport identifies the scanning surface (e.g., "fetch", "forward", "mcp_input", "body").
+func (l *Logger) LogDLPWarn(ctx LogContext, patternName, severity, transport string) {
+	technique := TechniqueForScanner(ScannerDLP)
+	loggedURL, loggedTarget, loggedResource := redactedContentFields(ctx, ScannerDLP)
+
+	e := newLogEntry(l.zl.Warn(), EventDLPWarn).
+		str("mode", "warn").
+		str("pattern", patternName).
+		str("severity", severity).
+		str("transport", transport).
+		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scannerpkg.ScannerDLP, patternName)).
+		str("mitre_technique", technique).
+		str("method", ctx.Method()).
+		optStr("url", loggedURL).
+		optStr("target", loggedTarget).
+		optStr("resource", loggedResource).
+		optStr("client_ip", ctx.ClientIP()).
+		optStr("request_id", ctx.RequestID()).
+		optStr("agent", ctx.Agent())
+	e.msg("DLP warn-mode match (informational)")
+
+	if l.emitter != nil {
+		l.emitter.Emit(context.Background(), string(EventDLPWarn), e.fields)
+	}
+}

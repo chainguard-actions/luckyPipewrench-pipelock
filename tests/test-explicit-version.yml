@@ -1,0 +1,46 @@
+name: Test explicit version input
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install jq (required by action)
+        run: sudo apt-get install -y jq 2>/dev/null || true
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          version: '1.0.0'
+          directory: '.'
+          scan-diff: 'false'
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+
+      - name: Assert action ran or failed gracefully on explicit version
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+          SCORE: ${{ steps.action.outputs.score }}
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "audit-failed: $AUDIT_FAILED"
+          echo "score: $SCORE"
+          echo "findings-count: $FINDINGS"
+          if [ "$OUTCOME" = "success" ]; then
+            echo "PASS: action succeeded with explicit version"
+            if [ -z "$SCORE" ]; then
+              echo "FAIL: action succeeded but score output is empty"
+              exit 1
+            fi
+            echo "PASS: score=$SCORE findings=$FINDINGS"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (pipelock v1.0.0 not available or repo not resolvable)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi

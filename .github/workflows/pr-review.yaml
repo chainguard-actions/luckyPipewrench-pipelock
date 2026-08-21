@@ -1,0 +1,64 @@
+name: AI PR Review
+
+on:
+  issue_comment:
+    types: [created]
+  # This workflow is evaluated only from the default branch. It cannot test a
+  # workflow change before that change merges, but it makes the next change
+  # exercisable without relying on an issue comment.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to review.
+        required: true
+        type: string
+      review_mode:
+        description: Review depth.
+        required: true
+        default: default
+        type: choice
+        options:
+          - default
+          - deep
+
+permissions:
+  contents: read
+  issues: write
+  # Both are required. Posting a comment on a PULL REQUEST needs
+  # pull-requests: write even though the call goes to the issue-comments
+  # endpoint; issues: write alone covers issues only, and the comment-create
+  # call returns 403. Verified live: this was reduced to read and every
+  # /review in the repository failed until it was restored. Do not narrow it
+  # again without running a real /review against a pull request.
+  pull-requests: write
+
+jobs:
+  review:
+    # This gate authorizes the external provider call and outbound PR-code
+    # review. The reusable workflow runs only immutable Pipelock action code.
+    if: >-
+      github.actor == 'luckyPipewrench' &&
+      github.triggering_actor == 'luckyPipewrench' &&
+      ((github.event_name == 'issue_comment' &&
+        github.event.comment.user.login == 'luckyPipewrench' &&
+        github.event.comment.author_association == 'OWNER' &&
+        github.event.issue.pull_request &&
+        (github.event.comment.body == '/review' ||
+         github.event.comment.body == '/review deep')) ||
+       github.event_name == 'workflow_dispatch')
+    uses: ./.github/workflows/pr-review-reusable.yaml
+    with:
+      pr_number: >-
+        ${{ github.event_name == 'issue_comment' &&
+            github.event.issue.number || inputs.pr_number }}
+      review_mode: >-
+        ${{ github.event_name == 'issue_comment' &&
+            (github.event.comment.body == '/review deep' && 'deep' ||
+             'default') ||
+            inputs.review_mode }}
+      # A same-repository reusable call resolves this workflow at github.sha.
+      # External callers use an explicit full SHA in both positions instead.
+      reviewer_sha: ${{ github.sha }}
+    secrets:
+      review_token: ${{ secrets.GITHUB_TOKEN }}
+      openai_api_key: ${{ secrets.OPENAI_API_KEY }}
