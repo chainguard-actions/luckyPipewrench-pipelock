@@ -1,0 +1,459 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+// Package jsonrpc provides shared JSON-RPC 2.0 types used across the mcp
+// sub-packages. Extracting these into a dedicated package breaks circular
+// imports between tools/, policy/, and the parent mcp package.
+package jsonrpc
+
+import (
+	"encoding/json"
+	"regexp"
+	"sort"
+	"strings"
+
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+)
+
+// Version is the JSON-RPC protocol version used by MCP.
+const Version = "2.0"
+
+// Null is the JSON literal "null", used to detect nil-equivalent
+// json.RawMessage values that are non-nil Go slices.
+const Null = "null"
+
+// ContentBlock represents a single content block in an MCP tool result.
+type ContentBlock struct {
+	Type        string            `json:"type"`
+	Text        string            `json:"text,omitempty"`
+	Resource    *ResourceContents `json:"resource,omitempty"`
+	Name        string            `json:"name,omitempty"`
+	Title       string            `json:"title,omitempty"`
+	Description string            `json:"description,omitempty"`
+	Data        string            `json:"data,omitempty"`
+	Blob        string            `json:"blob,omitempty"`
+	Raw         string            `json:"raw,omitempty"`
+	MimeType    string            `json:"mimeType,omitempty"`
+	MediaType   string            `json:"mediaType,omitempty"`
+}
+
+// ResourceContents is the content carried by an embedded MCP resource.
+// Blob data intentionally stays out of prompt scanning: it is opaque binary
+// content, while Text is rendered directly to the agent. Media policy handles
+// the Blob with its declared MimeType separately.
+type ResourceContents struct {
+	URI      string `json:"uri,omitempty"`
+	MimeType string `json:"mimeType,omitempty"`
+	Text     string `json:"text,omitempty"`
+	Blob     string `json:"blob,omitempty"`
+}
+
+// ToolResult represents the result field of an MCP tool response.
+type ToolResult struct {
+	Content           []ContentBlock  `json:"content"`
+	StructuredContent json.RawMessage `json:"structuredContent,omitempty"`
+}
+
+// RPCError represents a JSON-RPC 2.0 error object.
+// Data is optional per JSON-RPC 2.0 but can carry arbitrary content,
+// so it must be scanned for injection like any other text field.
+type RPCError struct {
+	Code    int             `json:"code"`
+	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data,omitempty"`
+}
+
+// RPCResponse represents a JSON-RPC 2.0 response envelope.
+// Result is json.RawMessage (not *ToolResult) to handle non-standard result
+// shapes without failing the entire parse - a typed *ToolResult would cause
+// json.Unmarshal to error on string/array/non-object results, allowing bypass.
+// Method and Params are included to scan server notifications for injection.
+type RPCResponse struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
+	Method  string          `json:"method,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   json.RawMessage `json:"error,omitempty"`
+}
+
+const (
+	// ScanScopeResponseInjection names the MCP response prompt-injection scanner.
+	ScanScopeResponseInjection = "response_injection"
+	// ScanScopeResponseDLP names the MCP response inbound text-DLP scanner.
+	ScanScopeResponseDLP = "response_dlp"
+)
+
+// ScanVerdict describes the outcome of scanning a single MCP response for MCP
+// response content. Clean means neither prompt-injection nor enforceable
+// inbound DLP was found in the scanned response text; it does not mean tool
+// policy or input scanning ran.
+//
+// Three states:
+//   - Clean:     Clean=true, Scanned names the response scopes.
+//   - Error:     Clean=false, Error set (parse/protocol failure). Not injection.
+//   - Finding:   Clean=false, Error empty, Matches and/or DLPMatches and
+//     Action set.
+type ScanVerdict struct {
+	Line  int             `json:"line"`
+	ID    json.RawMessage `json:"id"`
+	Clean bool            `json:"clean"`
+	// Scanned is stamped by the surface that emits the verdict, not by each
+	// ScanVerdict constructor. A new surface that marshals a verdict must set
+	// it, otherwise the scope is silently absent from operator-facing output.
+	Scanned []string                `json:"scanned,omitempty"`
+	Action  string                  `json:"action,omitempty"`
+	Matches []scanner.ResponseMatch `json:"matches,omitempty"`
+	// DLPMatches contains enforceable inbound text-DLP findings. It is additive
+	// to the long-standing injection Matches field so existing JSON consumers
+	// retain their response-injection contract.
+	DLPMatches []scanner.TextDLPMatch `json:"dlp_matches,omitempty"`
+	Error      string                 `json:"error,omitempty"`
+}
+
+// ExtractStringsResult is the bounded recursive extraction result. Truncated is
+// true when the JSON contains content beyond maxExtractDepth and a caller should
+// fail closed rather than make a decision from partial strings.
+type ExtractStringsResult struct {
+	Strings   []string
+	Truncated bool
+}
+
+// ExtractKeysResult is the bounded recursive JSON-key extraction result.
+// Truncated is true when the JSON contains keys beyond maxExtractDepth.
+type ExtractKeysResult struct {
+	Keys      []string
+	Truncated bool
+}
+
+// TextResult is the bounded text extraction result.
+type TextResult struct {
+	Text      string
+	Truncated bool
+}
+
+// ExtractText extracts all text content from an MCP tool result.
+// First tries to parse as a standard ToolResult with content blocks (extracting
+// text from ALL block types, not just "text" - prevents bypass via image blocks).
+// Falls back to recursively extracting all string values from arbitrary JSON,
+// preventing bypass via non-standard result shapes.
+//
+// Content blocks are joined with a single space to preserve word boundaries.
+// Between-word splits ("previous" + "instructions") produce intact injections
+// the agent will act on - scanner must detect these. Mid-word splits
+// ("Igno" + "re" → "Igno re") don't match, but the injection is also broken
+// for the agent, so this is not exploitable.
+func ExtractText(raw json.RawMessage) string {
+	return ExtractTextResult(raw).Text
+}
+
+// ExtractTextResult extracts text content and reports uninspectable depth in
+// the complete JSON value.
+func ExtractTextResult(raw json.RawMessage) TextResult {
+	if len(raw) == 0 || string(raw) == Null {
+		return TextResult{}
+	}
+	if jsonDepthTruncated(raw) {
+		return TextResult{Truncated: true}
+	}
+
+	// Try standard ToolResult structure first.
+	var tr ToolResult
+	if err := json.Unmarshal(raw, &tr); err == nil && (len(tr.Content) > 0 || tr.StructuredContent != nil) {
+		var texts []string
+		for _, block := range tr.Content {
+			// Extract text from ALL content blocks, not just type=="text".
+			// Non-text blocks (image, resource) may carry prompt injection
+			// in their text field.
+			if block.Text != "" {
+				texts = append(texts, block.Text)
+			}
+			// Embedded resources carry their rendered text under resource.text,
+			// rather than the top-level content block's text field. Treat it as
+			// agent-visible response content while deliberately excluding opaque
+			// resource blobs from prompt scanning.
+			if block.Resource != nil && block.Resource.Text != "" {
+				texts = append(texts, block.Resource.Text)
+			}
+			// resource_link metadata is also rendered to the agent. Keep URI and
+			// binary fields out of this text path; Name, Title, and Description
+			// are the human-facing fields an attacker could use as instructions.
+			for _, field := range []string{block.Name, block.Title, block.Description} {
+				if field != "" {
+					texts = append(texts, field)
+				}
+			}
+		}
+		// structuredContent is rendered to the agent alongside content blocks.
+		// Extract its text even when the typed content fast path succeeds, while
+		// excluding known opaque media fields such as data/blob/raw.
+		structured := ExtractVisibleStringsFromJSONResult(tr.StructuredContent)
+		if structured.Truncated {
+			return TextResult{Truncated: true}
+		}
+		texts = append(texts, structured.Strings...)
+		// Always return after a successful ToolResult parse, even when
+		// texts is empty. Falling through to ExtractStringsFromJSON would
+		// feed base64 media in data/blob/raw fields into prompt scanning.
+		return TextResult{Text: strings.Join(texts, " ")}
+	}
+
+	// Fallback: recursively extract all string values from arbitrary JSON.
+	// Catches non-standard result shapes (plain string, nested objects, etc).
+	extracted := ExtractStringsFromJSONResult(raw)
+	if len(extracted.Strings) > 0 {
+		return TextResult{Text: strings.Join(extracted.Strings, "\n"), Truncated: extracted.Truncated}
+	}
+
+	return TextResult{Truncated: extracted.Truncated}
+}
+
+// ExtractVisibleStringsFromJSONResult extracts agent-visible JSON string
+// values while deliberately excluding opaque MCP media fields. It is used for
+// structuredContent, whose values are rendered to the agent but which may
+// include image/resource payloads that must not be treated as prompt text.
+func ExtractVisibleStringsFromJSONResult(raw json.RawMessage) ExtractStringsResult {
+	var parsed interface{}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return ExtractStringsResult{}
+	}
+
+	var result []string
+	truncated := false
+	var extract func(interface{}, int)
+	extract = func(v interface{}, depth int) {
+		if depth > maxExtractDepth {
+			truncated = true
+			return
+		}
+		switch val := v.(type) {
+		case string:
+			result = append(result, val)
+		case []interface{}:
+			for _, item := range val {
+				extract(item, depth+1)
+			}
+		case map[string]interface{}:
+			for _, key := range SortedKeys(val) {
+				if isOpaqueMCPMediaField(key) {
+					continue
+				}
+				extract(val[key], depth+1)
+			}
+		}
+	}
+	extract(parsed, 0)
+	return ExtractStringsResult{Strings: result, Truncated: truncated}
+}
+
+func isOpaqueMCPMediaField(key string) bool {
+	switch strings.ToLower(key) {
+	case "blob", "data", "raw":
+		return true
+	default:
+		return false
+	}
+}
+
+// jsonDepthTruncated reports whether raw JSON exceeds the recursive extraction
+// depth cap without returning any extracted strings.
+func jsonDepthTruncated(raw json.RawMessage) bool {
+	var parsed interface{}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return false
+	}
+	return valueDepthTruncated(parsed, 0)
+}
+
+// valueDepthTruncated walks arbitrary decoded JSON and stops when depth exceeds
+// maxExtractDepth.
+func valueDepthTruncated(v interface{}, depth int) bool {
+	if depth > maxExtractDepth {
+		return true
+	}
+	switch val := v.(type) {
+	case []interface{}:
+		for _, item := range val {
+			if valueDepthTruncated(item, depth+1) {
+				return true
+			}
+		}
+	case map[string]interface{}:
+		for _, item := range val {
+			if valueDepthTruncated(item, depth+1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// SortedKeys returns the keys of a map in sorted order. Used by JSON extraction
+// functions to ensure deterministic iteration - Go map order is random, so
+// split-secret concat scanning would miss secrets nondeterministically without
+// stable ordering.
+func SortedKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// maxExtractDepth limits recursion in ExtractStringsFromJSON to prevent stack
+// overflow from maliciously deeply-nested JSON.
+const maxExtractDepth = 64
+
+// maxExtractKeys bounds how many object keys one extraction contributes to the
+// scanned text. Sized far above any real tool listing and far below what an
+// adversarial one can produce: a server publishing a hundred tools with fifty
+// parameters each stays well inside it, while a message engineered purely for
+// breadth stops here and is reported truncated, which callers already treat as
+// fail-closed. Chosen against a measurement rather than a guess: a 2.6MB
+// listing carrying eighty thousand keys took roughly twenty seconds to scan
+// before this bound existed.
+const maxExtractKeys = 20000
+
+// ExtractStringsForKeys extracts string values only from top-level keys
+// matching the keyPattern regex. Values under non-matching keys are excluded.
+// Nested values under matching keys are extracted recursively.
+// Returns nil if keyPattern is nil (callers must provide a compiled pattern).
+func ExtractStringsForKeys(raw json.RawMessage, keyPattern *regexp.Regexp) []string {
+	return ExtractStringsForKeysResult(raw, keyPattern).Strings
+}
+
+// ExtractStringsForKeysResult extracts string values from matching top-level
+// keys and reports whether recursive extraction hit the depth cap.
+func ExtractStringsForKeysResult(raw json.RawMessage, keyPattern *regexp.Regexp) ExtractStringsResult {
+	var parsed interface{}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return ExtractStringsResult{}
+	}
+	m, ok := parsed.(map[string]interface{})
+	if !ok {
+		return ExtractStringsResult{} // arguments must be an object
+	}
+	var result []string
+	truncated := false
+	var extract func(v interface{}, depth int)
+	extract = func(v interface{}, depth int) {
+		if depth > maxExtractDepth {
+			truncated = true
+			return
+		}
+		switch val := v.(type) {
+		case string:
+			result = append(result, val)
+		case []interface{}:
+			for _, item := range val {
+				extract(item, depth+1)
+			}
+		case map[string]interface{}:
+			for _, k := range SortedKeys(val) {
+				extract(val[k], depth+1)
+			}
+		}
+	}
+	if keyPattern == nil {
+		return ExtractStringsResult{}
+	}
+	for _, k := range SortedKeys(m) {
+		if keyPattern != nil && keyPattern.MatchString(k) {
+			extract(m[k], 0)
+		}
+	}
+	return ExtractStringsResult{Strings: result, Truncated: truncated}
+}
+
+// ExtractStringsFromJSON recursively extracts all string values from arbitrary JSON.
+// Only extracts values (not keys) to avoid false positives from field names.
+// Recursion is bounded by maxExtractDepth to prevent stack overflow.
+func ExtractStringsFromJSON(raw json.RawMessage) []string {
+	return ExtractStringsFromJSONResult(raw).Strings
+}
+
+// ExtractStringsFromJSONResult recursively extracts all string values from
+// arbitrary JSON and reports whether extraction hit the nesting cap.
+func ExtractStringsFromJSONResult(raw json.RawMessage) ExtractStringsResult {
+	var result []string
+	truncated := false
+	var extract func(v interface{}, depth int)
+	extract = func(v interface{}, depth int) {
+		if depth > maxExtractDepth {
+			truncated = true
+			return
+		}
+		switch val := v.(type) {
+		case string:
+			result = append(result, val)
+		case []interface{}:
+			for _, item := range val {
+				extract(item, depth+1)
+			}
+		case map[string]interface{}:
+			for _, k := range SortedKeys(val) {
+				extract(val[k], depth+1)
+			}
+		}
+	}
+	var parsed interface{}
+	if err := json.Unmarshal(raw, &parsed); err == nil {
+		extract(parsed, 0)
+	}
+	return ExtractStringsResult{Strings: result, Truncated: truncated}
+}
+
+// ExtractKeysFromJSONResult recursively extracts JSON object keys and reports
+// whether extraction hit the nesting cap. Most response scanning deliberately
+// ignores keys because they are normally structural. Callers that surface a
+// JSON object as agent-visible tool metadata can opt into scanning its keys.
+func ExtractKeysFromJSONResult(raw json.RawMessage) ExtractKeysResult {
+	var result []string
+	truncated := false
+	var extract func(v interface{}, depth int)
+	extract = func(v interface{}, depth int) {
+		// Depth alone does not bound the work: a wide, shallow document stays
+		// within maxExtractDepth while producing an unbounded number of keys,
+		// and every key is then joined into text that each scanner pattern runs
+		// over. Breadth is bounded here for the same reason depth is, and it
+		// reports through the same Truncated flag, so a caller that already
+		// fails closed on truncation needs no new branch.
+		if depth > maxExtractDepth || len(result) >= maxExtractKeys {
+			truncated = true
+			return
+		}
+		switch val := v.(type) {
+		case []interface{}:
+			for _, item := range val {
+				if len(result) >= maxExtractKeys {
+					truncated = true
+					return
+				}
+				extract(item, depth+1)
+			}
+		case map[string]interface{}:
+			// Compare the object's size against the remaining budget BEFORE
+			// sorting. SortedKeys allocates and sorts every key, which is the
+			// expensive part, so checking afterwards paid the whole cost of a
+			// hostile object and only then refused it.
+			if len(val) > maxExtractKeys-len(result) {
+				truncated = true
+				return
+			}
+			for _, key := range SortedKeys(val) {
+				if len(result) >= maxExtractKeys {
+					truncated = true
+					return
+				}
+				result = append(result, key)
+				extract(val[key], depth+1)
+			}
+		}
+	}
+	var parsed interface{}
+	if err := json.Unmarshal(raw, &parsed); err == nil {
+		extract(parsed, 0)
+	}
+	return ExtractKeysResult{Keys: result, Truncated: truncated}
+}

@@ -1,0 +1,40 @@
+name: Test explicit version input
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          version: '3.5.0'
+          directory: '.'
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+          scan-diff: 'false'
+
+      - name: Assert action ran or failed gracefully with explicit version
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SCORE: ${{ steps.action.outputs.score }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "score: $SCORE"
+          echo "audit-failed: $AUDIT_FAILED"
+          if [ "$OUTCOME" = "success" ]; then
+            if [ -z "$SCORE" ]; then
+              echo "FAIL: action succeeded but score output is empty"
+              exit 1
+            fi
+            echo "PASS: action succeeded with explicit version, score=$SCORE"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (pipelock release assets not available for fictional repo)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi

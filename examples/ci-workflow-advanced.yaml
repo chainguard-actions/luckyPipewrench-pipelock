@@ -1,0 +1,40 @@
+# Example: Advanced Pipelock CI workflow
+#
+# Uses a committed pipelock.yaml config, validates scanning coverage,
+# and gates PRs on security score. The action automatically writes
+# a summary to the job output with findings and score.
+
+name: Agent Security
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  pipelock:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write  # for future SARIF upload
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Pipelock Scan
+        id: scan
+        uses: luckyPipewrench/pipelock@4c748ab986d611138ce202ab800b16eca6fb589f # v3.4.0
+        with:
+          # version: 'X.Y.Z'  # optional: pin to a specific version (see https://github.com/luckyPipewrench/pipelock/releases)
+          config: pipelock.yaml
+          scan-diff: 'true'
+          test-vectors: 'true'
+          fail-on-findings: 'true'
+
+      # Optional: use outputs in downstream steps
+      - name: Print score
+        if: always()
+        run: |
+          echo "Security score: ${{ steps.scan.outputs.score }}/100"

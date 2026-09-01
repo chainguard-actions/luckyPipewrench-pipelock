@@ -1,0 +1,1239 @@
+name: Release
+
+on:
+  push:
+    tags:
+      # Coarse prefilter. The leading `[0-9]` is load-bearing: a bare `v*` also
+      # matches tags that merely CONTAIN a dotted version later in the name,
+      # because `*` happily spans the rest of the prefix. `verifier-v0.2.0`
+      # matched the old `v*.*.*` as v + "erifier-v0" + . + "2" + . + "0", which
+      # started a full release run for a verifier tag. Requiring a digit
+      # immediately after the `v` excludes every non-product tag prefix.
+      #
+      # Still deliberately coarse: the wildcards accept extra dots (v1.2.3.4) and
+      # hyphenated prerelease suffixes (v1.2.3-beta.1), and exclude the floating
+      # v1/v2 pointers. Strict SemVer remains enforced in the release-preflight
+      # gate (check-release-ready.sh), which is the fail-closed check.
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+
+# Serialize release publications so two overlapping tag pushes cannot race on the
+# GoReleaser uploads or a shared force-updated major tag (an older run could
+# otherwise overwrite a newer completed release pointer). Do not cancel a run in
+# progress: a half-finished publish must complete, not be interrupted.
+concurrency:
+  group: release-publication
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  # Hard gate: runs first, every build/publish job needs it. Fails the release
+  # BEFORE anything is built if the tag's metadata is wrong (CHANGELOG dated
+  # UNRELEASED/placeholder, or Chart appVersion not bumped). These are the
+  # recurring release mistakes that a human checklist kept missing.
+  release-preflight:
+    name: release-preflight (metadata gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Release-readiness gate
+        # The gate asserts the release keyring secret is present BEFORE any build runs, so
+        # it has to receive that secret. Without this mapping the check reads an empty value
+        # and fails every release, which is how it behaved when it was introduced.
+        env:
+          RELEASE_KEYRING_HEX: ${{ secrets.RELEASE_KEYRING_HEX }}
+        run: scripts/check-release-ready.sh "$GITHUB_REF_NAME"
+
+  release-tests:
+    needs: [release-preflight]
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    name: release-tests (${{ matrix.suite.name }}, ${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - name: default
+            tags: ''
+          - name: enterprise
+            tags: enterprise
+        shard: ['proxy', 'scanner', 'mcp', 'rest-0', 'rest-1', 'rest-2']
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.25.12'
+          check-latest: true
+
+      - name: Verify Go version
+        run: |
+          got="$(go env GOVERSION)"
+          echo "GOVERSION=$got"
+          test "$got" = "go1.25.12"
+
+      - name: Verify dependencies
+        run: bash scripts/ci-retry.sh go mod verify
+
+      - name: Download dependencies
+        run: bash scripts/ci-retry.sh go mod download
+
+      - name: Verify shard coverage
+        env:
+          GO_TEST_TAGS: ${{ matrix.suite.tags }}
+        run: |
+          set -euo pipefail
+
+          python3 -m unittest scripts.test_ci_test_packages scripts.test_race_test_shape
+
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "$tmpdir"' EXIT
+
+          if [ -n "$GO_TEST_TAGS" ]; then
+            go list -tags "$GO_TEST_TAGS" ./... | sort > "$tmpdir/all.txt"
+          else
+            go list ./... | sort > "$tmpdir/all.txt"
+          fi
+
+          : > "$tmpdir/shards.txt"
+          for shard in proxy scanner mcp rest-0 rest-1 rest-2; do
+            if [ -n "$GO_TEST_TAGS" ]; then
+              python3 scripts/ci_test_packages.py --tags "$GO_TEST_TAGS" --shard "$shard"
+            else
+              python3 scripts/ci_test_packages.py --shard "$shard"
+            fi | tr ' ' '\n' >> "$tmpdir/shards.txt"
+          done
+          sort "$tmpdir/shards.txt" > "$tmpdir/shards.sorted.txt"
+
+          diff -u "$tmpdir/all.txt" "$tmpdir/shards.sorted.txt"
+
+      - name: Run tests
+        env:
+          GO_TEST_TAGS: ${{ matrix.suite.tags }}
+          TEST_SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+
+          race_args=("--shard" "$TEST_SHARD")
+          if [ -n "$GO_TEST_TAGS" ]; then
+            race_args=("--tags" "$GO_TEST_TAGS" "${race_args[@]}")
+          fi
+          scripts/run-race-test.sh "${race_args[@]}"
+
+  # Source-tree conformance proves the implementations agree. This gate proves
+  # the packages customers can install accept a receipt from this candidate
+  # and reject a changed copy.
+  release-verifier-install:
+    needs: [release-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.25.12'
+          check-latest: true
+          cache: false
+
+      # zizmor 1.29.0 treats the empty cache value as enabled; setup-node treats it as disabled.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0; zizmor: ignore[cache-poisoning]
+        with:
+          node-version: '24'
+          cache: ''
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Set up Rust 1.95.0
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+
+      - name: Install and verify customer receipt verifiers
+        run: scripts/release-verifier-install-gate.sh --tag "$GITHUB_REF_NAME"
+
+  release-build:
+    needs: [release-tests, release-verifier-install]
+    runs-on: ubuntu-latest
+    outputs:
+      pipelock_index: ${{ steps.platform-digests.outputs.pipelock_index }}
+      pipelock_init_index: ${{ steps.platform-digests.outputs.pipelock_init_index }}
+      license_service_index: ${{ steps.platform-digests.outputs.license_service_index }}
+      pipelock_amd64: ${{ steps.platform-digests.outputs.pipelock_amd64 }}
+      pipelock_arm64: ${{ steps.platform-digests.outputs.pipelock_arm64 }}
+      pipelock_init_amd64: ${{ steps.platform-digests.outputs.pipelock_init_amd64 }}
+      pipelock_init_arm64: ${{ steps.platform-digests.outputs.pipelock_init_arm64 }}
+      license_service_amd64: ${{ steps.platform-digests.outputs.license_service_amd64 }}
+      license_service_arm64: ${{ steps.platform-digests.outputs.license_service_arm64 }}
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.25.12'
+          check-latest: true
+
+      - name: Verify Go version
+        run: |
+          got="$(go env GOVERSION)"
+          echo "GOVERSION=$got"
+          test "$got" = "go1.25.12"
+
+      - name: Verify dependencies
+        run: bash scripts/ci-retry.sh go mod verify
+
+      - name: Install ripgrep
+        run: bash scripts/ci-apt-install.sh ripgrep
+
+      - name: Run release audit
+        run: make release-audit
+
+      - name: Run runtime policy audit
+        run: make runtime-policy-audit
+
+      - name: Verify reproducible OSS build
+        run: make reproducible-build-check
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      # GoReleaser signs the legacy detached signature and certificate pair.
+      # Cosign v3 requires bundle output, so use the newest maintained v2
+      # release and verify its archive digest before it reaches GoReleaser.
+      - name: Install and verify cosign
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COSIGN_VERSION: v2.6.5
+          COSIGN_LINUX_AMD64_SHA256: c3b4f5410e608af03a5eb0aaac84a4313d8da131248e08ff1759ac70c79d1644
+        run: |
+          set -euo pipefail
+          tool_dir="$RUNNER_TEMP/cosign-${COSIGN_VERSION}"
+          mkdir -p "$tool_dir"
+          gh release download "$COSIGN_VERSION" \
+            --repo sigstore/cosign \
+            --pattern cosign-linux-amd64 \
+            --dir "$tool_dir"
+          printf '%s  %s\n' \
+            "$COSIGN_LINUX_AMD64_SHA256" \
+            "$tool_dir/cosign-linux-amd64" | sha256sum --check
+          install -m 0755 "$tool_dir/cosign-linux-amd64" "$tool_dir/cosign"
+          got="$($tool_dir/cosign version | awk '/^GitVersion:/ { print $2 }')"
+          expected="$COSIGN_VERSION"
+          test "$got" = "$expected" || {
+            echo "::error::cosign reports $got, expected $expected"
+            exit 1
+          }
+          echo "cosign version: $got"
+          echo "$tool_dir" >> "$GITHUB_PATH"
+
+      - name: Set GOVERSION
+        run: echo "GOVERSION=$(go env GOVERSION)" >> "$GITHUB_ENV"
+
+      - name: Verify embedded public keys are configured
+        env:
+          LICENSE_PUBLIC_KEY: ${{ secrets.LICENSE_PUBLIC_KEY }}
+          RULES_KEYRING_HEX: ${{ secrets.RULES_KEYRING_HEX }}
+          RELEASE_KEYRING_HEX: ${{ secrets.RELEASE_KEYRING_HEX }}
+        run: |
+          test -n "$LICENSE_PUBLIC_KEY" || {
+            echo "::error::LICENSE_PUBLIC_KEY secret is required for release builds"
+            exit 1
+          }
+          test -n "$RULES_KEYRING_HEX" || {
+            echo "::error::RULES_KEYRING_HEX secret is required for release builds"
+            exit 1
+          }
+          test -n "$RELEASE_KEYRING_HEX" || {
+            echo "::error::RELEASE_KEYRING_HEX secret is required for self-update release verification"
+            exit 1
+          }
+          case "$LICENSE_PUBLIC_KEY" in
+            *[!0123456789abcdefABCDEF]*)
+              echo "::error::LICENSE_PUBLIC_KEY must be a raw Ed25519 public key encoded as hex"
+              exit 1
+              ;;
+          esac
+          test "${#LICENSE_PUBLIC_KEY}" -eq 64 || {
+            echo "::error::LICENSE_PUBLIC_KEY must be 64 hex characters"
+            exit 1
+          }
+          if [[ ! "$RULES_KEYRING_HEX" =~ ^[0-9A-Fa-f]{64}(,[0-9A-Fa-f]{64})*$ ]]; then
+            echo "::error::RULES_KEYRING_HEX must be one or more 64-hex Ed25519 public keys separated by commas"
+            exit 1
+          fi
+          if [[ ! "$RELEASE_KEYRING_HEX" =~ ^[0-9A-Fa-f]{64}(,[0-9A-Fa-f]{64})*$ ]]; then
+            echo "::error::RELEASE_KEYRING_HEX must be one or more 64-hex Ed25519 public keys separated by commas"
+            exit 1
+          fi
+          license_public_key_normalized="${LICENSE_PUBLIC_KEY,,}"
+          IFS=',' read -r -a rules_keys <<< "$RULES_KEYRING_HEX"
+          for key in "${rules_keys[@]}"; do
+            test -n "$key" || {
+              echo "::error::RULES_KEYRING_HEX contains an empty key entry"
+              exit 1
+            }
+            test "${#key}" -eq 64 || {
+              echo "::error::RULES_KEYRING_HEX entries must be 64 hex characters"
+              exit 1
+            }
+            test "${key,,}" != "$license_public_key_normalized" || {
+              echo "::error::LICENSE_PUBLIC_KEY must not appear in RULES_KEYRING_HEX"
+              exit 1
+            }
+          done
+          IFS=',' read -r -a release_keys <<< "$RELEASE_KEYRING_HEX"
+          for key in "${release_keys[@]}"; do
+            test -n "$key" || {
+              echo "::error::RELEASE_KEYRING_HEX contains an empty key entry"
+              exit 1
+            }
+            test "${#key}" -eq 64 || {
+              echo "::error::RELEASE_KEYRING_HEX entries must be 64 hex characters"
+              exit 1
+            }
+            test "${key,,}" != "$license_public_key_normalized" || {
+              echo "::error::LICENSE_PUBLIC_KEY must not appear in RELEASE_KEYRING_HEX"
+              exit 1
+            }
+            for rules_key in "${rules_keys[@]}"; do
+              test "${key,,}" != "${rules_key,,}" || {
+                echo "::error::RELEASE_KEYRING_HEX must not reuse a rules signing key"
+                exit 1
+              }
+            done
+          done
+
+      # Keep the release builder as reproducible as the artifacts it emits. The
+      # action's convenient `~> v2` selector silently moved the release tool
+      # underneath us. Download the exact upstream archive, check the digest
+      # published by GoReleaser, then ask the binary what version it is before
+      # it can publish anything.
+      - name: Install and verify GoReleaser
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GORELEASER_VERSION: v2.15.4
+          GORELEASER_LINUX_AMD64_SHA256: aae00c71a4a6d55e08cce9273a1516bdce33c1e07cffb7e502fa6fec4377dede
+        run: |
+          set -euo pipefail
+          tool_dir="$RUNNER_TEMP/goreleaser-${GORELEASER_VERSION}"
+          mkdir -p "$tool_dir"
+          gh release download "$GORELEASER_VERSION" \
+            --repo goreleaser/goreleaser \
+            --pattern goreleaser_Linux_x86_64.tar.gz \
+            --dir "$tool_dir"
+          printf '%s  %s\n' \
+            "$GORELEASER_LINUX_AMD64_SHA256" \
+            "$tool_dir/goreleaser_Linux_x86_64.tar.gz" | sha256sum --check
+          tar -xzf "$tool_dir/goreleaser_Linux_x86_64.tar.gz" -C "$tool_dir"
+          got="$($tool_dir/goreleaser --version | awk '/^GitVersion:/ { print $2 }')"
+          expected="${GORELEASER_VERSION#v}"
+          test "$got" = "$expected" || {
+            echo "::error::GoReleaser reports $got, expected $expected"
+            exit 1
+          }
+          echo "GoReleaser version: $got"
+          echo "$tool_dir" >> "$GITHUB_PATH"
+
+      # Keep the GitHub Release private while the artifact set is assembled and
+      # checked. GoReleaser publishes only staging image tags; the consumer
+      # version and latest manifests are promoted after attestation completes.
+      # Homebrew remains a separate publication surface.
+      - name: Run GoReleaser
+        run: goreleaser release --clean --draft
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOVERSION: ${{ env.GOVERSION }}
+          LICENSE_PUBLIC_KEY: ${{ secrets.LICENSE_PUBLIC_KEY }}
+          RULES_KEYRING_HEX: ${{ secrets.RULES_KEYRING_HEX }}
+          RELEASE_KEYRING_HEX: ${{ secrets.RELEASE_KEYRING_HEX }}
+
+      - name: Generate and upload self-update release manifest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_KEYRING_HEX: ${{ secrets.RELEASE_KEYRING_HEX }}
+        run: |
+          release_commit="$(git rev-parse "${GITHUB_REF_NAME}^{}")"
+          go run ./cmd/pipelock-release-manifest \
+            -dist dist \
+            -tag "$GITHUB_REF_NAME" \
+            -commit "$release_commit"
+          gh release upload "$GITHUB_REF_NAME" dist/release.json --clobber
+
+      - name: Generate SBOM
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CYCLONEDX_GOMOD_VERSION: v1.10.0
+          CYCLONEDX_GOMOD_LINUX_AMD64_SHA256: 5cce8ae99a5181be6a610ea5ed9ca9d596937cc04dc1a8f6f6b5e462d8c9900e
+        run: |
+          set -euo pipefail
+          tool_dir="$RUNNER_TEMP/cyclonedx-gomod-${CYCLONEDX_GOMOD_VERSION}"
+          archive="cyclonedx-gomod_${CYCLONEDX_GOMOD_VERSION#v}_linux_amd64.tar.gz"
+          mkdir -p "$tool_dir"
+          gh release download "$CYCLONEDX_GOMOD_VERSION" \
+            --repo CycloneDX/cyclonedx-gomod \
+            --pattern "$archive" \
+            --dir "$tool_dir"
+          printf '%s  %s\n' \
+            "$CYCLONEDX_GOMOD_LINUX_AMD64_SHA256" \
+            "$tool_dir/$archive" | sha256sum --check
+          tar -xzf "$tool_dir/$archive" -C "$tool_dir"
+          got="$($tool_dir/cyclonedx-gomod version | awk '/^Version:/ { print $2 }')"
+          expected="$CYCLONEDX_GOMOD_VERSION"
+          test "$got" = "$expected" || {
+            echo "::error::cyclonedx-gomod reports $got, expected $expected"
+            exit 1
+          }
+          "$tool_dir/cyclonedx-gomod" mod -json -output sbom.cdx.json
+
+      - name: Upload SBOM to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" sbom.cdx.json --clobber
+
+      # Resolve the index AND its Linux children. An attestation against only a
+      # multi-architecture index does not prove the amd64 or arm64 image an
+      # operator actually runs. Matching the direct per-architecture tag to the
+      # index child prevents an image from being attested under a look-alike tag.
+      - name: Resolve release image platform digests
+        id: platform-digests
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          CRANE_VERSION: v0.21.9
+          CRANE_LINUX_AMD64_SHA256: 5c16d8ddb971cb1d5e6ed8b1e743da8224414eeba2c2762d8f1a61b2f095699e
+        run: |
+          set -euo pipefail
+          tool_dir="$RUNNER_TEMP/crane-${CRANE_VERSION}"
+          archive="go-containerregistry_Linux_x86_64.tar.gz"
+          mkdir -p "$tool_dir"
+          gh release download "$CRANE_VERSION" \
+            --repo google/go-containerregistry \
+            --pattern "$archive" \
+            --dir "$tool_dir"
+          printf '%s  %s\n' \
+            "$CRANE_LINUX_AMD64_SHA256" \
+            "$tool_dir/$archive" | sha256sum --check
+          tar -xzf "$tool_dir/$archive" -C "$tool_dir"
+          got="$($tool_dir/crane version)"
+          expected="${CRANE_VERSION#v}"
+          test "$got" = "$expected" || {
+            echo "::error::crane reports $got, expected $expected"
+            exit 1
+          }
+          echo "crane version: $got"
+          echo "$tool_dir" >> "$GITHUB_PATH"
+          resolve_image() {
+            local name="$1"
+            local repository="$2"
+            local staging_tag index_digest child_digest direct_digest arch
+
+            staging_tag="${TAG#v}-staging"
+            index_digest="$("$tool_dir/crane" digest "${repository}:${staging_tag}")"
+            printf '%s_index=%s\n' "$name" "$index_digest" >> "$GITHUB_OUTPUT"
+            for arch in amd64 arm64; do
+              child_digest="$("$tool_dir/crane" manifest "${repository}:${staging_tag}" | jq -er --arg arch "$arch" '
+                [.manifests[] | select(
+                  .platform.os == "linux" and
+                  .platform.architecture == $arch
+                ) | .digest] | if length == 1 then .[0] else error("expected one linux/" + $arch + " child") end
+              ')"
+              direct_digest="$("$tool_dir/crane" digest "${repository}:${staging_tag}-${arch}")"
+              test "$child_digest" = "$direct_digest" || {
+                echo "::error::${repository}:${staging_tag}-${arch} is not the index child"
+                exit 1
+              }
+              printf '%s_%s=%s\n' "$name" "$arch" "$child_digest" >> "$GITHUB_OUTPUT"
+            done
+          }
+
+          resolve_image pipelock ghcr.io/luckypipewrench/pipelock
+          resolve_image pipelock_init ghcr.io/luckypipewrench/pipelock-init
+          resolve_image license_service ghcr.io/luckypipewrench/pipelock-license-service
+
+      # Attach a CycloneDX SBOM for every platform-specific image, not a source
+      # dependency list that says nothing about the image base or architecture.
+      # The generator follows the same exact-version, exact-digest rule as the
+      # release builder; a bare Syft version is not enough to make the published
+      # inventory reproducible.
+      - name: Generate and publish platform image SBOMs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SYFT_VERSION: v1.50.0
+          SYFT_LINUX_AMD64_SHA256: bf7b29ff57f06da30918266a0e1c2885a8f99784798d1bdb1628886aa015d788
+          PIPELOCK_AMD64_DIGEST: ${{ steps.platform-digests.outputs.pipelock_amd64 }}
+          PIPELOCK_ARM64_DIGEST: ${{ steps.platform-digests.outputs.pipelock_arm64 }}
+          PIPELOCK_INIT_AMD64_DIGEST: ${{ steps.platform-digests.outputs.pipelock_init_amd64 }}
+          PIPELOCK_INIT_ARM64_DIGEST: ${{ steps.platform-digests.outputs.pipelock_init_arm64 }}
+          LICENSE_SERVICE_AMD64_DIGEST: ${{ steps.platform-digests.outputs.license_service_amd64 }}
+          LICENSE_SERVICE_ARM64_DIGEST: ${{ steps.platform-digests.outputs.license_service_arm64 }}
+        run: |
+          set -euo pipefail
+          tool_dir="$RUNNER_TEMP/syft-${SYFT_VERSION}"
+          archive="syft_${SYFT_VERSION#v}_linux_amd64.tar.gz"
+          mkdir -p "$tool_dir"
+          gh release download "$SYFT_VERSION" \
+            --repo anchore/syft \
+            --pattern "$archive" \
+            --dir "$tool_dir"
+          printf '%s  %s\n' \
+            "$SYFT_LINUX_AMD64_SHA256" \
+            "$tool_dir/$archive" | sha256sum --check
+          tar -xzf "$tool_dir/$archive" -C "$tool_dir"
+          got="$($tool_dir/syft version | awk '/^Version:/ { print $2 }')"
+          expected="${SYFT_VERSION#v}"
+          test "$got" = "$expected" || {
+            echo "::error::Syft reports $got, expected $expected"
+            exit 1
+          }
+          echo "Syft version: $got"
+          publish_sbom() {
+            local image="$1"
+            local digest="$2"
+            local output="$3"
+            "$tool_dir/syft" "registry:${image}@${digest}" -o "cyclonedx-json=${output}"
+            gh release upload "$GITHUB_REF_NAME" "$output" --clobber
+          }
+
+          publish_sbom ghcr.io/luckypipewrench/pipelock "$PIPELOCK_AMD64_DIGEST" sbom-pipelock-linux-amd64.cdx.json
+          publish_sbom ghcr.io/luckypipewrench/pipelock "$PIPELOCK_ARM64_DIGEST" sbom-pipelock-linux-arm64.cdx.json
+          publish_sbom ghcr.io/luckypipewrench/pipelock-init "$PIPELOCK_INIT_AMD64_DIGEST" sbom-pipelock-init-linux-amd64.cdx.json
+          publish_sbom ghcr.io/luckypipewrench/pipelock-init "$PIPELOCK_INIT_ARM64_DIGEST" sbom-pipelock-init-linux-arm64.cdx.json
+          publish_sbom ghcr.io/luckypipewrench/pipelock-license-service "$LICENSE_SERVICE_AMD64_DIGEST" sbom-pipelock-license-service-linux-amd64.cdx.json
+          publish_sbom ghcr.io/luckypipewrench/pipelock-license-service "$LICENSE_SERVICE_ARM64_DIGEST" sbom-pipelock-license-service-linux-arm64.cdx.json
+
+      # Attestation steps use continue-on-error so one failure doesn't
+      # cascade and kill the rest. The final verification step checks
+      # that ALL attestation steps succeeded (binaries, checksums,
+      # and all container images).
+      - name: Attest binary archives
+        id: attest-binaries
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/pipelock_*.tar.gz
+
+      - name: Attest checksums
+        id: attest-checksums
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/checksums.txt
+
+      - name: Attest SBOM
+        id: attest-sbom
+        continue-on-error: true
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/pipelock_*.tar.gz
+          sbom-path: sbom.cdx.json
+
+      - name: Attest container image
+        id: attest-pipelock-container
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/luckypipewrench/pipelock
+          subject-digest: ${{ steps.platform-digests.outputs.pipelock_index }}
+          push-to-registry: true
+
+      - name: Attest pipelock-init container image
+        id: attest-pipelock-init-container
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/luckypipewrench/pipelock-init
+          subject-digest: ${{ steps.platform-digests.outputs.pipelock_init_index }}
+          push-to-registry: true
+
+      - name: Attest license-service container image
+        id: attest-license-service-container
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/luckypipewrench/pipelock-license-service
+          subject-digest: ${{ steps.platform-digests.outputs.license_service_index }}
+          push-to-registry: true
+
+      - name: Attest pipelock linux amd64 image
+        id: attest-pipelock-amd64
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/luckypipewrench/pipelock
+          subject-digest: ${{ steps.platform-digests.outputs.pipelock_amd64 }}
+          push-to-registry: true
+
+      - name: Attest pipelock linux arm64 image
+        id: attest-pipelock-arm64
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/luckypipewrench/pipelock
+          subject-digest: ${{ steps.platform-digests.outputs.pipelock_arm64 }}
+          push-to-registry: true
+
+      - name: Attest pipelock-init linux amd64 image
+        id: attest-pipelock-init-amd64
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/luckypipewrench/pipelock-init
+          subject-digest: ${{ steps.platform-digests.outputs.pipelock_init_amd64 }}
+          push-to-registry: true
+
+      - name: Attest pipelock-init linux arm64 image
+        id: attest-pipelock-init-arm64
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/luckypipewrench/pipelock-init
+          subject-digest: ${{ steps.platform-digests.outputs.pipelock_init_arm64 }}
+          push-to-registry: true
+
+      - name: Attest license-service linux amd64 image
+        id: attest-license-service-amd64
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/luckypipewrench/pipelock-license-service
+          subject-digest: ${{ steps.platform-digests.outputs.license_service_amd64 }}
+          push-to-registry: true
+
+      - name: Attest license-service linux arm64 image
+        id: attest-license-service-arm64
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/luckypipewrench/pipelock-license-service
+          subject-digest: ${{ steps.platform-digests.outputs.license_service_arm64 }}
+          push-to-registry: true
+
+      - name: Attest pipelock linux amd64 SBOM
+        id: attest-pipelock-amd64-sbom
+        continue-on-error: true
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ghcr.io/luckypipewrench/pipelock
+          subject-digest: ${{ steps.platform-digests.outputs.pipelock_amd64 }}
+          sbom-path: sbom-pipelock-linux-amd64.cdx.json
+          push-to-registry: true
+
+      - name: Attest pipelock linux arm64 SBOM
+        id: attest-pipelock-arm64-sbom
+        continue-on-error: true
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ghcr.io/luckypipewrench/pipelock
+          subject-digest: ${{ steps.platform-digests.outputs.pipelock_arm64 }}
+          sbom-path: sbom-pipelock-linux-arm64.cdx.json
+          push-to-registry: true
+
+      - name: Attest pipelock-init linux amd64 SBOM
+        id: attest-pipelock-init-amd64-sbom
+        continue-on-error: true
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ghcr.io/luckypipewrench/pipelock-init
+          subject-digest: ${{ steps.platform-digests.outputs.pipelock_init_amd64 }}
+          sbom-path: sbom-pipelock-init-linux-amd64.cdx.json
+          push-to-registry: true
+
+      - name: Attest pipelock-init linux arm64 SBOM
+        id: attest-pipelock-init-arm64-sbom
+        continue-on-error: true
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ghcr.io/luckypipewrench/pipelock-init
+          subject-digest: ${{ steps.platform-digests.outputs.pipelock_init_arm64 }}
+          sbom-path: sbom-pipelock-init-linux-arm64.cdx.json
+          push-to-registry: true
+
+      - name: Attest license-service linux amd64 SBOM
+        id: attest-license-service-amd64-sbom
+        continue-on-error: true
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ghcr.io/luckypipewrench/pipelock-license-service
+          subject-digest: ${{ steps.platform-digests.outputs.license_service_amd64 }}
+          sbom-path: sbom-pipelock-license-service-linux-amd64.cdx.json
+          push-to-registry: true
+
+      - name: Attest license-service linux arm64 SBOM
+        id: attest-license-service-arm64-sbom
+        continue-on-error: true
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ghcr.io/luckypipewrench/pipelock-license-service
+          subject-digest: ${{ steps.platform-digests.outputs.license_service_arm64 }}
+          sbom-path: sbom-pipelock-license-service-linux-arm64.cdx.json
+          push-to-registry: true
+
+      # Fail closed: any attestation that did not SUCCEED blocks the release.
+      # `!= 'success'` (not `== 'failure'`) also catches a SKIPPED container
+      # attest step, which happens when its digest step could not resolve the
+      # image — otherwise a missing-digest container publishes with no
+      # provenance while this gate still reports success. `always()` ensures the
+      # gate runs even if an earlier step failed.
+      - name: Verify attestation
+        if: >-
+          always() && (
+          steps.attest-binaries.outcome != 'success' ||
+          steps.attest-checksums.outcome != 'success' ||
+          steps.attest-sbom.outcome != 'success' ||
+          steps.attest-pipelock-container.outcome != 'success' ||
+          steps.attest-pipelock-init-container.outcome != 'success' ||
+          steps.attest-license-service-container.outcome != 'success' ||
+          steps.attest-pipelock-amd64.outcome != 'success' ||
+          steps.attest-pipelock-arm64.outcome != 'success' ||
+          steps.attest-pipelock-init-amd64.outcome != 'success' ||
+          steps.attest-pipelock-init-arm64.outcome != 'success' ||
+          steps.attest-license-service-amd64.outcome != 'success' ||
+          steps.attest-license-service-arm64.outcome != 'success' ||
+          steps.attest-pipelock-amd64-sbom.outcome != 'success' ||
+          steps.attest-pipelock-arm64-sbom.outcome != 'success' ||
+          steps.attest-pipelock-init-amd64-sbom.outcome != 'success' ||
+          steps.attest-pipelock-init-arm64-sbom.outcome != 'success' ||
+          steps.attest-license-service-amd64-sbom.outcome != 'success' ||
+          steps.attest-license-service-arm64-sbom.outcome != 'success' )
+        run: |
+          echo "::error::Attestation failed — release provenance is incomplete"
+          exit 1
+
+      - name: Set up Helm
+        uses: Azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.21.3
+
+      - name: Package Helm chart
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          app_version="${TAG_NAME#v}"
+          chart_version="$(helm show chart charts/pipelock | awk '$1 == "version:" { print $2 }')"
+          test -n "$chart_version" || {
+            echo "::error::could not read chart version from charts/pipelock/Chart.yaml"
+            exit 1
+          }
+          helm package charts/pipelock --app-version "$app_version" --destination dist-chart
+
+      # Build the operator-facing bundle only after every child image has its
+      # own SBOM and provenance proof. The bundle contains index digests because
+      # Kubernetes selects the matching platform child from that signed index.
+      - name: Build Kubernetes image digest bundle
+        env:
+          PIPELOCK_INDEX_DIGEST: ${{ steps.platform-digests.outputs.pipelock_index }}
+          PIPELOCK_INIT_INDEX_DIGEST: ${{ steps.platform-digests.outputs.pipelock_init_index }}
+          LICENSE_SERVICE_INDEX_DIGEST: ${{ steps.platform-digests.outputs.license_service_index }}
+        run: |
+          release_commit="$(git rev-parse "${GITHUB_REF_NAME}^{}")"
+          go run ./cmd/pipelock-release-images \
+            -tag "$GITHUB_REF_NAME" \
+            -commit "$release_commit" \
+            -out dist/release-images.json \
+            -image "pipelock=ghcr.io/luckypipewrench/pipelock@${PIPELOCK_INDEX_DIGEST}" \
+            -image "pipelock-init=ghcr.io/luckypipewrench/pipelock-init@${PIPELOCK_INIT_INDEX_DIGEST}" \
+            -image "pipelock-license-service=ghcr.io/luckypipewrench/pipelock-license-service@${LICENSE_SERVICE_INDEX_DIGEST}"
+
+      - name: Attest Kubernetes image digest bundle
+        id: attest-release-images
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/release-images.json
+
+      - name: Verify Kubernetes image digest bundle attestation
+        if: always() && steps.attest-release-images.outcome != 'success'
+        run: |
+          echo "::error::Kubernetes image digest bundle attestation failed"
+          exit 1
+
+      - name: Upload Kubernetes image digest bundle
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/release-images.json --clobber
+
+      # upload-artifact's if-no-files-found only fires when NOTHING matches, so a
+      # bundle missing just the formula, or just the chart, uploads and passes.
+      # The promotion job would then fail partway through, with images already
+      # promoted. Assert each input separately here, in the job that produced it.
+      - name: Verify promotion inputs are complete
+        run: |
+          set -euo pipefail
+          test -s dist/release-images.json || {
+            echo "::error::dist/release-images.json was not generated"
+            exit 1
+          }
+          test -n "$(find dist-chart -maxdepth 1 -name 'pipelock-*.tgz' -print -quit)" || {
+            echo "::error::helm package produced no chart archive in dist-chart"
+            exit 1
+          }
+          test -s dist/homebrew/Formula/pipelock.rb || {
+            echo "::error::GoReleaser did not write dist/homebrew/Formula/pipelock.rb (found: $(find dist -name '*.rb' -print 2>/dev/null | tr '\n' ' '))"
+            exit 1
+          }
+
+      # overwrite so re-running the whole workflow works. Artifacts are immutable
+      # per run, and a re-run is a new attempt of the SAME run, so a second
+      # upload under this name is rejected without it: the rebuild would redo
+      # every image push and then fail on its last step.
+      - name: Save promotion inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-promotion-inputs
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+          path: |
+            dist/homebrew/Formula/pipelock.rb
+            dist-chart/pipelock-*.tgz
+            dist/release-images.json
+
+  release-promote:
+    needs: [release-build]
+    runs-on: ubuntu-latest
+    # Approval wait does not count against this; it bounds the promotion itself
+    # so a hung registry call cannot hold the release-publication concurrency
+    # group, and every later release with it, for the six-hour default.
+    timeout-minutes: 30
+    environment: release-promotion
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.25.12'
+          check-latest: true
+
+      - name: Verify Go version
+        run: test "$(go env GOVERSION)" = "go1.25.12"
+
+      - name: Download promotion inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-promotion-inputs
+
+      - name: Install verified crane
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CRANE_VERSION: v0.21.9
+          CRANE_LINUX_AMD64_SHA256: 5c16d8ddb971cb1d5e6ed8b1e743da8224414eeba2c2762d8f1a61b2f095699e
+        run: |
+          set -euo pipefail
+          tool_dir="$RUNNER_TEMP/crane-${CRANE_VERSION}"
+          archive="go-containerregistry_Linux_x86_64.tar.gz"
+          mkdir -p "$tool_dir"
+          gh release download "$CRANE_VERSION" --repo google/go-containerregistry --pattern "$archive" --dir "$tool_dir"
+          printf '%s  %s\n' "$CRANE_LINUX_AMD64_SHA256" "$tool_dir/$archive" | sha256sum --check
+          tar -xzf "$tool_dir/$archive" -C "$tool_dir" crane
+          test "$("$tool_dir/crane" version)" = "${CRANE_VERSION#v}"
+          echo "$tool_dir" >> "$GITHUB_PATH"
+
+      - name: Login to GHCR for promotion
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Helm
+        uses: Azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.21.3
+
+      - name: Verify release manifest signature before promotion
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_KEYRING_HEX: ${{ secrets.RELEASE_KEYRING_HEX }}
+        run: |
+          set -euo pipefail
+          verify_dir="$RUNNER_TEMP/release-manifest-verify"
+          mkdir -p "$verify_dir"
+          if ! gh release download "$GITHUB_REF_NAME" --pattern release.json --pattern release.json.sig --dir "$verify_dir" --clobber; then
+            echo "::error::release.json.sig is not attached to ${GITHUB_REF_NAME}; refusing promotion"
+            exit 1
+          fi
+          go run ./cmd/pipelock-release-manifest --verify --manifest "$verify_dir/release.json"
+          # A good signature proves only that someone we trust signed SOME
+          # manifest. Signing is offline and manual, so the reachable mistake is
+          # uploading a correctly signed manifest belonging to a different
+          # release, which would publish the previous release's asset digests as
+          # this tag's self-update evidence. Bind the verified manifest to the
+          # tag and commit being promoted, exactly as the image bundle is bound
+          # below.
+          manifest_tag="$(jq -r .tag "$verify_dir/release.json")"
+          manifest_commit="$(jq -r .commit "$verify_dir/release.json")"
+          test "$manifest_tag" = "$GITHUB_REF_NAME" || {
+            echo "::error::signed release manifest is for ${manifest_tag}, not ${GITHUB_REF_NAME}"
+            exit 1
+          }
+          test "$manifest_commit" = "$(git rev-parse "${GITHUB_REF_NAME}^{}")" || {
+            echo "::error::signed release manifest names commit ${manifest_commit}, which is not the commit ${GITHUB_REF_NAME} points at"
+            exit 1
+          }
+
+      # Every promotion input is checked here, before the first consumer-facing
+      # write below. A presence check that lives in the step that consumes the
+      # file fails after images are already promoted, which leaves a release
+      # half-published and needing a re-run.
+      - name: Verify promotion image inputs
+        env:
+          PIPELOCK_INDEX_DIGEST: ${{ needs.release-build.outputs.pipelock_index }}
+          PIPELOCK_INIT_INDEX_DIGEST: ${{ needs.release-build.outputs.pipelock_init_index }}
+          LICENSE_SERVICE_INDEX_DIGEST: ${{ needs.release-build.outputs.license_service_index }}
+          PIPELOCK_AMD64_DIGEST: ${{ needs.release-build.outputs.pipelock_amd64 }}
+          PIPELOCK_ARM64_DIGEST: ${{ needs.release-build.outputs.pipelock_arm64 }}
+          PIPELOCK_INIT_AMD64_DIGEST: ${{ needs.release-build.outputs.pipelock_init_amd64 }}
+          PIPELOCK_INIT_ARM64_DIGEST: ${{ needs.release-build.outputs.pipelock_init_arm64 }}
+          LICENSE_SERVICE_AMD64_DIGEST: ${{ needs.release-build.outputs.license_service_amd64 }}
+          LICENSE_SERVICE_ARM64_DIGEST: ${{ needs.release-build.outputs.license_service_arm64 }}
+        run: |
+          set -euo pipefail
+          test -s dist/homebrew/Formula/pipelock.rb || {
+            echo "::error::promotion bundle has no Homebrew formula"
+            exit 1
+          }
+          test -n "$(find dist-chart -maxdepth 1 -name 'pipelock-*.tgz' -print -quit)" || {
+            echo "::error::promotion bundle has no Helm chart"
+            exit 1
+          }
+          test "$(jq -r .schema dist/release-images.json)" = "pipelock-release-images-v1"
+          test "$(jq -r .tag dist/release-images.json)" = "$GITHUB_REF_NAME"
+          test "$(jq -r .commit dist/release-images.json)" = "$(git rev-parse "${GITHUB_REF_NAME}^{}")"
+          test "$(jq -er '.images[] | select(.name == "pipelock") | .digest' dist/release-images.json)" = "$PIPELOCK_INDEX_DIGEST"
+          test "$(jq -er '.images[] | select(.name == "pipelock-init") | .digest' dist/release-images.json)" = "$PIPELOCK_INIT_INDEX_DIGEST"
+          test "$(jq -er '.images[] | select(.name == "pipelock-license-service") | .digest' dist/release-images.json)" = "$LICENSE_SERVICE_INDEX_DIGEST"
+          test "$(jq '.images | length' dist/release-images.json)" -eq 3
+          for digest_name in \
+            PIPELOCK_INDEX_DIGEST PIPELOCK_INIT_INDEX_DIGEST LICENSE_SERVICE_INDEX_DIGEST \
+            PIPELOCK_AMD64_DIGEST PIPELOCK_ARM64_DIGEST \
+            PIPELOCK_INIT_AMD64_DIGEST PIPELOCK_INIT_ARM64_DIGEST \
+            LICENSE_SERVICE_AMD64_DIGEST LICENSE_SERVICE_ARM64_DIGEST; do
+            digest="${!digest_name}"
+            [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]] || {
+              echo "::error::${digest_name} is missing or is not a lowercase sha256 digest"
+              exit 1
+            }
+          done
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+
+          manifest = json.loads(
+              pathlib.Path(os.environ["RUNNER_TEMP"], "release-manifest-verify", "release.json").read_text()
+          )
+          assets = {asset["name"]: asset["sha256"] for asset in manifest["assets"]}
+          formula = pathlib.Path("dist/homebrew/Formula/pipelock.rb").read_text()
+          pairs = re.findall(
+              r'/download/[^/]+/([^"/]+)"\s+sha256 "([0-9a-f]{64})"',
+              formula,
+          )
+          if len(pairs) != 4:
+              raise SystemExit(f"expected 4 Homebrew archive checksums, found {len(pairs)}")
+          for name, digest in pairs:
+              if assets.get(name) != digest:
+                  raise SystemExit(f"Homebrew checksum for {name} does not match signed release.json")
+          PY
+
+      - name: Promote verified image manifests
+        env:
+          TAG: ${{ github.ref_name }}
+          PIPELOCK_INDEX_DIGEST: ${{ needs.release-build.outputs.pipelock_index }}
+          PIPELOCK_INIT_INDEX_DIGEST: ${{ needs.release-build.outputs.pipelock_init_index }}
+          LICENSE_SERVICE_INDEX_DIGEST: ${{ needs.release-build.outputs.license_service_index }}
+          PIPELOCK_AMD64_DIGEST: ${{ needs.release-build.outputs.pipelock_amd64 }}
+          PIPELOCK_ARM64_DIGEST: ${{ needs.release-build.outputs.pipelock_arm64 }}
+          PIPELOCK_INIT_AMD64_DIGEST: ${{ needs.release-build.outputs.pipelock_init_amd64 }}
+          PIPELOCK_INIT_ARM64_DIGEST: ${{ needs.release-build.outputs.pipelock_init_arm64 }}
+          LICENSE_SERVICE_AMD64_DIGEST: ${{ needs.release-build.outputs.license_service_amd64 }}
+          LICENSE_SERVICE_ARM64_DIGEST: ${{ needs.release-build.outputs.license_service_arm64 }}
+        run: |
+          set -euo pipefail
+          remote_stable_tags="$(git ls-remote --tags --refs origin 'refs/tags/v*')"
+          newest_stable="$(printf '%s\n' "$remote_stable_tags" | awk '{sub("refs/tags/v", "", $2); print $2}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)"
+          test -n "$newest_stable" || { echo "::error::could not determine newest stable release tag"; exit 1; }
+          promote_image() {
+            local repository="$1" index_digest="$2" version="${TAG#v}"
+            local tags existing latest_digest
+            tags="$(crane ls "$repository")" || { echo "::error::could not list tags for ${repository}"; exit 1; }
+            if grep -Fxq "$version" <<<"$tags"; then
+              existing="$(crane digest "${repository}:${version}")"
+              test "$existing" = "$index_digest" || { echo "::error::${repository}:${version} has a different digest"; exit 1; }
+            else
+              crane copy --no-clobber "${repository}@${index_digest}" "${repository}:${version}"
+            fi
+            if [[ "$version" != *-* ]]; then
+              if [[ "$newest_stable" = "$version" ]]; then
+                latest_digest="$(crane digest "${repository}:latest" 2>/dev/null || true)"
+                if [[ "$latest_digest" != "$index_digest" ]]; then
+                  crane copy "${repository}@${index_digest}" "${repository}:latest"
+                fi
+                test "$(crane digest "${repository}:latest")" = "$index_digest"
+              fi
+            fi
+            test "$(crane digest "${repository}:${version}")" = "$index_digest"
+          }
+          promote_platform_image() {
+            local repository="$1" digest="$2" arch="$3" version="${TAG#v}"
+            local target="${repository}:${version}-${arch}" existing
+            if existing="$(crane digest "$target" 2>/dev/null)"; then
+              test "$existing" = "$digest" || { echo "::error::${target} has a different digest"; exit 1; }
+            else
+              crane copy --no-clobber "${repository}@${digest}" "$target"
+            fi
+            test "$(crane digest "$target")" = "$digest"
+          }
+          promote_image ghcr.io/luckypipewrench/pipelock "$PIPELOCK_INDEX_DIGEST"
+          promote_image ghcr.io/luckypipewrench/pipelock-init "$PIPELOCK_INIT_INDEX_DIGEST"
+          promote_image ghcr.io/luckypipewrench/pipelock-license-service "$LICENSE_SERVICE_INDEX_DIGEST"
+          promote_platform_image ghcr.io/luckypipewrench/pipelock "$PIPELOCK_AMD64_DIGEST" amd64
+          promote_platform_image ghcr.io/luckypipewrench/pipelock "$PIPELOCK_ARM64_DIGEST" arm64
+          promote_platform_image ghcr.io/luckypipewrench/pipelock-init "$PIPELOCK_INIT_AMD64_DIGEST" amd64
+          promote_platform_image ghcr.io/luckypipewrench/pipelock-init "$PIPELOCK_INIT_ARM64_DIGEST" arm64
+          promote_platform_image ghcr.io/luckypipewrench/pipelock-license-service "$LICENSE_SERVICE_AMD64_DIGEST" amd64
+          promote_platform_image ghcr.io/luckypipewrench/pipelock-license-service "$LICENSE_SERVICE_ARM64_DIGEST" arm64
+
+      # Deliberately placed after the attestation gate. The chart is the least
+      # critical artifact in the release, and an earlier position would let a
+      # registry hiccup on the chart abort the job with binaries and images
+      # already published but their provenance never attested. Publishing
+      # unattested images because a chart push failed is the wrong failure
+      # direction for this project, so provenance completes first.
+      #
+      # The chart is published to the same registry as the images it deploys, as
+      # an OCI artifact, so there is no chart index to host and no gh-pages
+      # branch to keep in sync. `helm push` of pipelock-<v>.tgz to
+      # oci://ghcr.io/luckypipewrench/charts yields
+      # ghcr.io/luckypipewrench/charts/pipelock:<v>, which is the reference
+      # Artifact Hub indexes.
+      #
+      # Both appVersion and the chart version are release-gated to the tag being
+      # published. OCI charts are addressed by chart version, so this prevents
+      # a later release from replacing an already-published chart tag.
+      #
+      # The first run creates a new GHCR package, and new packages are private
+      # by default, so the chart is not installable until that package is made
+      # public once in the GitHub UI. There is no REST endpoint for that, and it
+      # is irreversible, so it stays a deliberate human step.
+      - name: Publish Helm chart
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          app_version="${TAG_NAME#v}"
+          chart_archive="$(find dist-chart -maxdepth 1 -name 'pipelock-*.tgz' -print -quit)"
+          test -n "$chart_archive" || {
+            echo "::error::promotion bundle has no Helm chart"
+            exit 1
+          }
+          chart_version="$(helm show chart "$chart_archive" | awk '$1 == "version:" { print $2 }')"
+          chart_app_version="$(helm show chart "$chart_archive" | awk '$1 == "appVersion:" { gsub(/\"/, "", $2); print $2 }')"
+          test -n "$chart_version"
+          test "$chart_archive" = "dist-chart/pipelock-${chart_version}.tgz"
+          test "$chart_app_version" = "$app_version" || {
+            echo "::error::chart appVersion ${chart_app_version} does not match ${app_version}"
+            exit 1
+          }
+          helm registry login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin <<<"$GITHUB_TOKEN"
+          trap 'helm registry logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          existing_dir="$RUNNER_TEMP/published-chart-${chart_version}"
+          candidate_dir="$RUNNER_TEMP/candidate-chart-${chart_version}"
+          mkdir -p "$existing_dir" "$candidate_dir"
+          if chart_lookup_output="$(helm pull "oci://ghcr.io/luckypipewrench/charts/pipelock" --version "$chart_version" --destination "$existing_dir" 2>&1)"; then
+            cmp -s "$chart_archive" "$existing_dir/pipelock-${chart_version}.tgz" || {
+              echo "::error::published chart archive ${chart_version} differs from the staged release archive"
+              exit 1
+            }
+            tar -xzf "$chart_archive" -C "$candidate_dir"
+            tar -xzf "$existing_dir/pipelock-${chart_version}.tgz" -C "$existing_dir"
+            diff -ru "$candidate_dir/pipelock" "$existing_dir/pipelock" || {
+              echo "::error::published chart ${chart_version} differs from the signed release input"
+              exit 1
+            }
+          elif printf '%s\n' "$chart_lookup_output" | grep -qE ': not found$'; then
+            helm push "$chart_archive" oci://ghcr.io/luckypipewrench/charts
+          else
+            echo "::error::could not determine whether chart ${chart_version} exists"
+            exit 1
+          fi
+
+          # A brand-new GHCR package is private, and the install command in the
+          # READMEs fails with an authorization error until it is made public.
+          # The reminder belongs here, in front of whoever ran the release, at
+          # the moment it becomes actionable. It deliberately does not go in the
+          # install docs: the condition is true once, during bootstrap, and a
+          # caveat left in user-facing docs would be permanently wrong
+          # afterwards.
+          {
+            echo "### Helm chart published"
+            echo
+            echo "\`ghcr.io/luckypipewrench/charts/pipelock:${chart_version}\` (appVersion ${app_version})."
+            echo
+            echo "If this is the first published chart, the package is PRIVATE and"
+            echo "\`helm install oci://ghcr.io/luckypipewrench/charts/pipelock\` fails for"
+            echo "everyone until it is made public once under Package settings."
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Publish Homebrew formula
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG_NAME#v}"
+          remote_stable_tags="$(git ls-remote --tags --refs origin 'refs/tags/v*')"
+          newest_stable="$(printf '%s\n' "$remote_stable_tags" | awk '{sub("refs/tags/v", "", $2); print $2}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)"
+          test -n "$newest_stable" || { echo "::error::could not determine newest stable release tag"; exit 1; }
+          if [[ "$version" != "$newest_stable" ]]; then
+            echo "Not updating Homebrew for ${TAG_NAME}; newest stable release is v${newest_stable}"
+            exit 0
+          fi
+          formula="dist/homebrew/Formula/pipelock.rb"
+          test -s "$formula" || { echo "::error::promotion bundle has no Homebrew formula"; exit 1; }
+          path="Formula/pipelock.rb"
+          encoded="$(base64 -w0 "$formula")"
+          existing_json="$RUNNER_TEMP/homebrew-existing.json"
+          if gh api "repos/luckyPipewrench/homebrew-tap/contents/${path}?ref=main" >"$existing_json" 2>"$RUNNER_TEMP/homebrew-read.err"; then
+            existing_sha="$(jq -r .sha "$existing_json")"
+            jq -r .content "$existing_json" | tr -d '\n' | base64 -d >"$RUNNER_TEMP/homebrew-existing.rb"
+            if cmp -s "$formula" "$RUNNER_TEMP/homebrew-existing.rb"; then
+              echo "Homebrew formula already matches ${TAG_NAME}"
+              exit 0
+            fi
+            gh api --method PUT "repos/luckyPipewrench/homebrew-tap/contents/${path}" \
+              -f message="Update Pipelock to ${TAG_NAME}" -f branch=main \
+              -f content="$encoded" -f sha="$existing_sha" >/dev/null
+          elif grep -q 'HTTP 404' "$RUNNER_TEMP/homebrew-read.err"; then
+            gh api --method PUT "repos/luckyPipewrench/homebrew-tap/contents/${path}" \
+              -f message="Add Pipelock ${TAG_NAME}" -f branch=main -f content="$encoded" >/dev/null
+          else
+            cat "$RUNNER_TEMP/homebrew-read.err" >&2
+            echo "::error::could not read the existing Homebrew formula"
+            exit 1
+          fi
+
+      # Promote only after the proof gate, Kubernetes digest bundle, and chart
+      # have all succeeded. The draft kept GitHub Release assets private while
+      # those checks ran. Container images and Homebrew remain separate
+      # publication surfaces and are not made atomic by this promotion.
+      # `pipelock update` verifies release.json against release.json.sig before
+      # trusting an update, so a release published without that signature leaves
+      # self-update unable to verify anything. v3.1.0 shipped in exactly that
+      # state. Signing is offline by design and cannot move into CI, so this
+      # refuses to leave draft until the signature has been uploaded, rather
+      # than publishing and discovering the gap from a user report.
+      # Verification and promotion share one step on purpose. Release assets stay
+      # mutable while the release is a draft, so a separate verify step leaves a
+      # window in which the verified manifest or signature can be replaced before
+      # the release goes public. Re-reading the assets and promoting without an
+      # intervening step boundary keeps that window as small as this surface
+      # allows. It does not make the pair atomic, which GitHub does not offer, so
+      # the digests that were verified are recorded in the job log as the record
+      # of what the decision was made against.
+      - name: Reverify the release manifest signature and publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_KEYRING_HEX: ${{ secrets.RELEASE_KEYRING_HEX }}
+        run: |
+          set -euo pipefail
+          verify_dir="$RUNNER_TEMP/release-manifest-verify"
+          rm -rf "$verify_dir"
+          mkdir -p "$verify_dir"
+          if ! gh release download "$GITHUB_REF_NAME" \
+                 --pattern release.json --pattern release.json.sig \
+                 --dir "$verify_dir" --clobber; then
+            echo "::error::release.json.sig is not attached to ${GITHUB_REF_NAME}. Sign dist/release.json offline (pipelock-release-manifest --sign-only) and upload it before publishing."
+            exit 1
+          fi
+          go run ./cmd/pipelock-release-manifest --verify --manifest "$verify_dir/release.json"
+          manifest_tag="$(jq -r .tag "$verify_dir/release.json")"
+          manifest_commit="$(jq -r .commit "$verify_dir/release.json")"
+          test "$manifest_tag" = "$GITHUB_REF_NAME" || {
+            echo "::error::signed release manifest is for ${manifest_tag}, not ${GITHUB_REF_NAME}"
+            exit 1
+          }
+          test "$manifest_commit" = "$(git rev-parse "${GITHUB_REF_NAME}^{}")" || {
+            echo "::error::signed release manifest names commit ${manifest_commit}, which is not the commit ${GITHUB_REF_NAME} points at"
+            exit 1
+          }
+          echo "verified asset digests:"
+          sha256sum "$verify_dir/release.json" "$verify_dir/release.json.sig"
+          gh release edit "$GITHUB_REF_NAME" --draft=false
+
+      # Move the floating major tag for this tag's major line, and only when
+      # this tag is the newest stable release in that line. A prerelease or an
+      # older patch still publishes its immutable version, but cannot move a
+      # consumer-facing pointer backward.
+      - name: Update floating major tag for GitHub Action
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Only an exact vX.Y.Z tag moves a pointer. A prerelease suffix makes
+          # this pattern fail to match, so major stays empty and the step stops.
+          major="$(printf '%s\n' "$TAG_NAME" | sed -nE 's/^v([0-9]+)\.[0-9]+\.[0-9]+$/\1/p')"
+          if [[ -z "$major" ]]; then
+            echo "Not moving any floating tag: ${TAG_NAME} is not an exact vX.Y.Z product tag"
+            exit 0
+          fi
+          remote_stable_tags="$(git ls-remote --tags --refs origin "refs/tags/v${major}.*")"
+          latest_stable_tag="$(printf '%s\n' "$remote_stable_tags" | awk '{sub("refs/tags/", "", $2); print $2}' | grep -E "^v${major}\.[0-9]+\.[0-9]+$" | sort -V | tail -n 1 || true)"
+          if [[ -z "$latest_stable_tag" ]]; then
+            echo "Cannot determine the newest stable v${major} tag from origin" >&2
+            exit 1
+          fi
+          if [[ "$TAG_NAME" != "$latest_stable_tag" ]]; then
+            echo "Not moving v${major}: ${TAG_NAME} is not the newest stable tag in the v${major} line (newest is ${latest_stable_tag:-none})"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          floating_ref="refs/tags/v${major}"
+          remote_oid="$(git ls-remote --refs origin "$floating_ref" | awk '{print $1}')"
+          # The ^{} suffix dereferences TAG_NAME (annotated tag) to its commit.
+          # Without it, git tag -fa "v${major}" "${TAG_NAME}" creates a nested tag
+          # (v3 -> v3.4.0 -> commit) which clutters ls-remote and some tooling rejects it.
+          git tag -fa "v${major}" "${TAG_NAME}^{}" -m "Update v${major} to ${TAG_NAME}"
+          git push origin "$floating_ref" --force-with-lease="${floating_ref}:${remote_oid}"
+          echo "Moved floating tag v${major} to ${TAG_NAME}"

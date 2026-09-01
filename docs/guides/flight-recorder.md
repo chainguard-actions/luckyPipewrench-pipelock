@@ -1,0 +1,609 @@
+# Flight Recorder Guide
+
+The flight recorder writes configured enforcement evidence to a per-writer
+hash-chained, tamper-evident log. Blocks produce receipts; allow receipts require
+`flight_recorder.require_receipts: true`, and clean stream frames are summarized
+rather than individually receipted. Each recorded entry is cryptographically
+linked to the one before it in that writer stream, so deletion or modification
+within an observed chain breaks verification. Signed checkpoints prove the chain
+state observed by one writer at specific points; they do not prove that traffic
+which bypassed Pipelock was recorded, or that several processes sharing one
+recorder directory formed one deployment-wide sequence. Use
+`pipelock evidence doctor DIR` to detect structural fork damage in a directory.
+The recorder is designed for post-incident investigation, compliance evidence,
+and forensic replay.
+
+**On by default.** `enabled` defaults to `true` so receipts are available out of the box ("verify the boundary"). It only *records* once a `dir` is configured, and because `sign_checkpoints` defaults to `true` a signing key is required alongside it unless you opt into an unsigned recorder with `sign_checkpoints: false`. Without a `dir` the recorder is inert and writes nothing, so the default flip never breaks an existing config. `pipelock init` generates a recorder directory and an Ed25519 signing key and writes them into the config, which is what makes receipts live. Receipt emission is best-effort by default; set `require_receipts: true` when allow-path receipt failures must fail closed before traffic is forwarded.
+
+## Whole-Corpus Auditor
+
+On Linux, `pipelock init` installs and enables the user-systemd
+`pipelock-evidence-corpus-auditor.timer`. Every 15 minutes it runs
+`pipelock evidence doctor` across the configured recorder directory and writes
+`pipelock_evidence_corpus_integrity_ok` plus its audit timestamp in Prometheus
+textfile format. The generated alert rule is
+`PipelockEvidenceCorpusIntegrityFailed` under
+`$XDG_CONFIG_HOME/pipelock/prometheus/rules/`.
+
+Point the Prometheus node-exporter textfile collector at
+`$XDG_CONFIG_HOME/pipelock/prometheus/textfile/`, and add a rule-file GLOB such
+as `$XDG_CONFIG_HOME/pipelock/prometheus/rules/*` to Prometheus `rule_files`.
+`rule_files` accepts file paths and globs, not directories, so naming the
+directory alone loads no rules and the alert never fires. The alert fires for
+damage, an incomplete scan, a stale audit, or no metric. Stop evidence export for
+investigation; the auditor never gates proxy requests. A process-local
+`require_receipts` failure can
+still stop that process's own mediated actions, but a different writer's
+historical damage cannot.
+
+## What Gets Recorded
+
+The recorder captures two categories of evidence:
+
+- **Enforcement decisions**: every allow, block, warn, redirect, and ask verdict with the scanner layer, pattern name, match text, transport, and tool name that triggered it.
+- **Checkpoint entries**: periodic summaries covering N entries, with an Ed25519 signature over the chain state.
+
+Each entry has a type field. Common types: `decision`, `checkpoint`. Session IDs tie entries to a specific proxy session.
+
+## Configuration
+
+Add a `flight_recorder` block to your `pipelock.yaml`:
+
+```yaml
+flight_recorder:
+  enabled: true
+  dir: /var/lib/pipelock/evidence
+  checkpoint_interval: 1000      # entries between signed checkpoints
+  retention_days: 90             # auto-expire raw-escrow sidecars older than 90 days (0 = forever)
+  redact: true                   # DLP redaction before commit (recommended)
+  require_receipts: false        # fail closed before forwarding when allow receipts cannot be emitted
+  require_containment_evidence: false # set true to refuse startup unless a verified containment proof is available
+  posture_signer_key: /etc/pipelock/keys/flight-recorder-signing.key.pub # required when containment evidence is required
+  sign_checkpoints: true         # Ed25519 signed checkpoints
+  signing_key_path: /etc/pipelock/keys/flight-recorder-signing.key   # `pipelock init` writes this next to your config
+  max_entries_per_file: 10000    # rotate to a new file after this many entries
+  raw_escrow: false              # encrypted raw sidecar (see below)
+  escrow_public_key: ""          # X25519 hex public key for raw escrow
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | true | Master switch. **On by default.** Recording requires `dir` and a signing key too — `enabled: true` with no `dir` is inert (nothing is written), not an error. Set `enabled: false` to opt out. |
+| `dir` | (empty) | Directory for evidence files. The recorder stays inert until this is set; created if absent. `pipelock init` generates one. |
+| `checkpoint_interval` | 1000 | How many entries between signed checkpoints. |
+| `retention_days` | 0 | Auto-expire raw-escrow sidecars after N days. JSONL receipt-chain shards are preserved. 0 = never expire. |
+| `redact` | true | DLP scan each entry before writing. Replaces matched content with a redaction marker. |
+| `require_receipts` | false | Require receipt emission before allow-path traffic is forwarded. When true, missing or failed receipt emission blocks the action with `receipt_emission_failed`; block-path receipts remain best-effort because the action is already denied. |
+| `require_containment_evidence` | false | Refuse signed-receipt startup unless the process can read a containment proof that verifies with `posture_signer_key`. This setting is startup-only. |
+| `posture_signer_key` | (empty) | Pinned Ed25519 public key, as 64 hex characters or a public-key file. Required with `require_containment_evidence: true`; the key is read and pinned at startup. |
+| `sign_checkpoints` | true | Sign each checkpoint with the agent's Ed25519 private key. |
+| `max_entries_per_file` | 10000 | Rotate to a new JSONL file after this many entries. |
+| `raw_escrow` | false | Write an encrypted sidecar with the unredacted detail for each entry. |
+| `escrow_public_key` | "" | X25519 hex public key for escrow encryption. Required when `raw_escrow: true`. |
+
+The receipt-signing private key is loaded from
+`flight_recorder.signing_key_path`.
+
+`pipelock init` and `pipelock contain install` also write a public-key sidecar
+next to that private key at `<signing_key_path>.pub`. The sidecar contains the
+64-hex Ed25519 public key that verifiers pin with `--key`; it is safe to share.
+Never share the private key file itself.
+
+For an existing install, or to refresh the sidecar without rotating the key:
+
+```bash
+pipelock signing pubkey --config /etc/pipelock/pipelock.yaml --out /etc/pipelock/keys/flight-recorder-signing.key.pub
+```
+
+You can also derive from the private key directly:
+
+```bash
+pipelock signing pubkey --key-file /etc/pipelock/keys/flight-recorder-signing.key
+```
+
+### Fail-closed receipts (`require_receipts`)
+
+By default receipt emission is best-effort: if signing or the recorder fails,
+the decision is logged and traffic still flows (evidence, not enforcement). Set
+`require_receipts: true` to make an *allow-path* receipt a precondition for
+forwarding. When it is on, pipelock emits the allow receipt **before** the
+request leaves the proxy; if that emission fails it blocks with
+`receipt_emission_failed` instead of egressing. This is enforced on every
+egress transport — `/fetch`, forward proxy, CONNECT tunnel admission,
+TLS-intercepted CONNECT inner HTTP requests, WebSocket, reverse proxy, MCP
+stdio, and MCP HTTP. Block-path receipts stay best-effort because the action is
+already denied.
+
+Two operational notes:
+
+- **It needs a live signed recorder.** `require_receipts` has nothing to emit
+  unless `enabled`, `dir`, and `signing_key_path` are all set. With no live
+  emitter every request would fail closed, so `pipelock run` and
+  `pipelock mcp proxy` **refuse to start** in that state rather than serve an
+  all-blocked proxy. `require_receipts` is hot-reloadable, but because the
+  recorder is built once at startup, what a reload does depends on whether a
+  recorder and `signing_key_path` were bound at startup:
+    - **Neither bound:** enabling it is **ignored**. Pipelock writes a warning to
+      stderr and the audit channel, then keeps the previous setting. Restart with
+      a configured recorder to enable receipt enforcement.
+    - **Both bound, emitter unhealthy or absent:** reload rebuilds the emitter,
+      whether receipts are already required or are being enabled by this reload.
+      A successful rebuild applies the setting. A failed rebuild rejects the whole
+      reload and keeps the existing setting, so an enable attempted in this state
+      is refused rather than ignored.
+  Turning `require_receipts` **off** through a reload is rejected in every case
+  and takes a restart, because it is a required security contract.
+- **An allowed request that is later blocked carries two receipts.** The
+  pre-egress allow receipt attests the egress *decision*; if response scanning
+  then blocks the reply, a block receipt is emitted under the **same
+  `action_id`**. Under `require_receipts` you will therefore see an allow
+  followed by a block for one action — the request did egress, and the response
+  was blocked separately.
+
+### Posture proof availability
+
+When a signed receipt session starts, it records `posture_proof_availability`
+in the unsigned top-level `ext` bag of its `session_open` receipt. The field is
+advisory diagnosis for a human reader, not verifier input or containment proof.
+It may be modified or removed without invalidating the individual receipt
+signature, but it is part of the full receipt envelope hash: changing a
+persisted `session_open` extension causes chain verification to fail once a
+successor receipt links to it.
+
+| Status | Runtime behavior | Meaning in the receipt |
+|--------|------------------|------------------------|
+| `attested` | Starts. | The proof was read and verified. A verified proof can still lack containment evidence. |
+| `absent` | Starts by default. | No proof file was present at the configured path. |
+| `unreadable` | Starts by default and writes a warning to stderr. | The process could not read the proof or traverse a parent directory. This does not establish that a proof exists. The warning names the path, filesystem cause, visible owner and group, and the access remedy. |
+| `invalid` | Refuses to start. | A present proof was malformed, unverifiable, or expired. No receipt is emitted from that startup. |
+
+Set `require_containment_evidence: true` when signed receipts must begin only
+with containment evidence signed by an operator-pinned key. Configure
+`posture_signer_key` with the key that signs the capsule; for containment runs
+that use the recorder signing key, its `<signing_key_path>.pub` sidecar is the
+natural value. In that mode `absent`, `unreadable`, an `attested` proof without
+containment evidence, and a proof signed by another key refuse startup.
+`invalid` always refuses startup. The setting requires `enabled`, `dir`,
+`signing_key_path`, and `posture_signer_key`, and changing any of them through a
+reload has no effect until restart.
+
+`PIPELOCK_POSTURE_PROOF` may select an absolute proof path for a process. In
+required mode the selected file still must verify with the pinned
+`posture_signer_key`; setting the variable cannot make a self-signed capsule
+satisfy containment evidence.
+
+### Default-on footguns (handled)
+
+Because the recorder is on by default, two footguns are bounded by the defaults — keep them in mind if you change them:
+
+- **Disk growth.** Evidence files rotate at `max_entries_per_file` (default 10000). `retention_days` can trim old raw-escrow sidecars, but JSONL receipt-chain shards are preserved for offline verification; archive or explicitly prune evidence if you need a hard storage cap.
+- **Privacy.** Receipts record the *targets* of mediated traffic. `redact` (default `true`) DLP-scrubs each entry before it touches disk so secrets are not persisted in the clear. Do not disable it unless you have a separate control around the evidence directory.
+- **Sign-without-a-key.** `sign_checkpoints` defaults to `true`, so once you set a `dir` the recorder expects a signing key. Starting a persisting recorder with `sign_checkpoints: true` and no `signing_key_path` is a hard startup error (it would otherwise write checkpoints with an empty signature that `verify-receipt` later rejects as "missing signature"). Provide `signing_key_path`, or set `sign_checkpoints: false` for an explicitly unsigned hash-chained recorder. `pipelock init` sets both, so this only bites hand-written configs.
+
+### Completeness anchor (transcript root)
+
+On a **clean shutdown** the recorder seals that writer's chain with a `transcript_root` entry: a single record naming the final sequence number and the chain's root hash. This is the per-writer completeness anchor — `verify-receipt --chain` can confirm the selected chain reached the sealed root rather than reporting a chain that was silently truncated at the tail as VALID.
+
+Scope and limits:
+
+- **Clean exit only.** The root is written during graceful shutdown, after in-flight receipt emits have drained (drain-then-seal). A `SIGKILL` (or power loss) terminates the process before the seal runs, so the tail is truncated with no root. Detecting that case requires an external/periodic anchor and is not closed here.
+- **Restart resumes cleanly.** A transcript root is a per-run checkpoint, not a permanent seal. The next start by the same writer resumes emission into the same hash-linked chain (a continuous per-writer chain still verifies), so receipts are never silently bricked by a prior clean shutdown.
+- **Large evidence directories keep emitting.** Resume reads only the tail record it needs and is not subject to the bounded directory-read cap used by query, verification, and dashboard paths. Those content-read paths stay bounded so a truncated scan cannot be mistaken for complete evidence. Resume and health selection parse the session id out of each shard filename instead of matching a raw prefix, so a session such as `agent` cannot accidentally adopt shards from `agent-debug`.
+
+### Key-free evidence capture (`--capture-output`)
+
+Signed action receipts require a signing key. To capture evidence **without** a
+key, use the `--capture-output` flag, available on both the HTTP proxy and the
+MCP proxy:
+
+```bash
+pipelock run --capture-output /var/lib/pipelock/evidence
+pipelock mcp proxy --capture-output /var/lib/pipelock/evidence -- node server.js
+```
+
+This writes `evidence-*.jsonl` for every scan verdict (DLP, injection,
+tool-policy, CEE) across all transports — including all MCP transports (stdio,
+streamable-HTTP, HTTP-reverse, WS-listener) — using the same on-disk format as
+the signed recorder, minus the signatures. Pass `--capture-escrow-public-key`
+(64 hex chars / 32 bytes) to encrypt payload sidecars. Captured payloads are
+DLP-redacted before they reach disk unless `flight_recorder.redact` is set to
+`false`. Signed receipts (`signing_key_path`) and key-free capture
+(`--capture-output`) are independent evidence streams and can run together.
+
+### Windows file-permission enforcement
+
+The signing-key, license, secrets, CA-key, salt, and `--header-file` loaders
+enforce strict file permissions on Unix as a fail-closed gate (a key readable or
+writable by group/other is rejected before it is read). On Windows this check is
+**skipped**: Go derives the file mode from the read-only attribute and never
+reflects the NTFS ACL, so the reported bits (`0666`/`0444`) are not
+security-meaningful — enforcing the Unix mask would reject every key. Enforce
+access control on Windows with NTFS ACLs at deployment time; Pipelock does not
+inspect them.
+
+### Rotating the signing key
+
+Pipelock **rejects `flight_recorder.signing_key_path` changes at hot-reload time.** If you edit the config and SIGHUP (or rely on fsnotify), pipelock keeps the previously loaded key in memory, logs `WARNING: config reload: flight_recorder.signing_key_path changed — receipt chain cannot rotate at runtime, ignoring (restart required)`, and continues signing with the old key. This is intentional: rotating the key mid-run would break chain verification (consumers would see entries signed with two different public keys under one `chain_id`). To rotate safely:
+
+1. Stop pipelock so the old chain closes cleanly at its last checkpoint.
+2. Swap the key file referenced by `signing_key_path`.
+3. Start pipelock. On resume it detects the key change and opens a new chain
+   **segment** that is cryptographically linked to the old one (see below).
+
+If you keep the same `signing_key_path` and replace the key file at
+that path, a reload re-reads the file contents. Treat that as an
+advanced operation: the documented operator-safe path is still a
+restart so the old chain closes cleanly before the new key starts
+signing.
+
+The new segment is a linked verifiable unit, not an orphan: its first receipt
+carries a `KeyTransition` marker and links to the prior segment's tail hash, so
+`pipelock verify-receipt --chain DIR --key old.pub --key new.pub` verifies
+continuously across the rotation and lists each segment's signer for you to
+confirm. Earlier builds opened a fully *separate* chain here — and, worse, could
+brick emission entirely when the resume saw the rotation; both are fixed, and a
+rotated chain now stays offline-verifiable. See the
+[receipt verification guide](receipt-verification.md#chains-that-rotated-the-signing-key)
+for the verification flow.
+
+To let a verifier trust the successor from the original pinned key instead of
+pinning every segment key separately, prepare an old-key-signed rotation
+endorsement while Pipelock is stopped:
+
+```bash
+sudo pipelock signing pubkey \
+  --key-file /etc/pipelock/keys/flight-recorder-signing.key \
+  --out /etc/pipelock/keys/flight-recorder-signing.root.pub
+
+sudo pipelock signing key generate \
+  --purpose receipt-signing \
+  --out /etc/pipelock/keys/flight-recorder-signing.next.json
+
+sudo systemctl stop pipelock
+
+sudo pipelock signing receipt-rotation endorse \
+  --chain /var/lib/pipelock/evidence \
+  --session proxy \
+  --prior-key-file /etc/pipelock/keys/flight-recorder-signing.key \
+  --new-key-file /etc/pipelock/keys/flight-recorder-signing.next.json \
+  --root-key /etc/pipelock/keys/flight-recorder-signing.root.pub \
+  --out /etc/pipelock/keys/receipt-rotation-2026-07-30.json
+
+sudo install -m 0600 \
+  /etc/pipelock/keys/flight-recorder-signing.next.json \
+  /etc/pipelock/keys/flight-recorder-signing.key
+sudo systemctl start pipelock
+```
+
+Rollback is safe only before the restarted process emits with the successor:
+restore the retiring key and restart. Once the successor has emitted, do not
+reinstall an earlier signer. That creates an `A -> B -> A` cycle which cannot be
+authorized by the endorsement ceremony. If the activated successor must be
+replaced, generate a fresh key and rotate forward from `B -> C`, passing the
+earlier endorsement when preparing and verifying the new boundary.
+
+The endorsement command does not stop, restart, or replace keys. It refuses an
+open chain, an unpinned root, a retiring key that does not sign the closed tail,
+a successor that signed any earlier segment, and an existing output file. The
+successor must be the purpose-bound JSON file produced by
+`pipelock signing key generate --purpose receipt-signing`; a legacy purpose-less
+retiring key remains accepted so existing deployments can migrate. Keep the
+retiring key in offline custody until the retention window for its receipts
+expires.
+
+The command also acquires an exclusive lock on the evidence directory from
+before verification through endorsement publication. A running recorder holds
+the conflicting writer lock, so the command refuses to proceed even if the
+chain happens to end in a close receipt. Platforms without cross-process
+ceremony locking fail closed; this currently excludes Windows. The output
+directory must support hard links so create-only publication stays atomic and
+never exposes a partially written signed artifact.
+
+After the restarted process emits at least one receipt, verify from the original
+root:
+
+```bash
+pipelock verify-receipt \
+  --chain /var/lib/pipelock/evidence \
+  --session proxy \
+  --key /etc/pipelock/keys/flight-recorder-signing.root.pub \
+  --rotation-endorsement /etc/pipelock/keys/receipt-rotation-2026-07-30.json
+```
+
+For a later rotation, pin the same original root and pass each earlier
+`--rotation-endorsement` to both the endorsement command and the verifier. This
+proves the full delegation path instead of treating the latest key as a new
+root.
+
+## Evidence File Format
+
+Each file is named `evidence-<session_id>-<seq_start>.jsonl`. One JSON object per line. Example entry:
+
+```json
+{
+  "v": 1,
+  "seq": 42,
+  "ts": "2026-03-01T10:00:00.123456789Z",
+  "session_id": "abc123",
+  "type": "decision",
+  "transport": "forward",
+  "summary": "block: dlp (AWS access key pattern)",
+  "detail": {
+    "version": 1,
+    "type": "decision_record",
+    "session_id": "abc123",
+    "timestamp": "2026-03-01T10:00:00.123456789Z",
+    "verdict": "block",
+    "scanner_result": {
+      "layer": "dlp",
+      "pattern": "AWS access key pattern",
+      "match_text": "[REDACTED:AWS access key pattern]",
+      "confidence": "high"
+    },
+    "policy_rule": {
+      "source": "dlp",
+      "section": "dlp.patterns"
+    },
+    "request_context": {
+      "transport": "forward"
+    }
+  },
+  "prev_hash": "a1b2c3d4...",
+  "hash": "e5f6a7b8..."
+}
+```
+
+Fields:
+
+| Field | Description |
+|-------|-------------|
+| `v` | Schema version. This release writes v2 and reads v1, v2, and v3. Readers reject other versions. |
+| `seq` | Monotonically increasing sequence number within the session. |
+| `ts` | RFC 3339 timestamp with nanosecond precision. |
+| `session_id` | Proxy session identifier. |
+| `chain_kind` | v3 chain namespace kind. Omitted from v1 and v2 records. |
+| `writer_instance_id` | v3 per-process namespace claim. Omitted from v1 and v2 records. This field separates cooperating writers; it does not authenticate the writer. |
+| `type` | Entry type: `decision`, `checkpoint`. |
+| `transport` | Proxy transport: `fetch`, `forward`, `connect`, `websocket`, `mcp-stdio`, `mcp-http`. |
+| `summary` | One-line human-readable description. |
+| `detail` | Typed payload. For `decision` entries, a `DecisionRecord`. For `checkpoint`, a `CheckpointDetail`. |
+| `raw_ref` | Filename of the encrypted escrow sidecar, if present. |
+| `prev_hash` | SHA-256 hex hash of the previous entry. First entry has `"genesis"`. |
+| `hash` | SHA-256 hex hash of this entry over all fields except `hash`. |
+
+## Hash Chain
+
+Each schema version has a frozen field projection joined with null-byte separators. V1 uses:
+
+```text
+SHA256(v \0 seq \0 ts \0 session_id \0 trace_id \0 type \0 transport \0 summary \0 detail_json \0 raw_ref \0 prev_hash)
+```
+
+V2 inserts `event_kind` after `type`. V3 inserts `chain_kind` and
+`writer_instance_id` after `session_id`. The recorder continues writing v2
+during the reader-first compatibility window.
+
+The first entry in a writer chain has `prev_hash: "genesis"`. Each subsequent entry's `prev_hash` must equal the `hash` of the previous entry from that writer. Any gap, deletion, modification, or concurrent-writer fork breaks the chain. Current releases do not reject multiple processes sharing a recorder directory. The whole-corpus auditor installed by `pipelock init` detects the resulting damage; run `pipelock evidence doctor DIR` manually when investigating its alert. The doctor reports symptoms rather than causes; a concurrent-writer fork and a deliberate edit can produce the same structure.
+
+To verify a chain:
+
+```go
+entries, err := recorder.ReadEntries("evidence-abc123-0.jsonl")
+if err != nil {
+    // Treat ErrEvidenceReadLimitExceeded as incomplete evidence, not as a
+    // successful partial read.
+    return err
+}
+err := recorder.VerifyChain(entries)
+```
+
+Pass a public key to also verify checkpoint signatures:
+
+```go
+err := recorder.VerifyChain(entries, pubKey)
+```
+
+## Checkpoints
+
+A checkpoint entry is written every `checkpoint_interval` entries and at `Close()`. The checkpoint detail contains:
+
+```json
+{
+  "entry_count": 1000,
+  "first_seq": 0,
+  "last_seq": 999,
+  "signature": "ed25519-hex-signature"
+}
+```
+
+The signature covers the `prev_hash` of the checkpoint entry, which represents the cumulative chain state up to that point. Verifying the checkpoint signature confirms the chain was intact at that exact point, without re-hashing every entry.
+
+To verify checkpoints independently:
+
+```go
+entries, err := recorder.ReadEntries(path)
+if err != nil {
+    return err
+}
+err := recorder.VerifyCheckpoints(entries, pubKey)
+```
+
+Checkpoints without signatures are rejected if a public key is provided.
+
+## DLP Redaction
+
+When `redact: true`, each entry's `detail` field is scanned by the DLP engine before being written. If a DLP pattern matches, the entire `detail` is replaced with a redaction marker:
+
+```json
+{
+  "redacted": true,
+  "detected_patterns": ["[REDACTED:AWS access key pattern]"],
+  "original_size": 412
+}
+```
+
+Redaction is surgical at the entry level but wholesale at the detail level: if any pattern matches, the entire detail is replaced. The original_size field lets you confirm the content existed and measure how much was withheld.
+
+When `raw_escrow: true`, the unredacted detail is preserved in an encrypted sidecar before redaction runs. This gives you forensic replay capability without storing plaintext secrets in the main evidence file.
+
+## Raw Escrow
+
+Raw escrow writes an encrypted sidecar file alongside each evidence entry:
+
+```
+evidence-abc123-42-raw-4b6f5a8c9d0e1f23456789abcdef0123.raw.enc
+```
+
+The final 32-hex-character token is generated for each payload. It keeps
+sidecars distinct when multiple recorder processes share a session and sequence.
+
+The sidecar is encrypted with X25519 NaCl box using an ephemeral key pair. The format is:
+
+```
+[32 bytes: ephemeral public key] [24 bytes: nonce, prepended to ciphertext] [ciphertext]
+```
+
+To decrypt, you need the private key corresponding to `escrow_public_key`. Decryption is your responsibility; pipelock only writes the sidecar.
+
+To enable raw escrow:
+
+```yaml
+flight_recorder:
+  enabled: true
+  dir: /var/lib/pipelock/evidence
+  signing_key_path: /etc/pipelock/keys/flight-recorder-signing.key   # `pipelock init` writes this next to your config
+  redact: true
+  raw_escrow: true
+  escrow_public_key: "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"  # 32-byte X25519 key, 64 hex chars
+```
+
+Generate an X25519 key pair with standard Go tooling or a library of your choice. Store the private key offline (not on the pipelock host). The escrow public key is safe to include in config.
+
+Raw escrow is off by default. Enable it only if you need forensic replay capability and have a key management process for the escrow private key.
+
+## Session Querying
+
+Query evidence for a specific session:
+
+```go
+result, err := recorder.QuerySession(
+    "/var/lib/pipelock/evidence",
+    "abc123",
+    &recorder.QueryFilter{
+        Type:      "decision",
+        Transport: "forward",
+    },
+)
+```
+
+Filter fields:
+
+| Field | Description |
+|-------|-------------|
+| `SessionID` | Exact match. Empty = all sessions. |
+| `Type` | Entry type filter. |
+| `Transport` | Transport filter. |
+| `After` | Include entries after this time. |
+| `Before` | Include entries before this time. |
+| `MinSeq` | Include entries at or above this sequence number. |
+| `MaxSeq` | Include entries at or below this sequence number. |
+| `MaxEntriesRead` | Optional parsed-entry ceiling. Positive values apply across the session query. Zero uses the default per-file parsed-entry ceiling. If reached, `QueryResult.Truncated` is true. |
+| `MaxDirectoryEntries` | Optional evidence-directory entry ceiling. Zero uses the default ceiling. |
+| `MaxBytesRead` | Optional byte ceiling. Positive values apply across scanned evidence files. Zero uses the default per-file byte ceiling. If reached, `QueryResult.Truncated` is true. |
+
+Recorder reads are bounded. `ReadEntries` and `ReadEntriesFromReader` return an
+error if the default evidence size or entry-count ceiling is exceeded. Query
+APIs that can return read metadata set `QueryResult.Truncated` instead of
+silently returning a partial session as complete.
+
+List sessions with recorded evidence:
+
+```go
+sessions, err := recorder.ListSessions("/var/lib/pipelock/evidence")
+```
+
+Session listing is also bounded by default. Use `ListSessionsBoundedResult` when
+a UI can display an explicit truncation warning; strict helpers return an error
+when the directory entry cap is exceeded.
+
+## File Rotation and Retention
+
+Files rotate when a file reaches `max_entries_per_file` entries. The new file picks up where the old one left off, with the new file's first entry linking to the last entry in the previous file via `prev_hash`.
+
+Pipelock automatically expires raw-escrow sidecars older than `retention_days` days based on file modification time. Expiry runs once when the flight recorder starts and then periodically while the process is running. Expiry is best-effort: cleanup errors are surfaced as warnings, but they do not block proxy traffic.
+
+JSONL shards are preserved even when they are older than `retention_days`. They are the hash-chain spine: deleting an older shard while retaining a newer shard can preserve append continuity, but it breaks full-history offline verification and can make a published anchor impossible to replay from local evidence.
+
+To trigger cleanup immediately, run:
+
+```bash
+pipelock evidence expire --config pipelock.yaml
+```
+
+`pipelock doctor` warns when any session reaches 200 shards. Receipt emission is not affected by shard count. Resume scans the session's shards to find the newest one that actually holds entries, walking past empty shards left by a crash between file creation and the first write, and reads only that tail. The candidate scan is not capped and each file read is, so emission keeps working past the 256-entry ceiling that stops the read paths. The scan does hold one filename and sequence per shard in memory while it runs, so it is bounded by available resources rather than unconditionally, and bounding that is tracked follow-up work. The 256-shard ceiling applies to the evidence read paths (`evidence view`, `evidence serve`, query, and the dashboard), which refuse rather than show a truncated view, so those surfaces degrade on a directory past it.
+
+The warning matters anyway, because nothing prunes chain shards. Retention expires raw sidecars only; `.jsonl` shards are the hash-chain spine and removing one breaks full-history verification and can strand external anchors, so a long-running session grows without bound. Treat a warning as a signal to archive and verify, not as a countdown to an outage.
+
+Expired raw sidecars are gone. If you need long-term raw-payload recovery, either increase `retention_days` or copy evidence files to external storage before they expire. If you need to reduce JSONL storage, archive the chain first and verify the archive before pruning local shards.
+
+## Integration with Session Manifest and AgBOM
+
+The flight recorder is one component of a larger evidence pipeline. When pipelock assess runs, the evidence directory can be included as an annex in the assessment bundle. The recorded decisions provide a per-session audit trail that complements the assessment's aggregate scoring.
+
+For compliance purposes, the combination of:
+- Hash-chained JSONL evidence (tamper detection)
+- Ed25519 signed checkpoints (tamper-evidence with point-in-time proof)
+- Optional X25519 encrypted raw escrow (forensic replay)
+
+provides a defensible evidence record for incident investigation and regulatory audits.
+
+## Verifying Evidence Files Externally
+
+Compute the SHA-256 of an evidence file for external verification:
+
+```go
+hash, err := recorder.ComputeFileHash("/var/lib/pipelock/evidence/evidence-abc123-0.jsonl")
+```
+
+This hash can be committed to an external ledger or included in an assessment artifact manifest to prove the evidence file has not been modified.
+
+### Verify a live receipt chain end-to-end
+
+Signed action receipts are produced once `flight_recorder` is enabled with a
+`dir` and a `signing_key_path` (all three are needed — without a key the
+recorder can only hash-chain, not sign). Setting `require_receipts: true`
+additionally makes a successful signed emission a precondition for allow-path
+traffic, so a receipt failure fails closed instead of forwarding silently.
+
+The full loop uses only shipped commands and verifies offline against the public
+key — no server, no account:
+
+```bash
+# 1. Provision the recorder: pipelock init writes flight_recorder.enabled/dir/
+#    signing_key_path into the config, generates the Ed25519 signing key, and
+#    writes the shareable public-key sidecar at <signing_key_path>.pub.
+pipelock init
+
+# 2. Run one proxy writer. Mediated allow/block decisions are signed into that
+#    writer's hash-linked chain under flight_recorder.dir.
+pipelock run --config /etc/pipelock/pipelock.yaml
+
+# 3. Stop it cleanly (Ctrl-C / SIGTERM). Graceful shutdown seals that writer's
+#    chain with a transcript_root completeness anchor; a SIGKILL skips the seal
+#    and leaves the tail unsealed (verification then reports no root rather
+#    than VALID).
+
+# 4. Verify the retained writer chain offline with the public-key sidecar. Use
+#    the dir and .pub path that step 1 wrote into your config.
+pipelock verify-receipt --chain /var/lib/pipelock/evidence \
+  --key /etc/pipelock/keys/flight-recorder-signing.key.pub
+```
+
+`--chain` walks the selected session's evidence files in the directory (across
+rotations and restarts), checks `prev_hash` linkage and sequence continuity,
+verifies each signature against the pinned key, and confirms the sealed
+`transcript_root`. If the writer chain rotated its signing key, pass each public
+key with a repeated `--key`. Because JSONL shards are preserved, this remains a
+full local writer-chain check unless an operator has explicitly pruned or moved
+shards. Copy evidence to external storage before manual pruning if you need
+full-history offline verification later.

@@ -1,0 +1,280 @@
+name: Reusable AI PR Review
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: Pull request number to review.
+        required: true
+        type: string
+      review_mode:
+        description: default or deep.
+        required: true
+        type: string
+      reviewer_sha:
+        description: Full immutable Pipelock commit containing the review
+          action.
+        required: true
+        type: string
+    secrets:
+      review_token:
+        required: true
+      openai_api_key:
+        required: false
+
+permissions:
+  contents: read
+  issues: write
+  # Both are required. Posting a comment on a PULL REQUEST needs
+  # pull-requests: write even though the call goes to the issue-comments
+  # endpoint; issues: write alone covers issues only, and the comment-create
+  # call returns 403. Verified live: this was reduced to read and every
+  # /review in the repository failed until it was restored. Do not narrow it
+  # again without running a real /review against a pull request.
+  pull-requests: write
+
+jobs:
+  admit:
+    # Serialize only the fast admission step. It persists a running status
+    # comment before provider work begins, so a later command can reply with
+    # that comment's link rather than start another review.
+    concurrency:
+      group: pr-review-${{ github.repository }}-${{ inputs.pr_number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      claimed: ${{ steps.claim.outputs.claimed }}
+      base_sha: ${{ steps.claim.outputs.base_sha }}
+      head_sha: ${{ steps.claim.outputs.head_sha }}
+      status_comment_id: ${{ steps.claim.outputs.status_comment_id }}
+      correlation: ${{ steps.claim.outputs.correlation }}
+    steps:
+      # reviewer_sha is a free-form workflow input used directly as a checkout
+      # ref. A branch or tag name would execute action code from a mutable ref,
+      # so reject anything that is not a full commit SHA before any fetch.
+      - name: Require an immutable reviewer commit
+        env:
+          REVIEWER_SHA: ${{ inputs.reviewer_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${REVIEWER_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "reviewer_sha must be a full 40-character commit SHA" >&2
+            exit 1
+          fi
+
+      # A called workflow's normal checkout is the caller repository. Fetch
+      # Pipelock by the caller-provided full SHA so the composite action and
+      # runner cannot silently come from a caller's stale local copy.
+      - name: Check out immutable Pipelock review source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: luckyPipewrench/pipelock
+          ref: ${{ inputs.reviewer_sha }}
+          path: trusted-pr-review
+          persist-credentials: false
+
+      - name: Claim review status
+        id: claim
+        uses: ./trusted-pr-review/.github/actions/pr-review
+        with:
+          github-token: ${{ secrets.review_token }}
+          repo: ${{ github.repository }}
+          pr-number: ${{ inputs.pr_number }}
+          review-mode: ${{ inputs.review_mode }}
+          reviewer-sha: ${{ inputs.reviewer_sha }}
+          model-fast: ${{ vars.PR_REVIEW_MODEL_FAST }}
+          model-deep: ${{ vars.PR_REVIEW_MODEL_DEEP }}
+          operation: claim
+
+
+  review:
+    needs: admit
+    if: needs.admit.outputs.claimed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      state: ${{ steps.openai.outputs.state || steps.nocreds.outputs.state }}
+      complete: ${{ steps.openai.outputs.complete || steps.nocreds.outputs.complete }}
+    env:
+      HAS_OPENAI: ${{ secrets.openai_api_key != '' && 'true' || 'false' }}
+    steps:
+      - name: Check out immutable Pipelock review source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: luckyPipewrench/pipelock
+          ref: ${{ inputs.reviewer_sha }}
+          path: trusted-pr-review
+          persist-credentials: false
+
+      - name: Check out immutable reviewed repository head
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ needs.admit.outputs.head_sha }}
+          path: reviewed-repository
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve immutable merge base
+        id: merge-base
+        env:
+          GH_TOKEN: ${{ secrets.review_token }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ needs.admit.outputs.base_sha }}
+          HEAD_SHA: ${{ needs.admit.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          merge_base="$(gh api "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" --jq '.merge_base_commit.sha')"
+          if [[ ! "${merge_base}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "compare response did not contain an immutable merge base" >&2
+            exit 1
+          fi
+          echo "sha=${merge_base}" >> "${GITHUB_OUTPUT}"
+
+      # A second depth-one checkout gives Git the authoritative merge-base
+      # snapshot without downloading every branch, tag, and historical object.
+      - name: Check out immutable reviewed repository merge base
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ steps.merge-base.outputs.sha }}
+          path: reviewed-merge-base
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Import immutable merge base into reviewed checkout
+        env:
+          MERGE_BASE_SHA: ${{ steps.merge-base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          timeout 90s git -C reviewed-repository fetch --no-tags --depth=1 "${GITHUB_WORKSPACE}/reviewed-merge-base" "${MERGE_BASE_SHA}"
+          git -C reviewed-repository cat-file -e "${MERGE_BASE_SHA}^{commit}"
+
+      # The runner receives one provider credential, never both. Named secret
+      # mappings are required because personal-account repositories cannot use
+      # secrets: inherit with a reusable workflow.
+      - name: Run review through OpenAI
+        id: openai
+        if: env.HAS_OPENAI == 'true'
+        uses: ./trusted-pr-review/.github/actions/pr-review
+        with:
+          github-token: ${{ secrets.review_token }}
+          repo: ${{ github.repository }}
+          pr-number: ${{ inputs.pr_number }}
+          review-mode: ${{ inputs.review_mode }}
+          reviewer-sha: ${{ inputs.reviewer_sha }}
+          operation: review
+          base-sha: ${{ needs.admit.outputs.base_sha }}
+          head-sha: ${{ needs.admit.outputs.head_sha }}
+          status-comment-id: ${{ needs.admit.outputs.status_comment_id }}
+          openai-api-key: ${{ secrets.openai_api_key }}
+          model-fast: ${{ vars.PR_REVIEW_MODEL_FAST }}
+          model-deep: ${{ vars.PR_REVIEW_MODEL_DEEP }}
+          reviewed-repository-path: ${{ github.workspace }}/reviewed-repository
+          reviewed-merge-base-sha: ${{ steps.merge-base.outputs.sha }}
+
+      - name: Report missing provider credential
+        id: nocreds
+        if: env.HAS_OPENAI != 'true'
+        uses: ./trusted-pr-review/.github/actions/pr-review
+        with:
+          github-token: ${{ secrets.review_token }}
+          repo: ${{ github.repository }}
+          pr-number: ${{ inputs.pr_number }}
+          review-mode: ${{ inputs.review_mode }}
+          reviewer-sha: ${{ inputs.reviewer_sha }}
+          operation: review
+          base-sha: ${{ needs.admit.outputs.base_sha }}
+          head-sha: ${{ needs.admit.outputs.head_sha }}
+          status-comment-id: ${{ needs.admit.outputs.status_comment_id }}
+          model-fast: ${{ vars.PR_REVIEW_MODEL_FAST }}
+          model-deep: ${{ vars.PR_REVIEW_MODEL_DEEP }}
+
+
+  # Separate from the review job on purpose. Inside it, this was skipped in the
+  # one case it most needs to cover: admission claims the status comment and the
+  # review job never starts, leaving the comment reading running until its stale
+  # timeout blocks later reviews.
+  finalize:
+    needs: [admit, review]
+    if: always() && needs.admit.outputs.claimed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # The job timeout, a cancellation, or a failed checkout all end this job
+      # before any step above finalizes the status comment. Left running, the
+      # admission check treats it as an active review and refuses later reviews
+      # on the same head. This deliberately uses the preinstalled CLI instead of
+      # the checked-out action: a failed checkout is one of the cases it has to
+      # survive, so it cannot depend on that checkout existing. It edits only
+      # the comment this run claimed, and only while that comment still reads
+      # running, so a completed review is never overwritten.
+      - name: Finalize an abandoned review
+        env:
+          GH_TOKEN: ${{ secrets.review_token }}
+          REPO: ${{ github.repository }}
+          COMMENT_ID: ${{ needs.admit.outputs.status_comment_id }}
+          BASE_SHA: ${{ needs.admit.outputs.base_sha }}
+          HEAD_SHA: ${{ needs.admit.outputs.head_sha }}
+          IDENTITY: ${{ needs.admit.outputs.correlation }}
+          REVIEW_MODE: ${{ inputs.review_mode }}
+        run: |
+          set -euo pipefail
+          if [ -z "${COMMENT_ID}" ] || [ -z "${IDENTITY}" ]; then
+            echo "pr-review phase=finalize status=no-claim"
+            exit 0
+          fi
+          body="$(gh api "repos/${REPO}/issues/comments/${COMMENT_ID}" --jq '.body')"
+          # Both conditions matter. The state check leaves a completed review
+          # alone, and the identity check makes this edit only ever land on the
+          # comment this run claimed, never on a newer review's.
+          case "${body}" in
+            *"<!-- pr-review-status:v1 state=running identity=${IDENTITY} -->"*) ;;
+            *) echo "pr-review phase=finalize status=not-ours-or-already-final"; exit 0 ;;
+          esac
+          profile=""
+          while IFS= read -r line; do
+            case "${line}" in
+              '**Review profile:** '*) profile="${line}"; break ;;
+            esac
+          done <<< "${body}"
+          case "${REVIEW_MODE}" in
+            default) profile_pattern='^\*\*Review profile:\*\* `default` with `[A-Za-z0-9._:/-]+` \(`low` reasoning\); candidate judge `[A-Za-z0-9._:/-]+` \(`high` reasoning\)\.$' ;;
+            deep) profile_pattern='^\*\*Review profile:\*\* `deep` with `[A-Za-z0-9._:/-]+` \(`xhigh` reasoning\)\.$' ;;
+            *) profile_pattern='a^' ;;
+          esac
+          if [[ ! "${profile}" =~ ${profile_pattern} ]]; then
+            profile="**Review profile:** \`${REVIEW_MODE}\`; the review job did not publish its effective model."
+          fi
+          printf '## AI PR Review\n\n**Verdict:** `failed`\n%s\n**Findings:** unavailable because the review job did not publish a final result.\n\n<details>\n<summary>Review details: binding and identity</summary>\n\n**Binding:** base `%s` head `%s`\n**Review identity:** `%s`\n\n</details>\n\n<!-- pr-review-status:v1 state=failed identity=%s mode=%s findings= reviewed_head=%s scope=full coverage_base=%s -->\n' \
+            "${profile}" "${BASE_SHA}" "${HEAD_SHA}" "${IDENTITY}" "${IDENTITY}" "${REVIEW_MODE}" "${HEAD_SHA}" "${BASE_SHA}" > /tmp/pr-review-finalize.md
+          gh api --method PATCH "repos/${REPO}/issues/comments/${COMMENT_ID}" -F body=@/tmp/pr-review-finalize.md >/dev/null
+          echo "pr-review phase=finalize status=closed"
+
+  completeness:
+    needs: [admit, review]
+    if: always() && needs.admit.outputs.claimed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require a review that covered the whole diff
+        env:
+          STATE: ${{ needs.review.outputs.state }}
+          COMPLETE: ${{ needs.review.outputs.complete }}
+          REVIEW_RESULT: ${{ needs.review.result }}
+        run: |
+          set -euo pipefail
+          if [ "${COMPLETE}" = "true" ]; then
+            echo "pr-review coverage: complete (${STATE})"
+            exit 0
+          fi
+          if [ "${STATE}" = "clean" ] || [ "${STATE}" = "findings" ]; then
+            echo "pr-review coverage: ${STATE}, but the reviewed range does not reach the current base" >&2
+            echo "A review chain covers the whole pull request only while the base it started from is still the base." >&2
+            echo "Re-run the review to cover the range whole." >&2
+            exit 1
+          fi
+          echo "pr-review coverage: NOT complete (state=${STATE:-none}, review job ${REVIEW_RESULT})" >&2
+          echo "The review comment carries the verdict and the reasons it is incomplete." >&2
+          exit 1

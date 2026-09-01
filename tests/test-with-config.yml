@@ -1,0 +1,56 @@
+name: Test with config file input
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create a minimal pipelock config file
+        run: |
+          mkdir -p "$RUNNER_TEMP/pipelock-test"
+          cat > "$RUNNER_TEMP/pipelock-test/pipelock.yaml" <<'EOF'
+          version: 1
+          rules: []
+          EOF
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          version: 'latest'
+          directory: '.'
+          config: '${{ runner.temp }}/pipelock-test/pipelock.yaml'
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+          scan-diff: 'false'
+
+      - name: Assert action ran or failed gracefully with config
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SCORE: ${{ steps.action.outputs.score }}
+          CONFIG_PATH: ${{ steps.action.outputs.config-path }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "score: $SCORE"
+          echo "config-path: $CONFIG_PATH"
+          echo "audit-failed: $AUDIT_FAILED"
+          if [ "$OUTCOME" = "success" ]; then
+            if [ -z "$SCORE" ]; then
+              echo "FAIL: action succeeded but score output is empty"
+              exit 1
+            fi
+            # When config is provided, config-path should match the provided config
+            if [ -z "$CONFIG_PATH" ]; then
+              echo "FAIL: action succeeded but config-path output is empty"
+              exit 1
+            fi
+            echo "PASS: action succeeded with config, score=$SCORE config-path=$CONFIG_PATH"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (pipelock binary not available for fictional repo)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi

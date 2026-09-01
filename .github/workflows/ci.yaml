@@ -1,0 +1,1073 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags-ignore: ['v*']
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # Pipelock scans the PR diff before anything else runs. If the scan
+  # finds credential leaks, injection patterns, or security misconfigs,
+  # all downstream jobs are skipped — no compromised code executes.
+  #
+  # The scanner is BUILT FROM THE DEFAULT BRANCH rather than downloaded as a
+  # release. A released binary is frozen at the last tag, so a scanner fix on
+  # main did not reach this gate until the next release shipped. That was not
+  # theoretical: the whole-file-deletion hunk fix in #1145 sat on main while the
+  # released binary rejected every deletion-bearing pull request with
+  # "unverifiable input: content outside unified diff hunks" and surfaced it as
+  # "Secrets detected in PR diff" with no secret present.
+  #
+  # Building from origin/main rather than from the pull request head also means
+  # a pull request cannot supply the scanner that inspects it.
+  security-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26'
+          cache: false
+
+      - name: Build scanner from origin/main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --quiet origin main
+          main_sha=$(git rev-parse FETCH_HEAD)
+          echo "building scanner from origin/main ${main_sha}"
+          build_tree="${RUNNER_TEMP}/trusted-main"
+          git worktree add --detach "${build_tree}" "${main_sha}"
+          ( cd "${build_tree}" && go build -o "${RUNNER_TEMP}/pipelock" ./cmd/pipelock )
+          "${RUNNER_TEMP}/pipelock" --version
+
+      - name: Verify diff generation
+        # Run the generator's tests from the TRUSTED worktree, not the pull
+        # request checkout. A pull request that supplied its own copy of these
+        # scripts could emit an empty diff and pass a scan that read nothing.
+        run: bash "${RUNNER_TEMP}/trusted-main/scripts/test-generate-trusted-diff.sh" "${RUNNER_TEMP}/pipelock"
+
+      - name: Scan the diff
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          zero_sha=0000000000000000000000000000000000000000
+          if [[ -z "${BASE_SHA}" || -z "${HEAD_SHA}" || "${BASE_SHA}" == "${zero_sha}" || "${HEAD_SHA}" == "${zero_sha}" ]]; then
+            echo "refusing to scan an empty or all-zero diff endpoint" >&2
+            exit 1
+          fi
+          git rev-parse --verify --quiet "${BASE_SHA}^{commit}" >/dev/null || {
+            echo "refusing to scan: base is not an available commit: ${BASE_SHA}" >&2
+            exit 1
+          }
+          git rev-parse --verify --quiet "${HEAD_SHA}^{commit}" >/dev/null || {
+            echo "refusing to scan: head is not an available commit: ${HEAD_SHA}" >&2
+            exit 1
+          }
+          merge_base=$(git merge-base "${BASE_SHA}" "${HEAD_SHA}")
+          diff_file="${RUNNER_TEMP}/pr.diff"
+          # Added-line scope for normal text, full new-side blob only where
+          # attributes or Git's binary heuristic hide the patch.
+          bash "${RUNNER_TEMP}/trusted-main/scripts/generate-trusted-diff.sh" \
+            "${merge_base}" "${HEAD_SHA}" "${diff_file}"
+
+          "${RUNNER_TEMP}/pipelock" git scan-diff \
+            --exclude internal/scanner/scanner_test.go \
+            --exclude internal/scanner/scan_env_test.go \
+            --exclude internal/scanner/text_dlp_test.go \
+            --exclude internal/scanner/validate_test.go \
+            --exclude internal/proxy/intercept_test.go \
+            --exclude internal/proxy/session_api.go \
+            --exclude internal/cli/support/bundle_test.go \
+            --exclude 'enterprise/licenseservice/*_test.go' \
+            --exclude test/secureiqlab/ \
+            --exclude README.md \
+            --exclude assets/demo.cast \
+            --exclude .github/actions/pr-review/pr_review.py \
+            --exclude docs/attacks-blocked.md \
+            --exclude docs/bypass-resistance.md \
+            --exclude docs/configuration.md \
+            --exclude docs/scan-api.md \
+            --exclude docs/guides/deployment-recipes.md \
+            --exclude docs/guides/tls-interception.md \
+            --exclude docs/guides/zed.md \
+            --exclude examples/demo-readme.sh \
+            --exclude sdk/conformance/testdata/aarp-corpus/ \
+            < "${diff_file}"
+
+  # Keep each Go minor in a separate producer. A matrix-level aggregate cannot
+  # distinguish which minor failed: its single result is red for either one.
+  test-oss-go125:
+    needs: [security-scan]
+    runs-on: ubuntu-latest
+    name: test-oss (1.25, ${{ matrix.shard }})
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ['proxy', 'scanner', 'mcp', 'rest-0', 'rest-1', 'rest-2']
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.25'
+
+      - name: Verify dependencies
+        run: bash scripts/ci-retry.sh go mod verify
+
+      - name: Download dependencies
+        run: bash scripts/ci-retry.sh go mod download
+
+      - name: Run tests (OSS)
+        env:
+          TEST_LABEL: OSS Go 1.25 ${{ matrix.shard }}
+          TEST_SHARD: ${{ matrix.shard }}
+        run: |
+          set -o pipefail
+          set +e
+          packages="$(python3 scripts/ci_test_packages.py --shard "$TEST_SHARD")" || exit $?
+          package_parallelism=2
+          if [ "$TEST_SHARD" = "proxy" ]; then
+            # The proxy shard has two race-instrumented packages. Running them
+            # sequentially lowers peak memory without serializing t.Parallel
+            # tests inside either package.
+            package_parallelism=1
+          fi
+          # Public runners are 4 vCPU, and -race multiplies scheduler pressure.
+          # Keep package and intra-package test fan-out below CPU count so
+          # deadline/timer tests are not starved by the shard matrix.
+          bash scripts/ci-test-with-retry.sh --packages "$packages" -- \
+            go test -race -p="$package_parallelism" -parallel=2 -timeout=15m -count=1 -json \
+            | python3 scripts/stream_go_test_json.py --label "$TEST_LABEL" --json-out /tmp/go-test-oss.json
+          test_status=$?
+          python3 scripts/summarize_go_test_json.py --label "$TEST_LABEL" < /tmp/go-test-oss.json
+          summary_status=$?
+          if [ "$summary_status" -ne 0 ]; then
+            exit "$summary_status"
+          fi
+          exit "$test_status"
+
+  test-oss-go126:
+    needs: [security-scan]
+    runs-on: ubuntu-latest
+    name: test-oss (1.26, ${{ matrix.shard }})
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ['proxy', 'scanner', 'mcp', 'rest-0', 'rest-1', 'rest-2']
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26'
+
+      - name: Verify dependencies
+        run: bash scripts/ci-retry.sh go mod verify
+
+      - name: Download dependencies
+        run: bash scripts/ci-retry.sh go mod download
+
+      - name: Run tests (OSS)
+        env:
+          TEST_LABEL: OSS Go 1.26 ${{ matrix.shard }}
+          TEST_SHARD: ${{ matrix.shard }}
+        run: |
+          set -o pipefail
+          set +e
+          packages="$(python3 scripts/ci_test_packages.py --shard "$TEST_SHARD")" || exit $?
+          package_parallelism=2
+          if [ "$TEST_SHARD" = "proxy" ]; then
+            package_parallelism=1
+          fi
+          bash scripts/ci-test-with-retry.sh --packages "$packages" -- \
+            go test -race -p="$package_parallelism" -parallel=2 -timeout=15m -count=1 -json \
+            | python3 scripts/stream_go_test_json.py --label "$TEST_LABEL" --json-out /tmp/go-test-oss.json
+          test_status=$?
+          python3 scripts/summarize_go_test_json.py --label "$TEST_LABEL" < /tmp/go-test-oss.json
+          summary_status=$?
+          if [ "$summary_status" -ne 0 ]; then
+            exit "$summary_status"
+          fi
+          exit "$test_status"
+
+  test-enterprise-go125:
+    needs: [security-scan]
+    runs-on: ubuntu-latest
+    name: test-enterprise (1.25, ${{ matrix.shard }})
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ['proxy', 'scanner', 'mcp', 'rest-0', 'rest-1', 'rest-2']
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.25'
+
+      - name: Verify dependencies
+        run: bash scripts/ci-retry.sh go mod verify
+
+      - name: Download dependencies
+        run: bash scripts/ci-retry.sh go mod download
+
+      - name: Run tests (enterprise with coverage)
+        env:
+          TEST_LABEL: enterprise Go 1.25 ${{ matrix.shard }}
+          TEST_SHARD: ${{ matrix.shard }}
+        run: |
+          set -o pipefail
+          set +e
+          packages="$(python3 scripts/ci_test_packages.py --tags enterprise --shard "$TEST_SHARD")" || exit $?
+          package_parallelism=2
+          if [ "$TEST_SHARD" = "proxy" ]; then
+            # The proxy shard has two race-instrumented packages. Running them
+            # sequentially lowers peak memory without serializing t.Parallel
+            # tests inside either package.
+            package_parallelism=1
+          fi
+          # Public runners are 4 vCPU, and -race multiplies scheduler pressure.
+          # Keep package and intra-package test fan-out below CPU count so
+          # deadline/timer tests are not starved by the shard matrix.
+          bash scripts/ci-test-with-retry.sh --packages "$packages" -- \
+            go test -tags enterprise -race -p="$package_parallelism" -parallel=2 -timeout=15m -count=1 -coverprofile="coverage-${TEST_SHARD}.out" -json \
+            | python3 scripts/stream_go_test_json.py --label "$TEST_LABEL" --json-out /tmp/go-test-enterprise.json
+          test_status=$?
+          python3 scripts/summarize_go_test_json.py --label "$TEST_LABEL" < /tmp/go-test-enterprise.json
+          summary_status=$?
+          if [ "$summary_status" -ne 0 ]; then
+            exit "$summary_status"
+          fi
+          exit "$test_status"
+
+      - name: Upload coverage
+        # Coverage upload is best-effort telemetry: the Codecov uploader's own
+        # CLI-integrity GPG check intermittently fails to fetch Codecov's public
+        # key ("no valid OpenPGP data found"), which exits non-zero regardless of
+        # fail_ci_if_error. Coverage is gated by the separate codecov/* status
+        # checks, so a transient uploader hiccup must never red a green test job.
+        continue-on-error: true
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        with:
+          files: ./coverage-${{ matrix.shard }}.out
+          fail_ci_if_error: false
+
+  test-enterprise-go126:
+    needs: [security-scan]
+    runs-on: ubuntu-latest
+    name: test-enterprise (1.26, ${{ matrix.shard }})
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ['proxy', 'scanner', 'mcp', 'rest-0', 'rest-1', 'rest-2']
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26'
+
+      - name: Verify dependencies
+        run: bash scripts/ci-retry.sh go mod verify
+
+      - name: Download dependencies
+        run: bash scripts/ci-retry.sh go mod download
+
+      - name: Run tests (enterprise)
+        env:
+          TEST_LABEL: enterprise Go 1.26 ${{ matrix.shard }}
+          TEST_SHARD: ${{ matrix.shard }}
+        run: |
+          set -o pipefail
+          set +e
+          packages="$(python3 scripts/ci_test_packages.py --tags enterprise --shard "$TEST_SHARD")" || exit $?
+          package_parallelism=2
+          if [ "$TEST_SHARD" = "proxy" ]; then
+            package_parallelism=1
+          fi
+          bash scripts/ci-test-with-retry.sh --packages "$packages" -- \
+            go test -tags enterprise -race -p="$package_parallelism" -parallel=2 -timeout=15m -count=1 -json \
+            | python3 scripts/stream_go_test_json.py --label "$TEST_LABEL" --json-out /tmp/go-test-enterprise.json
+          test_status=$?
+          python3 scripts/summarize_go_test_json.py --label "$TEST_LABEL" < /tmp/go-test-enterprise.json
+          summary_status=$?
+          if [ "$summary_status" -ne 0 ]; then
+            exit "$summary_status"
+          fi
+          exit "$test_status"
+
+  test-subprocess-coverage:
+    needs: [security-scan]
+    runs-on: ubuntu-latest
+    # Includes subprocess coverage plus four race-enabled Guard conformance
+    # invocations, each with its own five-minute timeout.
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.25'
+
+      - name: Verify dependencies
+        run: bash scripts/ci-retry.sh go mod verify
+
+      - name: Download dependencies
+        run: bash scripts/ci-retry.sh go mod download
+
+      - name: Collect sandbox subprocess coverage
+        run: bash scripts/coverage-with-subprocess.sh coverage-subprocess.out
+
+      - name: Run Guard hostile-input conformance gate
+        run: bash scripts/check-guard-conformance.sh
+
+      - name: Upload subprocess coverage
+        # Best-effort telemetry; see the Upload coverage step above. A Codecov
+        # uploader-integrity hiccup must not red this job when coverage collection
+        # itself succeeded.
+        continue-on-error: true
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        with:
+          files: ./coverage-subprocess.out
+          fail_ci_if_error: false
+
+  test-replay-go125:
+    needs: [security-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.25'
+      - name: Replay harness (deterministic regression)
+        run: make test-replay-harness
+
+  test-replay-go126:
+    needs: [security-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26'
+      - name: Replay harness (deterministic regression)
+        run: make test-replay-harness
+
+  test-go125:
+    needs: [security-scan, test-oss-go125, test-enterprise-go125, test-subprocess-coverage, test-replay-go125]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    name: test (1.25)
+    timeout-minutes: 5
+    steps:
+      - name: Required check compatibility gate
+        env:
+          SECURITY_SCAN_RESULT: ${{ needs.security-scan.result }}
+          TEST_OSS_GO125_RESULT: ${{ needs.test-oss-go125.result }}
+          TEST_ENTERPRISE_GO125_RESULT: ${{ needs.test-enterprise-go125.result }}
+          TEST_SUBPROCESS_COVERAGE_RESULT: ${{ needs.test-subprocess-coverage.result }}
+          TEST_REPLAY_GO125_RESULT: ${{ needs.test-replay-go125.result }}
+        run: |
+          echo "security-scan result: $SECURITY_SCAN_RESULT"
+          echo "test-oss-go125 result: $TEST_OSS_GO125_RESULT"
+          echo "test-enterprise-go125 result: $TEST_ENTERPRISE_GO125_RESULT"
+          echo "test-subprocess-coverage result: $TEST_SUBPROCESS_COVERAGE_RESULT"
+          echo "test-replay-go125 result: $TEST_REPLAY_GO125_RESULT"
+          test "$SECURITY_SCAN_RESULT" = "success"
+          test "$TEST_OSS_GO125_RESULT" = "success"
+          test "$TEST_ENTERPRISE_GO125_RESULT" = "success"
+          test "$TEST_SUBPROCESS_COVERAGE_RESULT" = "success"
+          test "$TEST_REPLAY_GO125_RESULT" = "success"
+
+  test-go126:
+    needs: [security-scan, test-oss-go126, test-enterprise-go126, test-replay-go126]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    name: test (1.26)
+    timeout-minutes: 5
+    steps:
+      - name: Required check compatibility gate
+        env:
+          SECURITY_SCAN_RESULT: ${{ needs.security-scan.result }}
+          TEST_OSS_GO126_RESULT: ${{ needs.test-oss-go126.result }}
+          TEST_ENTERPRISE_GO126_RESULT: ${{ needs.test-enterprise-go126.result }}
+          TEST_REPLAY_GO126_RESULT: ${{ needs.test-replay-go126.result }}
+        run: |
+          echo "security-scan result: $SECURITY_SCAN_RESULT"
+          echo "test-oss-go126 result: $TEST_OSS_GO126_RESULT"
+          echo "test-enterprise-go126 result: $TEST_ENTERPRISE_GO126_RESULT"
+          echo "test-replay-go126 result: $TEST_REPLAY_GO126_RESULT"
+          test "$SECURITY_SCAN_RESULT" = "success"
+          test "$TEST_OSS_GO126_RESULT" = "success"
+          test "$TEST_ENTERPRISE_GO126_RESULT" = "success"
+          test "$TEST_REPLAY_GO126_RESULT" = "success"
+
+  test-macos:
+    needs: [security-scan]
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26'
+
+      - name: Verify native target is darwin/arm64
+        run: |
+          set -euo pipefail
+          echo "runner architecture: $RUNNER_ARCH"
+          go_target="$(go env GOOS)/$(go env GOARCH)"
+          echo "Go target: $go_target"
+          test "$RUNNER_ARCH" = "ARM64"
+          test "$go_target" = "darwin/arm64"
+
+      - name: Run sandbox tests (macOS seatbelt)
+        run: go test -race -count=1 ./internal/sandbox/...
+
+      - name: Verify cross-platform build
+        run: go build ./...
+
+  test-macos-intel:
+    needs: [security-scan]
+    runs-on: macos-15-intel
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26'
+
+      - name: Verify native target is darwin/amd64
+        run: |
+          set -euo pipefail
+          echo "runner architecture: $RUNNER_ARCH"
+          go_target="$(go env GOOS)/$(go env GOARCH)"
+          echo "Go target: $go_target"
+          test "$RUNNER_ARCH" = "X64"
+          test "$go_target" = "darwin/amd64"
+
+      - name: Run sandbox tests (macOS seatbelt)
+        run: go test -race -count=1 ./internal/sandbox/...
+
+      - name: Verify cross-platform build
+        run: go build ./...
+
+  # Native Windows smoke lane. Pipelock had zero Windows CI, which let the
+  # recorder signing-key perm gate (#695) and the key-free MCP capture path
+  # (#696) regress on real Windows undetected. This is a TARGETED lane, not full
+  # parity: the full suite asserts Unix file modes that Go can't report on
+  # Windows (it derives FileMode from the read-only attribute, never the ACL),
+  # so internal/config still has ~27 permission-model failures here. So we run
+  # the OS-split predicate plus the load/capture paths that #695/#696 touch,
+  # scoped with -run. config's perm behavior is proven transitively by the
+  # secperm Windows test (all masks skip when secperm.Enforced is false).
+  # internal/config's test package previously could not COMPILE on Windows
+  # (syscall.Mkfifo), which `go build ./...` cannot catch because it never
+  # builds _test.go files. The scoped run below compiles that package so the
+  # break cannot return silently.
+  test-windows:
+    needs: [security-scan]
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26'
+
+      - name: Verify native target is windows/amd64
+        shell: pwsh
+        run: |
+          Write-Output "runner architecture: $env:RUNNER_ARCH"
+          $goTarget = "$(go env GOOS)/$(go env GOARCH)"
+          Write-Output "Go target: $goTarget"
+          if ($env:RUNNER_ARCH -ne "X64") { throw "expected X64 runner, got $env:RUNNER_ARCH" }
+          if ($goTarget -ne "windows/amd64") { throw "expected windows/amd64 Go target, got $goTarget" }
+
+      - name: Verify Windows build (OSS + enterprise)
+        run: |
+          go build ./...
+          go build -tags enterprise ./...
+
+      # -race is intentionally omitted: it needs a CGO C compiler on the runner,
+      # a common source of unrelated red CI on Windows. The Linux matrix already
+      # runs the race detector across all code; this lane proves Windows
+      # functional behavior, not data races.
+      - name: secperm OS split (mode checks skipped on Windows)
+        run: go test -count=1 ./internal/secperm/...
+
+      - name: Signing key / salt / header-file load at any reported mode (#695)
+        run: go test -count=1 -run "TestWindows" ./internal/signing/... ./internal/contract/privacy/... ./internal/cli/runtime/... ./internal/recorder/...
+
+      - name: Key-free MCP capture writer smoke (#696)
+        run: go test -count=1 -run "TestBuildCaptureWriter|TestParseCaptureEscrowKey" ./internal/cli/runtime/...
+
+      - name: Baseline no-follow reads work on Windows
+        run: go test -count=1 -run "TestWindows" ./internal/proxy/baseline/...
+
+      # Compiling this package is the point: it guards the Mkfifo-class break.
+      - name: internal/config test package builds on Windows
+        run: go test -count=1 -run "TestWindows" ./internal/config/...
+
+  test-windows-arm64:
+    needs: [security-scan]
+    runs-on: windows-11-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26'
+
+      - name: Verify native target is windows/arm64
+        shell: pwsh
+        run: |
+          Write-Output "runner architecture: $env:RUNNER_ARCH"
+          $goTarget = "$(go env GOOS)/$(go env GOARCH)"
+          Write-Output "Go target: $goTarget"
+          if ($env:RUNNER_ARCH -ne "ARM64") { throw "expected ARM64 runner, got $env:RUNNER_ARCH" }
+          if ($goTarget -ne "windows/arm64") { throw "expected windows/arm64 Go target, got $goTarget" }
+
+      - name: Verify Windows build (OSS + enterprise)
+        run: |
+          go build ./...
+          go build -tags enterprise ./...
+
+      # Keep this paired with test-windows. These targeted packages avoid the
+      # Unix permission assertions that make a full Windows suite misleading.
+      - name: secperm OS split (mode checks skipped on Windows)
+        run: go test -count=1 ./internal/secperm/...
+
+      - name: Signing key / salt / header-file load at any reported mode (#695)
+        run: go test -count=1 -run "TestWindows" ./internal/signing/... ./internal/contract/privacy/... ./internal/cli/runtime/... ./internal/recorder/...
+
+      - name: Key-free MCP capture writer smoke (#696)
+        run: go test -count=1 -run "TestBuildCaptureWriter|TestParseCaptureEscrowKey" ./internal/cli/runtime/...
+
+      - name: Baseline no-follow reads work on Windows
+        run: go test -count=1 -run "TestWindows" ./internal/proxy/baseline/...
+
+      - name: internal/config test package builds on Windows
+        run: go test -count=1 -run "TestWindows" ./internal/config/...
+
+  # Native linux/arm64 lane. GoReleaser publishes a linux/arm64 binary
+  # (.goreleaser.yaml) and no job has ever executed a test on that architecture,
+  # so three of six published Go targets ran zero tests. arm64 is not a
+  # theoretical target here: it is Graviton, Ampere, Apple Silicon Linux VMs, and
+  # the single-board machines an evaluator is most likely to reach for.
+  #
+  # The architecture is load-bearing for containment, not incidental. seccomp is
+  # built only for linux && amd64 (internal/sandbox/seccomp_linux.go), so an
+  # arm64 binary composes against seccomp_other.go and reports that layer
+  # unavailable. In the CLI's default non-strict mode a missing layer reduces
+  # containment and only logs it, so the arm64 degradation path is exactly the
+  # behavior that most needs a test and had none. The seccomp tests themselves
+  # are tagged linux && amd64 and stay out of this lane by construction; what
+  # runs here is the shared sandbox code deciding what to do when a layer is
+  # absent.
+  #
+  # TARGETED, like the macOS and Windows lanes above, not full parity. The amd64
+  # matrix remains the exhaustive lane.
+  test-linux-arm64:
+    needs: [security-scan]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26'
+
+      - name: Verify native target is linux/arm64
+        run: |
+          set -euo pipefail
+          echo "runner architecture: $RUNNER_ARCH"
+          go_target="$(go env GOOS)/$(go env GOARCH)"
+          echo "Go target: $go_target"
+          test "$RUNNER_ARCH" = "ARM64"
+          test "$go_target" = "linux/arm64"
+
+      # A published target that has never been compiled natively can break in
+      # ways cross-compilation catches and ways it does not, and `go build` never
+      # builds _test.go files, so a test package that cannot compile on arm64
+      # would stay invisible to it.
+      - name: Verify arm64 build (OSS + enterprise)
+        run: |
+          go build ./...
+          go build -tags enterprise ./...
+
+      - name: Sandbox behavior without Pipelock's seccomp filter
+        run: go test -race -count=1 ./internal/sandbox/...
+
+      # Preflight and diagnose are what tell an operator which layers they are
+      # actually getting. On arm64 they must report seccomp as unavailable
+      # rather than claiming it.
+      # `go test -run NAME` exits 0 when the filter matches NOTHING, including
+      # when a build tag excludes the file entirely. Both guards below are tagged
+      # `linux && !amd64`, so a tag drift, a rename, or a package move would leave
+      # this lane green while proving nothing: the exact failure this job exists to
+      # catch, relocated into the check. Assert the named test actually ran.
+      - name: Preflight reports the real arm64 layer set
+        run: |
+          set -euo pipefail
+          go test -race -count=1 -v -run TestDetectAndPreflightReportSeccompUnavailableWithoutFilter \
+            ./internal/sandbox/... | tee /tmp/arm64-preflight.log
+          grep -q '^--- PASS: TestDetectAndPreflightReportSeccompUnavailableWithoutFilter' /tmp/arm64-preflight.log
+
+      - name: Diagnose reports the real arm64 layer set
+        run: |
+          set -euo pipefail
+          go test -race -count=1 -v -run TestDiagnoseReportsSeccompUnavailableWithoutFilter \
+            ./internal/cli/diag/... | tee /tmp/arm64-diagnose.log
+          grep -q '^--- PASS: TestDiagnoseReportsSeccompUnavailableWithoutFilter' /tmp/arm64-diagnose.log
+
+  # Exercise the browser target's concrete fail-closed filesystem fallbacks,
+  # then compile the same contracts for WASI and AIX so build-tag gaps cannot
+  # silently remove their implementations.
+  test-unsupported-filesystems:
+    needs: [security-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26'
+
+      - name: Run browser target fallback contracts
+        run: GOOS=js GOARCH=wasm go test -exec="$(go env GOROOT)/lib/wasm/go_js_wasm_exec" -count=1 -run "TestOpenRegularNonblockingFailsClosedOnUnsupportedPlatform|TestEvidenceFileOperationsFailClosedOnUnsupportedPlatform" ./internal/securefile/... ./internal/recorder/...
+
+      - name: Compile WASI fallback contracts
+        run: |
+          GOOS=wasip1 GOARCH=wasm go test -c -o /tmp/securefile-wasi.test ./internal/securefile
+          GOOS=wasip1 GOARCH=wasm go test -c -o /tmp/recorder-wasi.test ./internal/recorder
+          GOOS=wasip1 GOARCH=wasm go test -c -o /tmp/license-wasi.test ./internal/license
+
+      - name: Compile AIX fallback contracts
+        run: |
+          GOOS=aix GOARCH=ppc64 go test -c -o /tmp/recorder-aix.test ./internal/recorder
+          GOOS=aix GOARCH=ppc64 go test -c -o /tmp/license-aix.test ./internal/license
+
+  # The reviewer's own regression suite now runs on pull requests.
+  #
+  # The repositories that kept their own copy of the reviewer ran these as a
+  # step inside the review itself. That never gated anything: a review is
+  # triggered by a comment, so it only ever executes the copy already on the
+  # default branch, and by then the change is merged. Consolidating onto one
+  # shared workflow then dropped even that step. So the suite has been proving
+  # nothing in either arrangement, while every guard in it reported green.
+  #
+  # This job is what makes them load-bearing, because it runs on the pull
+  # request that changes them. It covers the reviewer, the review workflow's
+  # permissions and authorization gate, and the adoption stub that other
+  # repositories copy.
+  pr-review-tests:
+    needs: [security-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install pinned dependencies
+        run: |
+          pip install --require-hashes -r .github/actions/pr-review/requirements.txt
+          pip install --require-hashes -r .github/requirements-pr-review-test.txt
+
+      - name: Run reviewer tests
+        run: python -m unittest scripts.pr_review_test
+
+  lint:
+    needs: [security-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.25'
+
+      - name: golangci-lint (OSS)
+        uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9
+        with:
+          version: v2.12.2
+          skip-cache: true
+
+      - name: golangci-lint (enterprise)
+        run: golangci-lint run --build-tags enterprise ./...
+
+      - name: Python pin policy
+        run: bash scripts/check-python-pins.sh
+
+      # The release-tooling tests read the release workflow as parsed YAML rather
+      # than as text, so PyYAML is a real dependency of this job. It is installed
+      # hash-pinned rather than taken from whatever the runner image happens to
+      # ship, because an undeclared dependency that works today breaks silently
+      # when the image changes.
+      - name: Install pinned release-tooling test dependencies
+        run: pip install --require-hashes -r .github/requirements-pr-review-test.txt
+
+      # Release-tooling tests had no PR-time runner, so breaks stayed invisible
+      # until tag time. The pattern covers both test_*.py and *_test.py modules.
+      - name: Release tooling unit tests
+        run: python3 -m unittest discover -s scripts -p '*test*.py'
+
+      - name: Test stability policy
+        run: bash scripts/check-test-stability.sh
+
+      - name: Config consumption policy
+        run: bash scripts/check-config-consumption.sh
+
+      - name: Codecov upload count matches the shard matrix
+        run: bash scripts/check-codecov-upload-count.sh
+
+      - name: Config example startability policy
+        run: bash scripts/check-config-examples.sh
+
+      - name: Install documentation search dependency
+        run: bash scripts/ci-apt-install.sh ripgrep
+
+      - name: Documentation accuracy and local links
+        run: make docs-check
+
+      - name: Source file headers
+        run: make source-header-check
+
+      - name: Reproducible OSS build
+        run: make reproducible-build-check
+
+  # Test files are compiled by `go test`, never by `go build`, so a test file
+  # that references a symbol guarded to one architecture makes an entire test
+  # package uncompilable there while every build job stays green. That is not
+  # hypothetical: internal/sandbox's test package could not compile on
+  # linux/arm64 at all, because coverage_deep_test.go was tagged plain linux
+  # while the seccomp filter builder and BPF helpers it calls exist only under
+  # linux && amd64. A published target therefore had zero sandbox test coverage
+  # and nothing said so. The same shape hit internal/config on Windows via
+  # syscall.Mkfifo.
+  #
+  # `go vet` compiles test files, so cross-targeting it catches the class on this
+  # amd64 runner without needing hardware for every target. Keep the expensive
+  # cross-target pass separate from lint so neither job consumes the other's
+  # timeout budget.
+  test-cross-target:
+    needs: [security-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.25'
+
+      - name: Test code compiles for every published target
+        run: |
+          set -euo pipefail
+          for target in linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            printf '==> %s\n' "$target"
+            GOOS="${target%%/*}" GOARCH="${target##*/}" go vet ./...
+            GOOS="${target%%/*}" GOARCH="${target##*/}" go vet -tags enterprise ./...
+          done
+
+  helm:
+    needs: [security-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Helm
+        uses: Azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2 # v5.0.0
+        with:
+          version: v3.20.2
+
+      - name: Verify Helm chart
+        run: bash scripts/check-helm-chart.sh
+
+  govulncheck:
+    needs: [security-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          # Pin the exact patched release. govulncheck analyzes the active
+          # toolchain's stdlib (go env GOVERSION), so the setup-go version is the
+          # lever, not the go.mod directive. go1.26.6 fixes six stdlib advisories
+          # that go1.26.5 carries across crypto/tls, html/template, net/http and
+          # net/url (GO-2026-5026, GO-2026-5972, GO-2026-6089, GO-2026-6090,
+          # GO-2026-6091, GO-2026-6218), reached here through the proxy and MCP
+          # transport call paths. A float to '1.26' can lag on the
+          # actions/go-versions manifest, so the scan stays red until the
+          # manifest publishes the patched toolchain. An EXACT version makes
+          # setup-go fall back to a direct download from the official Go
+          # distribution, bypassing the manifest.
+          #
+          # THIS PIN GOES STALE BY DESIGN. Every Go patch release that fixes a
+          # reachable stdlib advisory turns this job red repo-wide until the pin
+          # moves, which is what happened on 2026-08-13. Bump it here and in the
+          # assertion below, together; they are asserted equal on purpose so a
+          # half-done bump fails loudly instead of scanning the wrong toolchain.
+          # Revert to '1.26' + check-latest for steady-state self-healing once
+          # the manifest reliably carries the newest patch.
+          go-version: '1.26.6'
+          check-latest: true
+
+      - name: Verify Go version
+        # Fail loud if setup-go silently resolved a different stdlib (e.g. a
+        # stale cached 1.26.3) instead of letting a wrong toolchain false-green.
+        run: |
+          got="$(go env GOVERSION)"
+          echo "GOVERSION=$got"
+          test "$got" = "go1.26.6"
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+
+      - name: Reject unsafe OpenPGP packages
+        run: |
+          set -euo pipefail
+          dependencies=$(mktemp)
+          trap 'rm -f "$dependencies"' EXIT
+          {
+            go list -deps ./...
+            go list -tags enterprise -deps ./...
+          } > "$dependencies"
+          if grep -Eq '^golang\.org/x/crypto/openpgp(/|$)' "$dependencies"; then
+            echo "unsafe OpenPGP package detected in dependency graph" >&2
+            exit 1
+          fi
+
+      - name: Run govulncheck
+        # Scan both build graphs. Enterprise-only packages can make a vulnerable
+        # dependency reachable even when the default build remains clean.
+        run: |
+          default_status=0
+          enterprise_status=0
+          govulncheck ./... || default_status=$?
+          govulncheck -tags enterprise ./... || enterprise_status=$?
+          if (( default_status != 0 || enterprise_status != 0 )); then
+            echo "govulncheck failed: default=$default_status enterprise=$enterprise_status" >&2
+            exit 1
+          fi
+
+  # Compile in parallel with tests and lint so a successful critical path does
+  # not pay the build cost after the slowest test shard has already finished.
+  build-binaries:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [security-scan]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.25'
+
+      - name: Build binary
+        run: |
+          VERSION=$(./scripts/git-version.sh)
+          go build -trimpath -ldflags "-s -w \
+            -X github.com/luckyPipewrench/pipelock/internal/cliutil.Version=$VERSION \
+            -X github.com/luckyPipewrench/pipelock/internal/proxy.Version=$VERSION" \
+            -o pipelock ./cmd/pipelock
+
+      - name: Verify binary runs
+        run: ./pipelock --version
+
+      - name: Build binary (enterprise)
+        run: |
+          VERSION=$(./scripts/git-version.sh)
+          go build -tags enterprise -trimpath -ldflags "-s -w \
+            -X github.com/luckyPipewrench/pipelock/internal/cliutil.Version=$VERSION \
+            -X github.com/luckyPipewrench/pipelock/internal/proxy.Version=$VERSION" \
+            -o pipelock-enterprise ./cmd/pipelock
+
+      - name: Verify enterprise binary runs
+        run: ./pipelock-enterprise --version
+
+      - name: Cross-build Windows binaries (enterprise)
+        run: |
+          GOOS=windows GOARCH=amd64 go build -tags enterprise -trimpath -o /tmp/pipelock-windows-amd64.exe ./cmd/pipelock
+          GOOS=windows GOARCH=arm64 go build -tags enterprise -trimpath -o /tmp/pipelock-windows-arm64.exe ./cmd/pipelock
+
+  # Helm remains a separate diagnostic job, but the required `build` context
+  # intentionally carries its result through `needs`. Keep that dependency
+  # until a separately approved ruleset change makes `helm` required itself.
+  # The parallel binary and cross-target producers also flow through this gate,
+  # so a compilation failure cannot present as a successful required build check.
+  build:
+    needs: [security-scan, test-go125, test-go126, lint, test-cross-target, helm, build-binaries]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Report required build evidence
+        env:
+          SECURITY_SCAN_RESULT: ${{ needs.security-scan.result }}
+          TEST_GO125_RESULT: ${{ needs.test-go125.result }}
+          TEST_GO126_RESULT: ${{ needs.test-go126.result }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          CROSS_TARGET_RESULT: ${{ needs.test-cross-target.result }}
+          HELM_RESULT: ${{ needs.helm.result }}
+          BUILD_BINARIES_RESULT: ${{ needs.build-binaries.result }}
+        run: |
+          set -euo pipefail
+          for result in \
+            "$SECURITY_SCAN_RESULT" \
+            "$TEST_GO125_RESULT" \
+            "$TEST_GO126_RESULT" \
+            "$LINT_RESULT" \
+            "$CROSS_TARGET_RESULT" \
+            "$HELM_RESULT" \
+            "$BUILD_BINARIES_RESULT"; do
+            if [ "$result" != success ]; then
+              echo "required build evidence is incomplete or failed" >&2
+              exit 1
+            fi
+          done
+
+  # Operator-facing rollup only. Branch protection continues to evaluate the
+  # required producer checks independently.
+  pipelock-ci-summary:
+    needs: [security-scan, test-go125, test-go126, test-macos, lint, build, govulncheck]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    name: Pipelock CI Summary
+    timeout-minutes: 5
+    steps:
+      - name: Report required check evidence
+        env:
+          SECURITY_SCAN_RESULT: ${{ needs.security-scan.result }}
+          TEST_GO125_RESULT: ${{ needs.test-go125.result }}
+          TEST_GO126_RESULT: ${{ needs.test-go126.result }}
+          MACOS_RESULT: ${{ needs.test-macos.result }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          GOVULNCHECK_RESULT: ${{ needs.govulncheck.result }}
+        run: |
+          set -euo pipefail
+          failed=0
+          summary="$GITHUB_STEP_SUMMARY"
+          printf '%s\n\n' '## Pipelock CI Summary' > "$summary"
+          printf '%s\n\n' '| Required check | Evidence |' >> "$summary"
+          printf '%s\n' '| --- | --- |' >> "$summary"
+
+          record_result() {
+            local name="$1"
+            local result="$2"
+            printf '| %s | %s |\n' "$name" "$result" >> "$summary"
+            case "$result" in
+              success) ;;
+              *) failed=1 ;;
+            esac
+          }
+
+          record_result 'security-scan' "$SECURITY_SCAN_RESULT"
+          record_result 'test (1.25)' "$TEST_GO125_RESULT"
+          record_result 'test (1.26)' "$TEST_GO126_RESULT"
+          record_result 'test-macos' "$MACOS_RESULT"
+          record_result 'lint' "$LINT_RESULT"
+          record_result 'build' "$BUILD_RESULT"
+          record_result 'govulncheck' "$GOVULNCHECK_RESULT"
+
+          printf '\nCodeQL is separately required and runs in its own workflow; it is intentionally outside this summary.\n' >> "$summary"
+
+          if [ "$failed" -ne 0 ]; then
+            printf '\nOne or more required checks failed, were cancelled, skipped unexpectedly, or had unknown evidence.\n' >> "$summary"
+            exit 1
+          fi

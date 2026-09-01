@@ -1,0 +1,715 @@
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Apache-2.0
+
+package mcp
+
+import (
+	"context"
+	"net"
+	"net/http"
+	"strings"
+	"sync/atomic"
+
+	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/authority"
+	"github.com/luckyPipewrench/pipelock/internal/capture"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/contract/proxydecision"
+	contractruntime "github.com/luckyPipewrench/pipelock/internal/contract/runtime"
+	"github.com/luckyPipewrench/pipelock/internal/deferred"
+	"github.com/luckyPipewrench/pipelock/internal/envelope"
+	"github.com/luckyPipewrench/pipelock/internal/filesentry"
+	"github.com/luckyPipewrench/pipelock/internal/hitl"
+	"github.com/luckyPipewrench/pipelock/internal/killswitch"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/chains"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/tools"
+	"github.com/luckyPipewrench/pipelock/internal/metrics"
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/redact"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+	"github.com/luckyPipewrench/pipelock/internal/session"
+)
+
+// DoWCheckFunc checks an MCP action identity against denial-of-wallet budgets.
+// subjectKey is empty for single-session transports and a stable MCP DoW
+// subject for multi-client HTTP listener traffic.
+// The identity is a raw tool name for tools/call and "a2a:<Method>" for A2A.
+// Returns (allowed, action, reason, budgetType). Action is "block" or "warn".
+// When action is "warn", the caller logs but does not block the request.
+type DoWCheckFunc func(subjectKey, toolName, argsJSON string) (allowed bool, action, reason, budgetType string)
+
+// DoWAttribution carries the already-resolved subject metadata used only for
+// audit and metrics. SubjectKey never enters metrics or audit output directly.
+type DoWAttribution struct {
+	SubjectKey string
+	Trust      string
+}
+
+// ListenerPrincipal identifies a caller only after an authentication verifier
+// has accepted it. Provider separates trust domains; Epoch invalidates prior
+// state after verifier-policy or subject revocation changes.
+type ListenerPrincipal struct {
+	Provider string
+	Subject  string
+	Epoch    uint64
+}
+
+// ListenerPrincipalResolver authenticates an HTTP listener request and returns
+// its stable security identity. It must not trust self-declared MCP metadata.
+type ListenerPrincipalResolver func(*http.Request) (ListenerPrincipal, error)
+
+const (
+	transportMCPStdio = "mcp_stdio"
+	transportMCPHTTP  = "mcp_http"
+	mcpWarnMethod     = "MCP"
+	mcpServerResponse = "server_response"
+)
+
+// MCPRedactionConfig snapshots the request-side redaction settings used for a
+// single MCP message or HTTP request.
+type MCPRedactionConfig struct {
+	Matcher  *redact.Matcher
+	Limits   redact.Limits
+	Profile  string
+	Required bool
+}
+
+// minSubjectTrust resolves the operator-declared minimum subject grade,
+// preferring the reload-following resolver when one is wired.
+func (o MCPProxyOpts) minSubjectTrust() config.DoWSubjectTrust {
+	if o.DoWMinSubjectTrustFn != nil {
+		return o.DoWMinSubjectTrustFn()
+	}
+	return o.DoWMinSubjectTrust
+}
+
+// MCPProxyOpts groups the shared dependencies for MCP proxy functions.
+// Construct once per proxy invocation; pass by value so callers can
+// override fields (e.g. Rec, ToolCfg) without affecting the original.
+//
+// Required: Scanner (dereferenced unconditionally in all scan paths).
+// Optional (nil-safe): all other fields - functions check before use.
+type MCPProxyOpts struct {
+	// ListenerBearerToken authenticates inbound HTTP-listener clients through
+	// Proxy-Authorization. It is never forwarded to the MCP upstream, whose
+	// independent credential continues to use Authorization.
+	ListenerBearerToken string
+	// ListenerBearerTokenFn refreshes the listener credential for each request.
+	// File-backed CLI modes use this so token replacement revokes old clients
+	// without restarting the listener. Errors fail the request closed.
+	ListenerBearerTokenFn func() (string, error)
+	// ListenerPrincipalResolver returns a stable identity only after an external
+	// verifier has authenticated the request. It may subdivide holders of the
+	// listener bearer credential and is the integration seam for OAuth or mTLS.
+	// Client-declared MCP metadata must never be returned as a principal.
+	ListenerPrincipalResolver ListenerPrincipalResolver
+	// ListenerAllowedOrigins is an exact allowlist for browser Origin headers.
+	// An empty list rejects every request carrying Origin.
+	ListenerAllowedOrigins []string
+	// ListenerAllowUnauthenticated explicitly permits a non-loopback listener
+	// without ListenerBearerToken. This is intended only for deployments whose
+	// network policy is the authentication boundary.
+	ListenerAllowUnauthenticated bool
+	// listenerStateTokenRequired, when set, is the static token requirement
+	// used by tests. Nil means omitted. Production listeners should prefer
+	// ListenerStateTokenRequiredFn so a reload can change the value.
+	listenerStateTokenRequired *bool
+	// ListenerStateTokenRequiredFn is the live-reload source for the HTTP
+	// reverse-listener token requirement. A nil return is omitted (default
+	// off). When set, it wins over listenerStateTokenRequired.
+	ListenerStateTokenRequiredFn func() *bool
+	// UpstreamHeaders are operator-configured headers applied by the HTTP
+	// reverse listener. They take precedence over client-supplied headers, so a
+	// browser can use Authorization for listener authentication while Pipelock
+	// supplies a separate static Authorization credential to the upstream.
+	UpstreamHeaders http.Header
+	// DialContext is the dial path used for configured HTTP/SSE/WS MCP upstreams.
+	// Long-lived Pipelock servers pass the proxy SSRF-safe dialer here so DNS
+	// rebinding and metadata endpoints are checked again at connection time.
+	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+
+	// Scanning
+	Scanner        *scanner.Scanner
+	ScannerFn      func() *scanner.Scanner
+	Approver       *hitl.Approver
+	InputCfg       *InputScanConfig
+	InputCfgFn     func() *InputScanConfig
+	RequestBodyCfg *config.RequestBodyScanning
+	RequestBodyFn  func() *config.RequestBodyScanning
+	ToolCfg        *tools.ToolScanConfig
+	ToolCfgFn      func() *tools.ToolScanConfig
+	PolicyCfg      *policy.Config
+	PolicyCfgFn    func() *policy.Config
+	KillSwitch     *killswitch.Controller
+	ChainMatcher   *chains.Matcher
+	ChainMatcherFn func() *chains.Matcher
+
+	// Session and adaptive enforcement
+	Store         session.Store
+	Rec           session.Recorder // set by RunProxy after Store.GetOrCreate
+	BaselineRec   session.ToolCallBaselineRecorder
+	Baseline      session.BaselineChecker
+	BaselineFn    func() session.BaselineChecker
+	AdaptiveCfg   *config.AdaptiveEnforcement
+	AdaptiveCfgFn AdaptiveConfigFunc // hot-reload aware; used by listener proxy. Nil = use static AdaptiveCfg.
+	AirlockCfg    *config.Airlock
+	AirlockCfgFn  func() *config.Airlock
+	TaintCfg      *config.TaintConfig
+	TaintCfgFn    func() *config.TaintConfig
+	// TaintExternalSource marks responses from this MCP transport as external
+	// content by default (HTTP/SSE and WebSocket upstreams).
+	TaintExternalSource bool
+	// TaintTrustedSource marks this MCP server's responses as operator-trusted
+	// for taint classification. Prompt-injection hits can still raise hostile
+	// taint; this only changes clean response-source classification.
+	TaintTrustedSource bool
+	// TaintTrustedSourceFn returns the current MCP taint trust decision for
+	// hot-reload-aware proxy surfaces. Nil falls back to TaintTrustedSource.
+	TaintTrustedSourceFn func() bool
+
+	// Cross-request exfiltration detection
+	CEE   *CEEDeps
+	CEEFn func() *CEEDeps
+
+	// Observability
+	AuditLogger *audit.Logger
+	Metrics     *metrics.Metrics
+
+	// AuthorityVerifier validates external grants immediately before an MCP
+	// request is forwarded. AuthorityActor and AuthorityDestination are
+	// resolved by the trusted transport/runtime, never from client metadata.
+	AuthorityVerifier    authority.Verifier
+	AuthorityActor       string
+	AuthorityDestination string
+
+	// Redirect handler runtime config (nil-safe).
+	RedirectRT   *RedirectRuntime
+	RedirectRTFn func() *RedirectRuntime
+
+	// Provenance verification for MCP tools (nil-safe).
+	ProvenanceCfg   *config.MCPToolProvenance
+	ProvenanceCfgFn func() *config.MCPToolProvenance
+
+	// A2A protocol scanning (nil-safe).
+	A2ACfg       *config.A2AScanning
+	A2ACfgFn     func() *config.A2AScanning
+	CardBaseline *CardBaseline
+	// A2ACardURL is the Agent Card origin used for signature verification
+	// and drift keys on MCP transports that have an upstream URL. Empty
+	// is valid for stdio; origin-scoped signature checks then fail closed.
+	A2ACardURL string
+	// A2ACardAuthFingerprint partitions Agent Card drift baselines by the
+	// effective upstream Authorization credential. It is a truncated digest,
+	// never the credential itself.
+	A2ACardAuthFingerprint string
+
+	// MediaPolicy enforces response-side media handling for base64 tool
+	// result content blocks (image/audio/video) before generic text scanning.
+	// Nil-safe: MCP media policy is disabled when unset.
+	MediaPolicy   *config.MediaPolicy
+	MediaPolicyFn func() *config.MediaPolicy
+
+	// Request-side redaction for tools/call params.arguments. Nil matcher
+	// disables MCP redaction. Limits use redact package defaults when zero.
+	RedactMatcher  *redact.Matcher
+	RedactLimits   redact.Limits
+	RedactProfile  string
+	RedactionCfgFn func() MCPRedactionConfig
+
+	// Frozen tool enforcement for airlock hard tier (nil-safe).
+	// When non-nil and a stable key is frozen, only tools in the frozen set
+	// are allowed. Injected from proxy.FrozenToolRegistry via the interface.
+	ToolFreezer session.ToolFreezer
+
+	// FrozenToolStableKey identifies the MCP instance for frozen tool lookups.
+	// Set by the proxy when constructing opts from the stable identity.
+	FrozenToolStableKey string
+
+	// Denial-of-wallet tracking (nil-safe).
+	DoWCheck DoWCheckFunc
+	// DoWEnabledFn returns the live denial-of-wallet enabled state for
+	// long-lived listener surfaces. Nil preserves legacy static behavior:
+	// a configured DoWCheck means the gate is enabled.
+	DoWEnabledFn func() bool
+	// DoWSubjectKey is set per request by multi-client transports before
+	// invoking the shared input pipeline. Empty is valid only when
+	// DoWEnforceSubjectTrust is false.
+	DoWSubjectKey string
+	// DoWAttribution preserves the raw subject and its resolved trust grade for
+	// privacy-safe audit correlation after DoWSubjectKey has been blanked by a
+	// minimum-trust refusal. It does not participate in enforcement.
+	DoWAttribution DoWAttribution
+	// DoWSessionKey is a deprecated alias for older direct pipeline callers.
+	DoWSessionKey string
+	// DoWSubjectAgent and DoWSubjectAgentAuth are the configured fallback
+	// identity components used when no future authenticated MCP principal is
+	// available. Only bound/config-default auth contributes the agent name.
+	DoWSubjectAgent     string
+	DoWSubjectAgentAuth envelope.ActorAuth
+	// DoWAuthenticatedPrincipal is a future seam for mTLS/OAuth-style MCP
+	// client principals. It is nil today for shipped MCP listener paths.
+	DoWAuthenticatedPrincipal func(*http.Request) string
+	// DoWMinSubjectTrust is the weakest subject identification this listener
+	// will bill a budget against. A request graded below it is refused. The
+	// zero value is the weakest grade, so enabling a budget does not by itself
+	// begin refusing traffic Pipelock can already account for.
+	DoWMinSubjectTrust config.DoWSubjectTrust
+	// DoWMinSubjectTrustFn resolves the minimum for each request so a hot reload
+	// that raises or lowers it takes effect without restarting the listener. When
+	// set it overrides DoWMinSubjectTrust.
+	DoWMinSubjectTrustFn func() config.DoWSubjectTrust
+	// DoWEnforceSubjectTrust refuses a request whose subject is identified
+	// below DoWMinSubjectTrust. Formerly this required a server-minted
+	// Mcp-Session-Id, which protocol revision 2026-07-28 removes entirely.
+	// Historic note: missing/unknown session identity was a
+	// fail-closed DoW block for tool and A2A calls. HTTP listener mode enables
+	// this because a raw client-supplied Mcp-Session-Id is not a trustworthy
+	// budget key until Pipelock has observed the upstream issue it.
+	DoWEnforceSubjectTrust bool
+	// DoWSessionKnown reports whether an inbound Mcp-Session-Id has previously
+	// been issued by the upstream through this Pipelock listener.
+	DoWSessionKnown func(sessionKey string) bool
+	// DoWRegisterSession records an upstream-issued Mcp-Session-Id as trusted.
+	DoWRegisterSession func(sessionKey string)
+	// DoWForgetSession removes a session after a successful MCP DELETE.
+	DoWForgetSession func(sessionKey string)
+
+	// Policy capture observer for recording scan verdicts.
+	// Defaults to capture.NopObserver{} when nil.
+	CaptureObs capture.CaptureObserver
+
+	// Capture metadata stamped onto recorded MCP scan verdicts.
+	ConfigHash   string
+	ConfigHashFn func() string
+	Profile      string
+	ProfileFn    func() string
+	// AddressProtectionAgent is the resolved agent/profile name used when MCP
+	// request scanning consults per-agent address_protection allowlists.
+	// Empty preserves global-only behavior for direct callers.
+	AddressProtectionAgent   string
+	AddressProtectionAgentFn func() string
+
+	// Suppress holds the operator's response suppress rules (config Suppress
+	// list). The stdio response path consults these via config.IsSuppressed so
+	// a response-scan false positive can be remediated for one server without a
+	// global change, reaching parity with the SSE/HTTP response paths.
+	// Nil/empty preserves no-suppression behavior.
+	Suppress []config.SuppressEntry
+	// SuppressFn returns the current response suppress rules for long-lived
+	// proxy surfaces that support hot reload. Nil falls back to Suppress.
+	SuppressFn func() []config.SuppressEntry
+
+	// ServerName is a stable per-server identity used to build the suppress
+	// Target ("mcp://<ServerName>/response") that path-scoped suppress entries
+	// match against. Empty disables target-scoped response suppression. Set
+	// from `pipelock mcp proxy --server-name`.
+	ServerName string
+
+	// ResponseTrustClass is the effective trust class for this server's MCP
+	// responses. Empty is treated as "untrusted" and fails closed. Set from
+	// response_scanning.mcp_servers when --server-name matches an entry.
+	ResponseTrustClass string
+	// ResponseTrustClassFn returns the current response trust class for
+	// hot-reload-aware proxy surfaces. Nil falls back to ResponseTrustClass.
+	ResponseTrustClassFn func() string
+
+	// ResponseActionOverride is the MCP response-scan action derived from
+	// ResponseTrustClass by runtime config wiring. Empty preserves the
+	// scanner's action for low-level callers and diagnostic tests.
+	ResponseActionOverride string
+	// ResponseActionOverrideFn returns the current MCP response action override
+	// for hot-reload-aware proxy surfaces. Nil falls back to ResponseActionOverride.
+	ResponseActionOverrideFn func() string
+
+	// AdaptiveResetFile is the signed local control-file path for an adaptive
+	// reset. It is honored only through AdaptiveResetAuthority.
+	AdaptiveResetFile string
+	// AdaptiveResetAuthority verifies signed adaptive reset delegations. The
+	// proxy holds only the operator's public key. Nil disables adaptive reset,
+	// including when AdaptiveResetFile is configured.
+	AdaptiveResetAuthority *ResetAuthority
+	// AdaptiveResetEpoch is incremented after every accepted reset, preventing
+	// a valid delegation from being reused within this proxy process. Nil
+	// disables adaptive reset and preserves the airlock.
+	AdaptiveResetEpoch *atomic.Uint64
+
+	// Transport identifies the MCP transport for capture records.
+	// Set by each proxy surface, for example "mcp_stdio", "mcp_http_upstream",
+	// "mcp_http_listener", or "mcp_ws".
+	Transport string
+
+	// WarnContext is the parent context used to attach per-request DLP warn
+	// metadata before MCP payload scans. Nil-safe: falls back to Background.
+	WarnContext context.Context
+
+	// ReceiptEmitter emits signed action receipts for MCP decisions.
+	// Nil-safe (no-op when nil).
+	ReceiptEmitter    *receipt.Emitter
+	ReceiptEmitterFn  func() *receipt.Emitter
+	RequireReceipts   bool
+	RequireReceiptsFn func() bool
+	// V2ReceiptEmitter emits EvidenceReceipt v2 proxy_decision records in
+	// parity with ReceiptEmitter. Nil-safe (no-op when nil).
+	V2ReceiptEmitter   *proxydecision.Emitter
+	V2ReceiptEmitterFn func() *proxydecision.Emitter
+	PolicyHash         string
+	PolicyHashFn       func() string
+
+	DeferManager   *deferred.Manager
+	DeferManagerFn func() *deferred.Manager
+	// DeferResolverRuntime owns async DEFER resolver subprocess lifetime for
+	// one proxy invocation. It is wired by proxy entry points, not config.
+	DeferResolverRuntime *DeferResolverRuntime
+
+	// Learn-lock contract enforcement for MCP transports. HTTP listener and
+	// stdio-to-HTTP modes gate the configured upstream URL; every transport
+	// gates tools/call messages with runtime.EvaluateMCP. ContractLoaderPtr
+	// is for hot-reload owners; ContractLoader is for short-lived command
+	// invocations and tests.
+	ContractLoader    *contractruntime.Loader
+	ContractLoaderPtr *atomic.Pointer[contractruntime.Loader]
+	ContractLoaderFn  func() *contractruntime.Loader
+	ContractAgent     string
+	ContractServer    string
+
+	// EnvelopeEmitter builds mediation envelopes for MCP allow decisions.
+	// When non-nil, tools/call messages forwarded on allow get a
+	// com.pipelock/mediation entry injected into params._meta.
+	// Nil-safe (no-op when nil).
+	EnvelopeEmitter   *envelope.Emitter
+	EnvelopeEmitterFn func() *envelope.Emitter
+
+	// Pre-spawn binary integrity verification (nil-safe).
+	IntegrityCfg *config.MCPBinaryIntegrity
+	// afterIntegrityPreparedForTest runs between integrity preparation and the
+	// descriptor launch. Tests use it to mutate the command pathname so the
+	// swap-after-hash case can be reproduced; production wiring leaves it nil.
+	afterIntegrityPreparedForTest func()
+
+	// sessionExitForTest overrides the session-bound exit's parent-death
+	// watch and drain window. A test process cannot make its own parent
+	// die, so the in-process teardown path is otherwise reachable only
+	// from a helper subprocess; production wiring leaves it nil.
+	sessionExitForTest *sessionExitTestHooks
+	// outputForwardStartedForTest signals that RunProxy has entered its
+	// server-output forwarding loop. Production wiring leaves it nil.
+	outputForwardStartedForTest func()
+	// outputForwardDoneForTest signals that server-output forwarding returned.
+	// Tests use it to release a child held after closing stdout; production
+	// wiring leaves it nil.
+	outputForwardDoneForTest func()
+	// sessionExit marks Pipelock-initiated descriptor closes during a
+	// session-bound teardown. It is wired only by proxy entry points.
+	sessionExit *sessionExitState
+	// enableSubreaperForTest supplies a deterministic subreaper setup result.
+	// Production wiring leaves it nil and calls the platform implementation.
+	enableSubreaperForTest func() error
+
+	// File sentry (stdio proxy only)
+	Lineage      filesentry.Lineage
+	OnChildReady func() // called after child process starts
+}
+
+// responseTarget returns the suppress-rule target for this server's MCP
+// responses ("mcp://<ServerName>/response"), or "" when no stable server
+// name is set (which disables target-scoped response suppression).
+func (o MCPProxyOpts) responseTarget() string {
+	if o.ServerName == "" {
+		return ""
+	}
+	return "mcp://" + o.ServerName + "/response"
+}
+
+// responseScanOptions builds the per-server suppression context passed into
+// the stdio response scan (ScanResponseOpts).
+func (o MCPProxyOpts) responseScanOptions() ResponseScanOptions {
+	return ResponseScanOptions{
+		Target:         o.responseTarget(),
+		Suppress:       o.responseSuppress(),
+		ActionOverride: o.responseActionOverride(),
+		TrustClass:     o.responseTrustClass(),
+	}
+}
+
+func (o MCPProxyOpts) responseSuppress() []config.SuppressEntry {
+	if o.SuppressFn != nil {
+		return o.SuppressFn()
+	}
+	return o.Suppress
+}
+
+func (o MCPProxyOpts) responseTrustClass() string {
+	if o.ResponseTrustClassFn != nil {
+		if v := o.ResponseTrustClassFn(); v != "" {
+			return v
+		}
+	}
+	if o.ResponseTrustClass != "" {
+		return o.ResponseTrustClass
+	}
+	return config.ResponseTrustUntrusted
+}
+
+func (o MCPProxyOpts) responseActionOverride() string {
+	if o.ResponseActionOverrideFn != nil {
+		return o.ResponseActionOverrideFn()
+	}
+	return o.ResponseActionOverride
+}
+
+// captureObserver returns the observer, defaulting to NopObserver when nil.
+func (o MCPProxyOpts) captureObserver() capture.CaptureObserver {
+	if o.CaptureObs != nil {
+		return o.CaptureObs
+	}
+	return capture.NopObserver{}
+}
+
+func (o MCPProxyOpts) captureConfigHash() string {
+	if o.ConfigHashFn != nil {
+		if v := o.ConfigHashFn(); v != "" {
+			return v
+		}
+	}
+	return o.ConfigHash
+}
+
+func (o MCPProxyOpts) captureProfile() string {
+	if o.ProfileFn != nil {
+		if v := o.ProfileFn(); v != "" {
+			return v
+		}
+	}
+	return o.Profile
+}
+
+func (o MCPProxyOpts) addressProtectionAgent() string {
+	if o.AddressProtectionAgentFn != nil {
+		if v := strings.TrimSpace(o.AddressProtectionAgentFn()); v != "" {
+			return v
+		}
+	}
+	return strings.TrimSpace(o.AddressProtectionAgent)
+}
+
+func (o MCPProxyOpts) warnContext() context.Context {
+	if o.WarnContext != nil {
+		return o.WarnContext
+	}
+	return context.Background()
+}
+
+func (o MCPProxyOpts) scanner() *scanner.Scanner {
+	if o.ScannerFn != nil {
+		return o.ScannerFn()
+	}
+	return o.Scanner
+}
+
+func (o MCPProxyOpts) inputCfg() *InputScanConfig {
+	if o.InputCfgFn != nil {
+		return o.InputCfgFn()
+	}
+	return o.InputCfg
+}
+
+func (o MCPProxyOpts) requestBodyCfg() *config.RequestBodyScanning {
+	if o.RequestBodyFn != nil {
+		return o.RequestBodyFn()
+	}
+	return o.RequestBodyCfg
+}
+
+func (o MCPProxyOpts) toolCfg() *tools.ToolScanConfig {
+	if o.ToolCfgFn != nil {
+		return o.ToolCfgFn()
+	}
+	return o.ToolCfg
+}
+
+func (o MCPProxyOpts) policyCfg() *policy.Config {
+	if o.PolicyCfgFn != nil {
+		return o.PolicyCfgFn()
+	}
+	return o.PolicyCfg
+}
+
+func (o MCPProxyOpts) chainMatcher() *chains.Matcher {
+	if o.ChainMatcherFn != nil {
+		return o.ChainMatcherFn()
+	}
+	return o.ChainMatcher
+}
+
+func (o MCPProxyOpts) adaptiveCfg() *config.AdaptiveEnforcement {
+	if o.AdaptiveCfgFn != nil {
+		return o.AdaptiveCfgFn()
+	}
+	return o.AdaptiveCfg
+}
+
+func (o MCPProxyOpts) airlockCfg() *config.Airlock {
+	if o.AirlockCfgFn != nil {
+		return o.AirlockCfgFn()
+	}
+	return o.AirlockCfg
+}
+
+func (o MCPProxyOpts) baselineChecker() session.BaselineChecker {
+	if o.BaselineFn != nil {
+		return o.BaselineFn()
+	}
+	return o.Baseline
+}
+
+func (o MCPProxyOpts) taintCfg() *config.TaintConfig {
+	if o.TaintCfgFn != nil {
+		return o.TaintCfgFn()
+	}
+	return o.TaintCfg
+}
+
+func (o MCPProxyOpts) mcpResponseTaintExternal() bool {
+	trusted := o.TaintTrustedSource
+	if o.TaintTrustedSourceFn != nil {
+		trusted = o.TaintTrustedSourceFn()
+	}
+	return o.TaintExternalSource && !trusted
+}
+
+func (o MCPProxyOpts) cee() *CEEDeps {
+	if o.CEEFn != nil {
+		return o.CEEFn()
+	}
+	return o.CEE
+}
+
+func (o MCPProxyOpts) redirectRT() *RedirectRuntime {
+	if o.RedirectRTFn != nil {
+		return o.RedirectRTFn()
+	}
+	return o.RedirectRT
+}
+
+func (o MCPProxyOpts) provenanceCfg() *config.MCPToolProvenance {
+	if o.ProvenanceCfgFn != nil {
+		return o.ProvenanceCfgFn()
+	}
+	return o.ProvenanceCfg
+}
+
+func (o MCPProxyOpts) a2aCfg() *config.A2AScanning {
+	if o.A2ACfgFn != nil {
+		return o.A2ACfgFn()
+	}
+	return o.A2ACfg
+}
+
+func (o MCPProxyOpts) a2aResponseOpts(scanOpts ResponseScanOptions) *A2AResponseOpts {
+	return &A2AResponseOpts{
+		Cfg:      o.a2aCfg(),
+		Baseline: o.CardBaseline,
+		CardKey: cardCacheKey{
+			cardURL:         o.A2ACardURL,
+			authFingerprint: o.A2ACardAuthFingerprint,
+		},
+		ScanOpts: scanOpts,
+	}
+}
+
+func (o MCPProxyOpts) mediaPolicy() *config.MediaPolicy {
+	if o.MediaPolicyFn != nil {
+		return o.MediaPolicyFn()
+	}
+	return o.MediaPolicy
+}
+
+func (o MCPProxyOpts) redactionConfig() MCPRedactionConfig {
+	if o.RedactionCfgFn != nil {
+		return o.RedactionCfgFn()
+	}
+	return MCPRedactionConfig{
+		Matcher: o.RedactMatcher,
+		Limits:  o.RedactLimits,
+		Profile: o.RedactProfile,
+	}
+}
+
+func (o MCPProxyOpts) receiptEmitter() *receipt.Emitter {
+	if o.ReceiptEmitterFn != nil {
+		return o.ReceiptEmitterFn()
+	}
+	return o.ReceiptEmitter
+}
+
+func (o MCPProxyOpts) requireReceipts() bool {
+	if o.RequireReceiptsFn != nil {
+		return o.RequireReceiptsFn()
+	}
+	return o.RequireReceipts
+}
+
+func (o MCPProxyOpts) v2ReceiptEmitter() *proxydecision.Emitter {
+	if o.V2ReceiptEmitterFn != nil {
+		return o.V2ReceiptEmitterFn()
+	}
+	return o.V2ReceiptEmitter
+}
+
+func (o MCPProxyOpts) receiptPolicyHash() string {
+	if o.PolicyHashFn != nil {
+		if v := o.PolicyHashFn(); v != "" {
+			return v
+		}
+	}
+	if o.PolicyHash != "" {
+		return o.PolicyHash
+	}
+	return o.captureConfigHash()
+}
+
+func (o MCPProxyOpts) withReceiptPolicyHash(opts receipt.EmitOpts) receipt.EmitOpts {
+	if opts.PolicyHash == "" {
+		opts.PolicyHash = o.receiptPolicyHash()
+	}
+	return opts
+}
+
+func (o MCPProxyOpts) deferManager() *deferred.Manager {
+	if o.DeferManagerFn != nil {
+		return o.DeferManagerFn()
+	}
+	return o.DeferManager
+}
+
+func (o MCPProxyOpts) deferResolverRuntime() *DeferResolverRuntime {
+	return o.DeferResolverRuntime
+}
+
+func (o MCPProxyOpts) contractLoader() *contractruntime.Loader {
+	if o.ContractLoaderFn != nil {
+		return o.ContractLoaderFn()
+	}
+	if o.ContractLoaderPtr != nil {
+		return o.ContractLoaderPtr.Load()
+	}
+	return o.ContractLoader
+}
+
+func (o MCPProxyOpts) envelopeEmitter() *envelope.Emitter {
+	if o.EnvelopeEmitterFn != nil {
+		return o.EnvelopeEmitterFn()
+	}
+	return o.EnvelopeEmitter
+}
+
+// dowEnabled reports the live denial-of-wallet enabled state. It is consulted by
+// both the HTTP listener and the stdio input pipeline, so it lives with the
+// option it reads rather than in either transport's file.
+func (o MCPProxyOpts) dowEnabled() bool {
+	if o.DoWEnabledFn != nil {
+		return o.DoWEnabledFn()
+	}
+	return o.DoWCheck != nil || o.DoWEnforceSubjectTrust
+}

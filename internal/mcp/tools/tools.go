@@ -1,0 +1,2422 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+// Package tools provides MCP tool description scanning for poisoning detection,
+// rug-pull (drift) detection, and session binding (tool inventory validation).
+package tools
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/luckyPipewrench/pipelock/internal/mcp/a2amethods"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/jsonrpc"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/provenance"
+	"github.com/luckyPipewrench/pipelock/internal/normalize"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+)
+
+// ToolDef represents a single tool definition in an MCP tools/list response.
+type ToolDef struct {
+	Name         string          `json:"name"`
+	Title        string          `json:"title,omitempty"`
+	Description  string          `json:"description,omitempty"`
+	InputSchema  json.RawMessage `json:"inputSchema,omitempty"`
+	OutputSchema json.RawMessage `json:"outputSchema,omitempty"`
+	Annotations  json.RawMessage `json:"annotations,omitempty"`
+	Meta         json.RawMessage `json:"_meta,omitempty"`
+	raw          json.RawMessage
+	unknown      map[string]json.RawMessage
+}
+
+func (t *ToolDef) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	unknown := make(map[string]json.RawMessage)
+	for field, value := range fields {
+		switch field {
+		case "name", "title", "description", "inputSchema", "outputSchema", "annotations", "_meta":
+		default:
+			// MCP tool definitions are extensible. Keep every unknown value for
+			// bounded visible-text extraction instead of treating a future or
+			// vendor field as either a scan bypass or a protocol error.
+			unknown[field] = append(json.RawMessage(nil), value...)
+		}
+	}
+	type toolDefAlias ToolDef
+	var decoded toolDefAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*t = ToolDef(decoded)
+	t.raw = append(t.raw[:0], data...)
+	t.unknown = unknown
+	return nil
+}
+
+// toolsListResult is the result payload of an MCP tools/list response.
+type toolsListResult struct {
+	Tools []ToolDef `json:"tools"`
+}
+
+// ToolScanMatch describes a finding in a specific tool definition.
+type ToolScanMatch struct {
+	ToolName      string                  `json:"tool_name"`
+	Injection     []scanner.ResponseMatch `json:"injection,omitempty"`
+	ToolPoison    []string                `json:"tool_poison,omitempty"`
+	DriftDetected bool                    `json:"drift_detected,omitempty"`
+	// DriftAccepted reports a definition that changed but introduced no risk
+	// cue. It is an observation for the operator, never a finding: it does not
+	// affect the verdict, and the changed definition becomes the new baseline.
+	DriftAccepted bool `json:"drift_accepted,omitempty"`
+	// DriftCues lists the cue classes the change introduced. Populated only
+	// when DriftDetected is true, and it is the reason the change was blocked.
+	DriftCues    []string `json:"drift_cues,omitempty"`
+	PreviousHash string   `json:"previous_hash,omitempty"`
+	CurrentHash  string   `json:"current_hash,omitempty"`
+	DriftDetail  string   `json:"drift_detail,omitempty"`
+}
+
+// ToolScanResult describes the outcome of scanning a tools/list response.
+type ToolScanResult struct {
+	IsToolsList bool `json:"is_tools_list"`
+	Clean       bool `json:"clean"`
+	// ResourceLimit identifies a baseline resource limit that made this
+	// tools/list response uninspectable. It is never a warning: allowing a
+	// definition that cannot be recorded creates a permanent blind spot.
+	ResourceLimit string          `json:"resource_limit,omitempty"`
+	Matches       []ToolScanMatch `json:"matches,omitempty"`
+	// Observations carry non-blocking drift notices: a definition changed but
+	// introduced no risk cue. They never affect Clean or the verdict; they
+	// exist so an accepted change is visible to the operator rather than
+	// silent.
+	Observations []ToolScanMatch `json:"observations,omitempty"`
+	RPCID        json.RawMessage `json:"-"` // parsed ID for block responses (avoids re-parse)
+	ToolNames    []string        `json:"-"` // tool names from tools/list (for session binding)
+	ToolDefs     []ToolDef       `json:"-"` // accepted definitions for transport header binding
+}
+
+// ExtraPoisonPattern is a tool-poison pattern from a community rule bundle.
+type ExtraPoisonPattern struct {
+	Name          string
+	RuleID        string // namespaced rule ID
+	Re            *regexp.Regexp
+	ScanField     string // "description" or "name"
+	Bundle        string
+	BundleVersion string
+}
+
+// ToolScanConfig holds configuration for MCP tool description scanning.
+// A nil ToolScanConfig disables tool scanning entirely.
+// Session binding fields are optional: when BindingUnknownAction is non-empty,
+// tools/call requests are validated against the baseline captured from tools/list.
+type ToolScanConfig struct {
+	// Baseline holds the caller-scoped baseline for session binding. It is also
+	// the drift baseline unless DriftBaseline is set.
+	Baseline *ToolBaseline
+	// DriftBaseline, when set, is used only for definition-drift detection.
+	// It must never be used for session binding decisions.
+	DriftBaseline *ToolBaseline
+	// ExpectedDriftEpoch binds a response to the listener baseline generation
+	// captured before it was sent upstream. A response from before an operator
+	// re-baseline must not seed the new baseline after it returns.
+	ExpectedDriftEpoch *uint64
+	// DriftRemediation is included in a drift block so an operator has a
+	// narrow recovery action instead of disabling drift detection.
+	DriftRemediation string
+	// ListenerDriftResetFile contains a signed one-shot control file honored
+	// by the HTTP reverse listener to re-baseline its upstream tool inventory.
+	ListenerDriftResetFile string
+	// ListenerDriftResetAuthorityPublicKey is the configured public half of an
+	// mcp-reset-authority key. The private half stays outside the proxy.
+	ListenerDriftResetAuthorityPublicKey ed25519.PublicKey
+	// ListenerDriftResetTarget is the stable identity a delegation must bind.
+	ListenerDriftResetTarget string
+	Action                   string // warn, block
+	DetectDrift              bool
+
+	// Session binding (optional). When BindingUnknownAction is non-empty,
+	// RunProxy wires tools/call validation into the input scanner.
+	BindingUnknownAction    string // warn, block - action for unknown tool calls
+	BindingNoBaselineAction string // warn, block - action before baseline established
+
+	// ExtraPoison holds tool-poison patterns from community rule bundles.
+	ExtraPoison []*ExtraPoisonPattern
+}
+
+// ToolBaseline tracks SHA256 hashes of tool definitions for rug pull detection
+// and session binding (known tool inventory). Safe for concurrent use.
+type ToolBaseline struct {
+	mu             sync.Mutex
+	hashes         map[string]string                   // tool name → SHA256(description + inputSchema)
+	structural     map[string]string                   // tool name → digest of everything but the description
+	descs          map[string]string                   // tool name → last known description text
+	params         map[string][]string                 // tool name → last known parameter names (sorted)
+	knownTools     map[string]bool                     // session binding: tool name set from first tools/list
+	knownA2A       map[string]bool                     // session binding: A2A method identity set from trusted inventory
+	headerBindings map[string]map[string]HeaderBinding // tool name -> lower-case Mcp-Param name -> schema binding
+	pendingTools   map[string]struct{}                 // names admitted for a response that has not forwarded yet
+	hasBaseline    bool                                // true after first SetKnownTools call
+	hasA2A         bool                                // true after first SetKnownA2AMethods call
+	driftEpoch     uint64                              // increments when operator reset clears drift state
+}
+
+// NewToolBaseline creates a new empty tool baseline.
+func NewToolBaseline() *ToolBaseline {
+	return &ToolBaseline{
+		hashes:         make(map[string]string),
+		structural:     make(map[string]string),
+		descs:          make(map[string]string),
+		params:         make(map[string][]string),
+		headerBindings: make(map[string]map[string]HeaderBinding),
+		pendingTools:   make(map[string]struct{}),
+	}
+}
+
+// maxBaselineTools caps the number of tracked tools to prevent unbounded
+// memory growth from a malicious server sending unlimited unique tool names.
+const maxBaselineTools = 10000
+
+// ErrBaselineCapacity means a definition or inventory cannot be recorded
+// without exceeding the baseline limit. Callers must treat it as an
+// uninspectable security outcome, not as a cache miss.
+var ErrBaselineCapacity = errors.New("tool baseline capacity exceeded")
+
+const a2aMethodIdentityPrefix = "a2a:"
+
+func baselineInventoryMapCapacity(n int) int {
+	if n > maxBaselineTools {
+		return maxBaselineTools
+	}
+	return n
+}
+
+// ShouldSkip returns true if the tool name is unknown and the baseline is at
+// capacity. Callers should skip expensive hash computation in this case to
+// prevent CPU exhaustion from malicious servers flooding with unique tool names.
+func (tb *ToolBaseline) ShouldSkip(name string) bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	_, exists := tb.hashes[name]
+	return !exists && len(tb.hashes) >= maxBaselineTools
+}
+
+func namesFitCapacity[T any](stored map[string]T, names []string) bool {
+	needed := len(stored)
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if _, exists := stored[name]; exists {
+			continue
+		}
+		if _, duplicate := seen[name]; duplicate {
+			continue
+		}
+		seen[name] = struct{}{}
+		needed++
+		if needed > maxBaselineTools {
+			return false
+		}
+	}
+	return true
+}
+
+func namesFitCapacityWithPending[T any](stored map[string]T, pending map[string]struct{}, names []string) bool {
+	needed := len(stored) + len(pending)
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if _, exists := stored[name]; exists {
+			continue
+		}
+		if _, reserved := pending[name]; reserved {
+			return false
+		}
+		if _, duplicate := seen[name]; duplicate {
+			continue
+		}
+		seen[name] = struct{}{}
+		needed++
+		if needed > maxBaselineTools {
+			return false
+		}
+	}
+	return true
+}
+
+// CanTrackDefinitions reports whether every definition in names can remain
+// under the drift baseline cap. It has no side effects so callers can reject
+// an oversized response before scanning or promoting any partial baseline.
+func (tb *ToolBaseline) CanTrackDefinitions(names []string) bool {
+	if tb == nil {
+		return true
+	}
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	return namesFitCapacity(tb.hashes, names)
+}
+
+// CanAdmitKnownTools reports whether a tools/list inventory can be committed
+// in full. A partial inventory is not a baseline.
+func (tb *ToolBaseline) CanAdmitKnownTools(names []string) bool {
+	if tb == nil {
+		return true
+	}
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	return namesFitCapacity(tb.knownTools, names)
+}
+
+// CheckAndUpdate stores a tool's hash and reports whether it changed.
+// Returns (driftDetected, previousHash). On first insertion returns (false, "").
+// New tools are silently dropped when the baseline exceeds maxBaselineTools.
+func (tb *ToolBaseline) CheckAndUpdate(name, hash string) (bool, string) {
+	drifted, prev, _ := tb.CheckAndUpdatePromote(name, hash, true, true)
+	return drifted, prev
+}
+
+// CheckAndUpdatePromote stores a tool's hash and reports whether it changed.
+// When promoteNew is false, first-seen hashes are not stored. When
+// promoteChanged is false, changed hashes are reported but not stored.
+// Unchanged tools always match the existing baseline.
+// The promoted return value reports whether callers should update companion
+// baseline state such as descriptions and parameter names.
+func (tb *ToolBaseline) CheckAndUpdatePromote(name, hash string, promoteNew, promoteChanged bool) (drifted bool, previousHash string, promoted bool) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+
+	prev, exists := tb.hashes[name]
+
+	if !exists && len(tb.hashes) >= maxBaselineTools {
+		return false, "", false
+	}
+
+	if !exists {
+		if !promoteNew {
+			return false, "", false
+		}
+		tb.hashes[name] = hash
+		return false, "", true
+	}
+	if prev != hash {
+		if promoteChanged {
+			tb.hashes[name] = hash
+			return true, prev, true
+		}
+		return true, prev, false
+	}
+	return false, "", true
+}
+
+// StoreDesc saves a tool's description text for later diff generation.
+// Called alongside CheckAndUpdate. Respects maxBaselineTools capacity.
+func (tb *ToolBaseline) StoreDesc(name, desc string) error {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if _, exists := tb.descs[name]; !exists && len(tb.descs) >= maxBaselineTools {
+		return ErrBaselineCapacity
+	}
+	tb.descs[name] = desc
+	return nil
+}
+
+// StoreParams saves a tool's parameter names for later diff generation.
+// Called alongside CheckAndUpdate. Respects maxBaselineTools capacity.
+// Names should be pre-sorted for deterministic comparison.
+func (tb *ToolBaseline) StoreParams(name string, paramNames []string) error {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if _, exists := tb.params[name]; !exists && len(tb.params) >= maxBaselineTools {
+		return ErrBaselineCapacity
+	}
+	// Store a copy to prevent mutation.
+	cp := make([]string, len(paramNames))
+	copy(cp, paramNames)
+	tb.params[name] = cp
+	return nil
+}
+
+// DriftEvaluation is the outcome of one atomic compare-and-promote against the
+// baseline.
+type DriftEvaluation struct {
+	// CapacityExceeded reports that the definition could not be represented in
+	// the baseline. It is a fail-closed outcome, never an empty evaluation.
+	CapacityExceeded bool
+	// EpochChanged reports that an operator re-baselined after the response
+	// left the upstream. Its stale definition must not be committed.
+	EpochChanged bool
+	// Drifted reports that a stored definition changed.
+	Drifted bool
+	// Cues lists what the change introduced. Empty means the change was
+	// accepted and the new definition is now the baseline.
+	Cues []string
+	// PreviousHash is the hash the baseline held before this evaluation.
+	PreviousHash string
+	// Detail is the human-readable diff, computed from the same locked
+	// snapshot the decision used.
+	Detail string
+}
+
+// Accepted reports a change that was evaluated and adopted as the new baseline.
+func (e DriftEvaluation) Accepted() bool { return e.Drifted && len(e.Cues) == 0 }
+
+// EvaluateDefinition compares a tool definition against the baseline and
+// promotes it, under ONE lock acquisition.
+//
+// Atomicity is the point. The HTTP reverse listener shares a single baseline
+// across concurrent clients, so reading the previous definition, deciding, and
+// writing the new hash, description, parameters, and structural digest through
+// separate acquisitions lets two responses interleave and pair a new hash with
+// another response's metadata. A later comparison then runs against a
+// definition that never existed, which can both manufacture a finding and hide
+// one.
+//
+// classify receives the previous description and whether anything outside the
+// description moved, and returns the cue classes the change introduced. It runs
+// while the lock is held, so it must be pure and must not call back into this
+// baseline.
+// DefinitionEvaluation carries one tool definition and the promotion policy to
+// apply to it.
+type DefinitionEvaluation struct {
+	Name string
+	Hash string
+	Desc string
+	// Params are the tool's parameter names, already sorted.
+	Params []string
+	// Structural is the digest of everything except the description.
+	Structural string
+	// ExpectedDriftEpoch, when non-nil, rejects a response if the baseline was
+	// reset after this response was sent upstream.
+	ExpectedDriftEpoch *uint64
+	// PromoteNew stores a first sighting. Block mode withholds it when the
+	// definition already carries a finding.
+	PromoteNew bool
+	// PromoteChanged stores a CHANGED definition that was blocked BY DRIFT.
+	// Block mode withholds it so the approved definition stays in place.
+	PromoteChanged bool
+	// PromoteAccepted allows a change carrying no drift cue to become the new
+	// baseline. It must carry the FULL per-tool verdict, not just the drift
+	// one: a definition the scanner blocked for injection or poisoning has to
+	// stay out of the baseline even when drift itself found nothing to say,
+	// or rejected content becomes the approved comparison state and every
+	// later drift decision is measured against something we refused.
+	PromoteAccepted bool
+	// Classify returns the cue classes the change introduced. It runs while the
+	// baseline lock is held, so it must be pure and must not call back into the
+	// baseline.
+	Classify func(prevDesc string, structuralChanged bool) []string
+}
+
+func (tb *ToolBaseline) EvaluateDefinition(in DefinitionEvaluation) DriftEvaluation {
+	name, hash, desc := in.Name, in.Hash, in.Desc
+	params, structural := in.Params, in.Structural
+	promoteNew, promoteChanged, classify := in.PromoteNew, in.PromoteChanged, in.Classify
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if in.ExpectedDriftEpoch != nil && tb.driftEpoch != *in.ExpectedDriftEpoch {
+		return DriftEvaluation{EpochChanged: true}
+	}
+
+	prevHash, exists := tb.hashes[name]
+	if !exists && len(tb.hashes) >= maxBaselineTools {
+		return DriftEvaluation{CapacityExceeded: true}
+	}
+
+	promote := func() {
+		tb.hashes[name] = hash
+		tb.descs[name] = desc
+		cp := make([]string, len(params))
+		copy(cp, params)
+		tb.params[name] = cp
+		tb.structural[name] = structural
+	}
+
+	if !exists {
+		if promoteNew {
+			promote()
+		}
+		return DriftEvaluation{}
+	}
+	if prevHash == hash {
+		promote()
+		return DriftEvaluation{}
+	}
+
+	prevDesc := tb.descs[name]
+	prevStructural, hasPrevStructural := tb.structural[name]
+	result := DriftEvaluation{
+		Drifted:      true,
+		PreviousHash: prevHash,
+		Detail:       tb.diffSummaryLocked(name, desc, params),
+		Cues:         classify(prevDesc, !hasPrevStructural || prevStructural != structural),
+	}
+
+	// An accepted change becomes the new baseline, or it re-reports on every
+	// later tools/list. "Accepted" means the whole scan accepted it, not just
+	// drift. A change blocked by drift is promoted only when the configured
+	// action does not hold the approved definition in place.
+	if (len(result.Cues) == 0 && in.PromoteAccepted) || promoteChanged {
+		promote()
+	}
+	return result
+}
+
+// DiffSummary returns a human-readable summary of what changed between the
+// stored description/params and the new ones. Returns "" if no previous data.
+func (tb *ToolBaseline) DiffSummary(name, newDesc string, newParams []string) string {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	return tb.diffSummaryLocked(name, newDesc, newParams)
+}
+
+// diffSummaryLocked is DiffSummary's body. Callers hold tb.mu.
+func (tb *ToolBaseline) diffSummaryLocked(name, newDesc string, newParams []string) string {
+	prevDesc, hasDesc := tb.descs[name]
+	prevParams, hasParams := tb.params[name]
+
+	if !hasDesc && !hasParams {
+		return ""
+	}
+
+	var parts []string
+
+	// Description diff.
+	if hasDesc {
+		prevLen := len([]rune(prevDesc))
+		newLen := len([]rune(newDesc))
+
+		if prevDesc != newDesc {
+			if newLen > prevLen {
+				parts = append(parts, fmt.Sprintf("description grew from %d to %d chars (+%d)", prevLen, newLen, newLen-prevLen))
+			} else if newLen < prevLen {
+				parts = append(parts, fmt.Sprintf("description shrank from %d to %d chars (-%d)", prevLen, newLen, prevLen-newLen))
+			} else {
+				parts = append(parts, fmt.Sprintf("description changed (%d chars)", newLen))
+			}
+
+			// Show added text (tail of new description beyond previous length).
+			// Use rune slicing to avoid splitting multi-byte characters.
+			if newLen > prevLen {
+				newRunes := []rune(newDesc)
+				added := string(newRunes[prevLen:])
+				// 200: truncation limit for readable drift summaries
+				if len(newRunes)-prevLen > 200 {
+					added = string(newRunes[prevLen:prevLen+200]) + "..."
+				}
+				parts = append(parts, fmt.Sprintf("added: %q", added))
+			}
+		}
+	}
+
+	// Parameter diff.
+	if hasParams {
+		added, removed := diffStringSlices(prevParams, newParams)
+		if len(added) > 0 {
+			parts = append(parts, fmt.Sprintf("parameters added: %v", added))
+		}
+		if len(removed) > 0 {
+			parts = append(parts, fmt.Sprintf("parameters removed: %v", removed))
+		}
+	}
+
+	return strings.Join(parts, "; ")
+}
+
+// diffStringSlices compares two sorted string slices and returns elements
+// present only in b (added) and elements present only in a (removed).
+func diffStringSlices(a, b []string) (added, removed []string) {
+	setA := make(map[string]bool, len(a))
+	for _, s := range a {
+		setA[s] = true
+	}
+	setB := make(map[string]bool, len(b))
+	for _, s := range b {
+		setB[s] = true
+	}
+	for _, s := range b {
+		if !setA[s] {
+			added = append(added, s)
+		}
+	}
+	for _, s := range a {
+		if !setB[s] {
+			removed = append(removed, s)
+		}
+	}
+	return added, removed
+}
+
+// ResetDriftState clears the drift-tracking maps (hashes, descs, params)
+// while preserving session binding state (knownTools, hasBaseline). Called
+// after an authorized operator reset delegation. A detect_drift reload never
+// calls this method: retaining the last trusted hashes blocks an unreviewed
+// upstream change until the operator deliberately re-baselines it. Session
+// binding is intentionally preserved: knownTools tracks "tools the session has
+// ever seen" and continues to flag wholly-new names through
+// BindingUnknownAction.
+func (tb *ToolBaseline) ResetDriftState() {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	tb.resetDriftStateLocked()
+}
+
+// ResetDriftStateAtEpoch clears drift state only when the requested generation
+// is still current. It makes an operator reset's generation check and advance
+// indivisible even when authorities are replaced during a listener reload.
+func (tb *ToolBaseline) ResetDriftStateAtEpoch(expected uint64) bool {
+	if tb == nil {
+		return false
+	}
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.driftEpoch != expected {
+		return false
+	}
+	tb.resetDriftStateLocked()
+	return true
+}
+
+func (tb *ToolBaseline) resetDriftStateLocked() {
+	tb.driftEpoch++
+	tb.hashes = make(map[string]string)
+	tb.structural = make(map[string]string)
+	tb.descs = make(map[string]string)
+	tb.params = make(map[string][]string)
+}
+
+// DriftEpoch returns the generation of the drift baseline. A listener captures
+// it before upstream work and binds any returned tools/list to that generation.
+func (tb *ToolBaseline) DriftEpoch() uint64 {
+	if tb == nil {
+		return 0
+	}
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	return tb.driftEpoch
+}
+
+func (tb *ToolBaseline) matchesDriftEpoch(expected uint64) bool {
+	if tb == nil {
+		return true
+	}
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	return tb.driftEpoch == expected
+}
+
+// DetectDriftRisingEdge tracks a concurrent boolean transition. The zero value
+// is ready to use. Safe for concurrent Observe calls; one rising-edge
+// transition in a flurry of concurrent reloads will trigger exactly one true
+// return. MCP reset paths do not use this helper to clear a baseline: that
+// requires a signed operator delegation.
+//
+// State is encoded in a single atomic Uint32 so initialization and the
+// previous-value flag stay composed under concurrent Observe calls. The
+// earlier two-Bool implementation had a race where a concurrent pair of
+// initial Observe(true) calls could fire a spurious rising edge: one
+// goroutine could see prev=false from its Swap and then lose the
+// initialization Swap to a peer, ending up with curr=true && !prev=true,
+// returning a transition that did not happen. Single-Swap state machine
+// closes that.
+//
+// The initialization gate distinguishes "first observation of true at
+// startup" (which is NOT a transition; baseline already matches the
+// operator-intended state) from "false→true transition via hot reload"
+// (which IS the rising edge that must reseed drift state). Without this
+// gate, an initial config load with detect_drift=true does not report a
+// transition. Callers must decide whether an observed edge is authorized to
+// change state.
+type DetectDriftRisingEdge struct {
+	// state encoding:
+	//   driftEdgeStateUninit (0): never observed
+	//   driftEdgeStatePrevFalse (1): last observed value was false
+	//   driftEdgeStatePrevTrue  (2): last observed value was true
+	state atomic.Uint32
+}
+
+const (
+	driftEdgeStateUninit    uint32 = 0
+	driftEdgeStatePrevFalse uint32 = 1
+	driftEdgeStatePrevTrue  uint32 = 2
+)
+
+// Observe records the new detect_drift value and reports whether it was a
+// rising edge (false→true). The first call records the initial state and
+// always returns false; subsequent calls return true only on an actual
+// false→true transition.
+func (d *DetectDriftRisingEdge) Observe(curr bool) bool {
+	next := driftEdgeStatePrevFalse
+	if curr {
+		next = driftEdgeStatePrevTrue
+	}
+	prev := d.state.Swap(next)
+	if prev == driftEdgeStateUninit {
+		return false
+	}
+	return prev == driftEdgeStatePrevFalse && curr
+}
+
+// SetKnownTools sets the session baseline from a tools/list response.
+// Called on the first tools/list to lock the baseline. Subsequent calls
+// add newly seen tools to the known set. Respects maxBaselineTools to
+// prevent unbounded memory growth from malicious servers.
+func (tb *ToolBaseline) SetKnownTools(names []string) error {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.knownTools == nil {
+		tb.knownTools = make(map[string]bool, baselineInventoryMapCapacity(len(names)))
+	}
+	if !namesFitCapacity(tb.knownTools, names) {
+		return ErrBaselineCapacity
+	}
+	for _, n := range names {
+		tb.knownTools[n] = true
+	}
+	tb.hasBaseline = true
+	return nil
+}
+
+// SetKnownA2AMethods sets the session baseline from a trusted response-derived
+// A2A method inventory. Methods are stored in the same namespaced identity form
+// used by the MCP input gates, case-folded to match A2A method detection.
+// Subsequent calls add newly seen methods. Respects maxBaselineTools to prevent
+// unbounded memory growth. Unknown method names and reserved-prefix tool
+// identities are ignored so an attacker-influenced inventory cannot create
+// arbitrary allowlist entries.
+func (tb *ToolBaseline) SetKnownA2AMethods(methods []string) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.knownA2A == nil {
+		tb.knownA2A = make(map[string]bool, baselineInventoryMapCapacity(len(methods)))
+	}
+	added := false
+	for _, method := range methods {
+		identity := a2aInventoryMethodIdentity(method)
+		if identity == "" {
+			continue
+		}
+		if !tb.knownA2A[identity] && len(tb.knownA2A) >= maxBaselineTools {
+			break
+		}
+		if !tb.knownA2A[identity] {
+			added = true
+		}
+		tb.knownA2A[identity] = true
+	}
+	if added {
+		tb.hasA2A = true
+	}
+}
+
+// HasBaseline reports whether a tool inventory baseline has been established.
+func (tb *ToolBaseline) HasBaseline() bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	return tb.hasBaseline
+}
+
+// HasA2AMethodBaseline reports whether an A2A method inventory baseline has
+// been established.
+func (tb *ToolBaseline) HasA2AMethodBaseline() bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	return tb.hasA2A
+}
+
+// IsKnownTool reports whether the given tool name is in the session baseline.
+func (tb *ToolBaseline) IsKnownTool(name string) bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	return tb.knownTools[name]
+}
+
+// IsKnownA2AMethod reports whether the given A2A method identity is in the
+// session baseline.
+func (tb *ToolBaseline) IsKnownA2AMethod(method string) bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	return tb.knownA2A[a2aMethodIdentity(method)]
+}
+
+// CheckNewTools was removed when tool-inventory admission moved to
+// ToolInventoryReservation below. It had no production caller after that change
+// and returned ([]string, error), so a future caller that ignored the error
+// would have read an empty "added" slice as "nothing was added" and allowed the
+// response - reintroducing exactly the capacity fail-open the reservation
+// exists to close. Reserve/commit is the only supported path; it cannot report
+// success without having taken the capacity it needs.
+
+// ToolInventoryReservation holds capacity reserved for one tools/list
+// response until its downstream write succeeds. It prevents two concurrent
+// responses from both observing the final slot as available, while keeping a
+// failed downstream write out of the trusted baseline.
+type ToolInventoryReservation struct {
+	baseline *ToolBaseline
+	names    []string
+	defs     []ToolDef
+	bindings map[string]map[string]HeaderBinding
+	reserved []string
+}
+
+// ReserveToolInventory reserves all state that a clean tools/list response
+// needs before it can forward. Call Commit after the downstream write succeeds
+// or Release when it does not. A partial reservation is never created.
+func (tb *ToolBaseline) ReserveToolInventory(names []string, defs []ToolDef) (*ToolInventoryReservation, error) {
+	if tb == nil {
+		return nil, nil
+	}
+	if len(defs) > maxBaselineTools {
+		return nil, ErrBaselineCapacity
+	}
+	bindings := headerBindingsForDefs(defs)
+	bindingNames := make([]string, 0, len(bindings))
+	for name := range bindings {
+		bindingNames = append(bindingNames, name)
+	}
+
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.pendingTools == nil {
+		tb.pendingTools = make(map[string]struct{})
+	}
+	if !namesFitCapacityWithPending(tb.knownTools, tb.pendingTools, names) ||
+		!namesFitCapacityWithPending(tb.headerBindings, tb.pendingTools, bindingNames) {
+		return nil, ErrBaselineCapacity
+	}
+
+	reserved := make([]string, 0, len(names))
+	claimed := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if _, known := tb.knownTools[name]; known {
+			continue
+		}
+		if _, repeat := claimed[name]; repeat {
+			continue
+		}
+		if _, duplicate := tb.pendingTools[name]; duplicate {
+			for _, held := range reserved {
+				delete(tb.pendingTools, held)
+			}
+			return nil, ErrBaselineCapacity
+		}
+		tb.pendingTools[name] = struct{}{}
+		claimed[name] = struct{}{}
+		reserved = append(reserved, name)
+	}
+	return &ToolInventoryReservation{baseline: tb, names: names, defs: defs, bindings: bindings, reserved: reserved}, nil
+}
+
+// Release discards a reservation after the response did not reach the client.
+func (r *ToolInventoryReservation) Release() {
+	if r == nil || r.baseline == nil {
+		return
+	}
+	r.baseline.mu.Lock()
+	defer r.baseline.mu.Unlock()
+	for _, name := range r.reserved {
+		delete(r.baseline.pendingTools, name)
+	}
+	r.reserved = nil
+}
+
+// Commit makes a reserved tools/list response trusted after it has forwarded.
+// It is infallible: Reserve already held every slot this response needs.
+func (r *ToolInventoryReservation) Commit(clean bool) []string {
+	if r == nil || r.baseline == nil {
+		return nil
+	}
+	tb := r.baseline
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	defer func() {
+		for _, name := range r.reserved {
+			delete(tb.pendingTools, name)
+		}
+		r.reserved = nil
+	}()
+
+	if tb.knownTools == nil {
+		tb.knownTools = make(map[string]bool, baselineInventoryMapCapacity(len(r.names)))
+	}
+	added := make([]string, 0, len(r.reserved))
+	for _, name := range r.names {
+		if !tb.knownTools[name] {
+			if tb.hasBaseline {
+				added = append(added, name)
+			}
+			tb.knownTools[name] = true
+		}
+	}
+	tb.hasBaseline = true
+
+	if tb.headerBindings == nil {
+		tb.headerBindings = make(map[string]map[string]HeaderBinding)
+	}
+	for _, def := range r.defs {
+		bindings, valid := r.bindings[def.Name]
+		if !clean || !valid {
+			delete(tb.headerBindings, def.Name)
+			continue
+		}
+		tb.headerBindings[def.Name] = bindings
+	}
+	return added
+}
+
+func a2aMethodIdentity(method string) string {
+	method = strings.TrimSpace(method)
+	if method == "" {
+		return ""
+	}
+	if strings.HasPrefix(method, a2aMethodIdentityPrefix) {
+		method = strings.TrimSpace(strings.TrimPrefix(method, a2aMethodIdentityPrefix))
+	}
+	if !a2amethods.Is(method) {
+		return ""
+	}
+	return a2aMethodIdentityPrefix + strings.ToLower(method)
+}
+
+func a2aInventoryMethodIdentity(method string) string {
+	method = strings.TrimSpace(method)
+	if method == "" || strings.HasPrefix(method, a2aMethodIdentityPrefix) {
+		return ""
+	}
+	if !a2amethods.Is(method) {
+		return ""
+	}
+	return a2aMethodIdentityPrefix + strings.ToLower(method)
+}
+
+// compiledToolPattern is a precompiled regex for tool-specific poisoning detection.
+type compiledToolPattern struct {
+	name string
+	re   *regexp.Regexp
+}
+
+// toolPoisonKeywords is the set of directive keywords checked in tool descriptions.
+const toolPoisonKeywords = `IMPORTANT|CRITICAL|SYSTEM|INSTRUCTION|SECRET|HIDDEN|URGENT`
+
+// toolPoisonPatterns detect structural indicators of tool description poisoning.
+// These are checked ONLY in tool descriptions to avoid false positives on
+// legitimate response content. Text is Unicode-normalized before matching.
+var toolPoisonPatterns = []*compiledToolPattern{
+	{
+		name: "Instruction Tag",
+		// Catches <IMPORTANT>, [IMPORTANT], **IMPORTANT**, and variants with
+		// trailing words like **CRITICAL FIRST STEP** or [SYSTEM NOTE].
+		// All three tag styles use \b + capped permissive fill ({0,100}) to
+		// match trailing words consistently without unbounded backtracking.
+		re: regexp.MustCompile(`(?i)(?:` +
+			`<\s*(?:` + toolPoisonKeywords + `)\b[^>]{0,100}>` + `|` +
+			`\[\s*(?:` + toolPoisonKeywords + `)\b[^\]]{0,100}\]` + `|` +
+			`\*{2}\s*(?:` + toolPoisonKeywords + `)\b[^*]{0,100}\*{2}` +
+			`)`),
+	},
+	{
+		name: "File Exfiltration Directive",
+		re:   regexp.MustCompile(`(?i)(read|send|include|exfiltrate|steal|access|retrieve|fetch|dump|upload|cat|prepend|append|add|attach|embed)\s+.{0,40}(\.ssh|\.env|\.aws|credentials|private[_\s]?key|id_rsa|passwd)`),
+	},
+	{
+		// Reverse order: path mentioned before action verb.
+		// Catches "~/.ssh/config and upload" style directives.
+		name: "File Exfiltration Directive",
+		re:   regexp.MustCompile(`(?i)(\.ssh|\.env|\.aws|credentials|private[_\s]?key|id_rsa|passwd).{0,40}(read|send|include|exfiltrate|steal|access|retrieve|fetch|dump|upload|cat|prepend|append|add|attach|embed)\b`),
+	},
+	{
+		name: "Cross-Tool Sensitive File Directive",
+		// Catches tool descriptions that instruct the agent to invoke another
+		// read-style tool with a concrete sensitive path. This is distinct
+		// from generic cross-tool routing: a benign "call read_file with the
+		// requested path" should not match without a secret-bearing path.
+		re: regexp.MustCompile(`(?i)\b(?:first\s+)?(?:call|use|invoke)\s+(?:the\s+)?[\w.-]*(?:read|file|secret|credential)[\w.-]*(?:\s+(?:tool|function))?\b.{0,100}` +
+			`(?:path|file|target|argument)?\s*[:=]?\s*['"]?(?:~?/)?(?:\.ssh[/\\]|\.aws[/\\]credentials|\.env\b|\.npmrc\b|\.pypirc\b|\.netrc\b|id_rsa\b|id_ed25519\b|/etc/passwd\b|/etc/shadow\b|private[_\s-]?key)`),
+	},
+	{
+		name: "Cross-Tool Manipulation",
+		re:   regexp.MustCompile(`(?i)(instead\s+of|rather\s+than|don't\s+use|never\s+use|always\s+prefer)\s+(using\s+)?(the\s+)?\w+\s+(tool|function|command)`),
+	},
+	{
+		name: "Dangerous Capability",
+		// Detects tools that describe executing local files, scripts, or commands.
+		// Standalone "script"/"file" require a determiner (a/the/any) to avoid
+		// false positives on "Execute the deployment script" or "Run the build
+		// script". Qualified forms (local/shell/arbitrary/system) match directly.
+		//
+		// The leading verb group is strict: it matches only actual verb forms
+		// of execute/run/launch/spawn, not any word that begins with those
+		// stems. `(execut|run|launch|spawn)\w*` accepted `runtime`, `runner`,
+		// `launcher`, `spawner` as noun false positives (PR #348 widening
+		// regressed on `runtime` specifically, blocking agents whose tool
+		// descriptions used it in phrases like "OpenClaw runtime ... local
+		// file"). RE2 has no negative lookahead, so each verb family's
+		// inflections are enumerated explicitly.
+		re: regexp.MustCompile(`(?i)\b(execut(?:e[ds]?|ing)|run(?:s|ning)?|launch(?:e[ds]?|ing)?|spawn(?:s|ed|ing)?)\b\s+.{0,40}(` +
+			`local\s+(?:file|script)|` +
+			`(?:a|the|any)\s+(?:file|script)\b|` +
+			`(?:shell|arbitrary|system)\s+(?:command|script))`,
+		),
+	},
+	{
+		name: "Dangerous Capability",
+		// Detects tools that download from URLs then execute the result.
+		// Requires "it"/"them" after the execute verb to avoid false positives
+		// on "Fetch data and run the analysis" where fetch and run act on
+		// different objects.
+		re: regexp.MustCompile(`(?i)(download|fetch|retriev)\w*\s+.{0,60}(execut|run|launch)\w*\s+(?:it|them)\b`),
+	},
+	{
+		name: "Dangerous Capability",
+		// Detects tools that instruct calling external commands via tool chain.
+		// Catches "call the bash tool to run: curl", "use the shell tool to execute",
+		// and similar patterns where a tool description directs the agent to invoke
+		// another tool for command execution.
+		re: regexp.MustCompile(`(?i)(call|use|invoke)\s+(the\s+)?(bash|shell|exec|terminal|command|cmd)\s+(tool|function).{0,40}(run|execut|curl|wget|nc\b|ncat|python|perl|ruby|node\b)`),
+	},
+	{
+		name: "Data Routing Directive",
+		// Detects shadow tools that instruct the agent to pass data from one
+		// tool through another. Requires a cross-tool cue ("before using",
+		// "first call this tool", "when the user asks to use ... tool") to
+		// avoid false positives on benign "submit the request body" descriptions.
+		re: regexp.MustCompile(`(?i)(first\s+call\s+this\s+tool|before\s+(?:using|calling|sending)|when\s+(?:the\s+user|you)\s+(?:asks?\s+to\s+)?use\s+\w+\s+tool).{0,80}(pass|send|include|forward)\s+(the\s+)?(full|entire|complete)?\s*(body|content|data|message|email|payload|request\s+body)\s+.{0,40}(parameter|argument|field)`),
+	},
+	{
+		name: "Workspace Data Exfiltration Directive",
+		// A lookup or analysis tool has no legitimate reason to require the
+		// agent to collect workspace material and submit it to an external URL.
+		// Requiring both the local-workspace collection and URL-routing cues
+		// keeps ordinary descriptions of upload tools out of scope.
+		// The qualifier slot lists SCOPE-BROADENING words only ("unrelated",
+		// "any other", "all"), which is the signal that the collection reaches
+		// past what the caller asked for. A scope-NARROWING qualifier
+		// ("selected", "specified") describes an ordinary user-scoped transfer
+		// and must not match, so a counting slot that accepts any adjective is
+		// wrong: it flags a legitimate backup tool. The bare no-qualifier form
+		// still matches, so dropping the adjective is not a bypass. A
+		// scope-broadening synonym outside this list is a known limit of a
+		// regex mechanism and is tracked rather than papered over.
+		// A determiner is accepted only AFTER a scope-broadening word, so
+		// "all the" and "all of the" match while a bare "the workspace files"
+		// does not: a lone determiner reads as scoped and belongs with the
+		// benign transfers.
+		re: regexp.MustCompile(`(?i)\b(?:collect|gather)\s+(?:(?:all|any|other|another|every|unrelated|additional|remaining|extra|cached|nearby|arbitrary|miscellaneous|misc|further|recent)\s+(?:of\s+)?(?:the\s+)?){0,3}(?:(?:workspace|project|local)\s+(?:notes|data|files|context)|(?:notes|data|files|context)\s+from\s+(?:the\s+)?(?:workspace|project|local))\b(?s:.{0,120})\b(?:submit|send|upload|forward|post)\s+(?:them|it|(?:the\s+)?(?:workspace|project|local)\s+(?:notes|data|files|context))?\s*(?:to|via)\s+https?://`),
+	},
+}
+
+// exfilParamPattern detects parameter names that encode exfiltration intent.
+// Catches names like "content_from_reading_ssh_id_rsa" where the param name
+// itself directs the agent to read sensitive files. Runs per-param on the
+// expanded name (not aggregated tool text) to avoid false positives from
+// action words in the description pairing with sensitive targets in unrelated
+// params. Requires an action word + sensitive target in the same param name.
+var exfilParamPattern = regexp.MustCompile(
+	`(?i)\b(content|data|value|result|output|read|fetch|get|dump|steal|exfil|extract|copy|upload|send)\b` +
+		`.{0,40}` +
+		`\b(ssh.{0,5}(?:id.rsa|key)|id.rsa|private.key|api.key|secret.key|` +
+		`credentials?|passwd|env.(?:secret|key|file|var)|aws.secret|access.token|auth.token)\b`,
+)
+
+// directiveParamPattern detects a parameter or schema key that is itself an
+// instruction to override the agent's existing instructions.
+//
+// Ordinary identifiers are deliberately excluded from prose scanning, because a
+// tool that names a property "instructions" or "role" is doing something
+// completely normal and refusing its whole tools/list over that is the kind of
+// false positive that gets tool scanning switched off. A key spelled
+// "ignore-previous-instructions" is not that: it reads as an identifier to the
+// filter and as a directive to the agent, so it was being forwarded clean.
+//
+// The pattern therefore requires all three parts of the attack phrasing, an
+// override verb, a scope word, and a rules noun, rather than any one of them.
+// A name has to be trying to say the sentence to match it.
+var directiveParamPattern = regexp.MustCompile(
+	`(?i)\b(ignore|disregard|forget|override|bypass)\b\s+(?:\w+\s+){0,2}` +
+		`\b(previous|prior|all|above|earlier|preceding|former|initial|original)\b\s+(?:\w+\s+){0,2}` +
+		`\b(instructions?|rules?|directives?|prompts?|constraints?|guidelines?|guardrails?|restrictions?|commands?)\b`,
+)
+
+// contextLeakParamPattern detects parameter names that direct the agent to
+// populate them with internal model context - system prompt, conversation
+// history, tool-call history, chain of thought, model identity, available
+// tools. The HiddenLayer "Exploiting MCP Tool Parameters" attack
+// (https://hiddenlayer.com/innovation-hub/exploiting-mcp-tool-parameters/)
+// demonstrated that agents will fill such parameters even when the tool
+// code never reads them - the name alone is enough of a cue.
+//
+// Operates on the same expanded form as exfilParamPattern: underscores and
+// camelCase boundaries are spaces, case is normalized lowercase. Patterns
+// match the HiddenLayer-published shapes plus immediate semantic siblings
+// (assistant_response, user_messages, etc.) that carry equivalent risk.
+//
+// Operators can suppress for known-good tools via mcp_tool_scanning config.
+var contextLeakParamPattern = regexp.MustCompile(
+	`(?i)\b(` +
+		`system\s+prompt|` +
+		`conversation\s+(history|context|log|transcript|messages?)|` +
+		`chat\s+(history|context|log|transcript|messages?)|` +
+		`tool\s+call\s+(history|log|trace|sequence|results?)|` +
+		`chain\s+of\s+thought|` +
+		`inner\s+monologue|` +
+		`reasoning\s+(trace|steps|chain|history)|` +
+		`model\s+(name|id|identifier|version)|` +
+		`assistant\s+(messages?|response|history|context)|` +
+		`user\s+(messages?|prompt|history)|` +
+		`tools\s+list|` +
+		`available\s+tools|` +
+		`prompt\s+(template|history|context|chain)|` +
+		`session\s+(context|history|state|memory)|` +
+		`agent\s+(state|memory|context|scratchpad)` +
+		`)\b`,
+)
+
+// isIdentifierToken reports a JSON key that is an identifier rather than
+// prose: letters, digits, underscore, and hyphen, with no spaces. The
+// injection scanner's matching view splits camelCase, so feeding
+// developerMode through it matches "developer mode" and refuses a legitimate
+// tools/list. Identifier keys are judged by the dedicated parameter-name
+// detectors; keys that contain spaces or other punctuation remain prose.
+func isIdentifierToken(key string) bool {
+	if key == "" {
+		return false
+	}
+	for i, r := range key {
+		switch {
+		case r == '_' || r == '-':
+		case unicode.IsLetter(r):
+		case i > 0 && unicode.IsDigit(r):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// isOrdinaryContextLeakIdentifier reports property names that expand into a
+// context-leak phrase but are ordinary API identifiers. A model-wrapper tool
+// legitimately names a parameter system_prompt; treating that identifier as
+// an attack refuses the entire tools/list, and the cheapest operator fix is
+// disabling tool scanning. Decorated wrapping-underscore forms such as
+// _system_prompt_ still match because they are not this exact identifier.
+func isOrdinaryContextLeakIdentifier(name string) bool {
+	switch name {
+	case "system_prompt", "systemPrompt", "SystemPrompt":
+		return true
+	}
+	return false
+}
+
+// hashTool computes the same full-tool-object digest that provenance
+// attestation verifies: every tool field is covered, with only Pipelock's own
+// embedded provenance _meta member stripped before hashing.
+func hashTool(t ToolDef) string {
+	if len(t.raw) > 0 {
+		return provenance.ToolDigestRaw(t.raw)
+	}
+	return provenance.ToolDigest(t.Name, t.Description, t.InputSchema)
+}
+
+// extractToolText extracts prose from a tool definition: the description and
+// nested schema descriptions. Parameter names are identifiers, not prose; the
+// dedicated exfil and context-leak detectors judge them separately. Expanding
+// names into the injection scanner turned ordinary identifiers such as
+// developer_mode into jailbreak matches and refused the listing.
+func extractToolText(t ToolDef) string {
+	var parts []string
+	if t.Description != "" {
+		parts = append(parts, t.Description)
+	}
+	if len(t.InputSchema) > 0 {
+		parts = append(parts, ExtractSchemaDescriptions(t.InputSchema)...)
+	}
+	// A sentence boundary keeps word boundaries intact after Unicode
+	// normalization without letting a negated capability in one tool field
+	// suppress an exfiltration directive in a later schema field.
+	return strings.Join(parts, ". ")
+}
+
+// extractToolRuleDescriptionText returns only fields that the rule-bundle
+// contract calls descriptions. Built-in scanners deliberately inspect every
+// agent-visible tool field, but a community rule scoped to "description" must
+// not turn metadata, titles, defaults, or extension values into description
+// matches. Input-schema description keywords remain part of this surface.
+func extractToolRuleDescriptionText(t ToolDef) string {
+	parts := make([]string, 0, 2)
+	if t.Description != "" {
+		parts = append(parts, t.Description)
+	}
+	if len(t.InputSchema) > 0 {
+		var schema any
+		if json.Unmarshal(t.InputSchema, &schema) == nil {
+			collectSchemaDescriptionFields(schema, &parts, 0)
+		}
+	}
+	return strings.Join(parts, ". ")
+}
+
+func collectSchemaDescriptionFields(value any, result *[]string, depth int) {
+	collectSchemaDescriptionFieldsMode(value, result, depth, false)
+}
+
+func collectSchemaDescriptionFieldsMode(value any, result *[]string, depth int, schemaMap bool) {
+	if depth > maxSchemaDepth {
+		return
+	}
+	if schemas, ok := value.([]any); ok {
+		for _, schema := range schemas {
+			collectSchemaDescriptionFieldsMode(schema, result, depth+1, false)
+		}
+		return
+	}
+	obj, ok := value.(map[string]any)
+	if !ok {
+		return
+	}
+	if schemaMap {
+		for _, schema := range obj {
+			collectSchemaDescriptionFieldsMode(schema, result, depth+1, false)
+		}
+		return
+	}
+	if description, ok := obj["description"]; ok {
+		collectStringLeaves(description, result, depth+1)
+	}
+
+	for key, child := range obj {
+		switch key {
+		case "description", "default", "const", "enum", "examples":
+			// The description value was collected above. The other fields carry
+			// example data, not nested schemas, even when their data contains a
+			// property that happens to be named description.
+			continue
+		case "properties", "patternProperties", "dependentSchemas", "dependencies", "$defs", "definitions":
+			collectSchemaDescriptionFieldsMode(child, result, depth+1, true)
+		case "additionalItems", "additionalProperties", "contains", "contentSchema", "else", "if", "items", "not", "propertyNames", "then", "unevaluatedItems", "unevaluatedProperties":
+			collectSchemaDescriptionFieldsMode(child, result, depth+1, false)
+		case "allOf", "anyOf", "oneOf", "prefixItems":
+			collectSchemaDescriptionFieldsMode(child, result, depth+1, false)
+		case "links":
+			collectHyperSchemaDescriptions(child, result, depth+1)
+		}
+	}
+}
+
+func collectHyperSchemaDescriptions(value any, result *[]string, depth int) {
+	if depth > maxSchemaDepth {
+		return
+	}
+	links, ok := value.([]any)
+	if !ok {
+		return
+	}
+	for _, value := range links {
+		link, ok := value.(map[string]any)
+		if !ok {
+			continue
+		}
+		collectStringLeaves(link["description"], result, depth+1)
+		for _, key := range []string{"headerSchema", "hrefSchema", "submissionSchema", "targetSchema"} {
+			collectSchemaDescriptionFieldsMode(link[key], result, depth+1, false)
+		}
+	}
+}
+
+// extractToolGeneralText returns every supported agent-visible tool field
+// except Description. The response-scanning path deliberately omits all tool
+// descriptions to preserve tools/list compatibility; this dedicated tool
+// scanner owns their checks and its action can warn without forwarding a
+// response-scanner block. Extension and schema key names are included because
+// clients can surface them to an agent as part of the tool definition. Keys are
+// scanned in their original form; they are not expanded into space-separated
+// words, because that is how an identifier becomes jailbreak prose.
+func extractToolGeneralText(t ToolDef) string {
+	var parts []string
+	// Dropping a truncated key set is only safe because
+	// toolDefinitionsHaveUninspectableText has already refused the definition
+	// by the time this runs. That pre-scan checks key-extraction truncation
+	// directly, through toolKeyExtractionTruncated, on every field this
+	// function reads. It has to: key extraction truncates on breadth as well as
+	// depth, and a string-extraction or schema-depth check cannot see a field
+	// that is shallow and merely enormous. If the pre-scan ever stops running
+	// first, or drops that check, this silent drop becomes a scan gap rather
+	// than a fail-closed one, and padding keys past the bound becomes a way to
+	// hide one.
+	appendJSONKeys := func(field json.RawMessage) {
+		if extracted := jsonrpc.ExtractKeysFromJSONResult(field); !extracted.Truncated {
+			for _, key := range extracted.Keys {
+				if !isIdentifierToken(key) {
+					parts = append(parts, key)
+				}
+			}
+		}
+	}
+	for _, field := range []string{t.Name, t.Title} {
+		if field != "" {
+			parts = append(parts, field)
+		}
+	}
+	// extractToolText already contributes every input-schema value. Keep its
+	// keys here, but do not make every downstream scanner process those values
+	// a second time. Output-schema values are unique to this extractor.
+	if len(t.InputSchema) > 0 {
+		appendJSONKeys(t.InputSchema)
+	}
+	if len(t.OutputSchema) > 0 {
+		parts = append(parts, ExtractSchemaDescriptions(t.OutputSchema)...)
+		appendJSONKeys(t.OutputSchema)
+	}
+	// Metadata is extensible and agent-visible. Its readable strings use the
+	// generic bounded extractor; actual opaque media is rejected before this
+	// function is called rather than skipped as though it were harmless.
+	for _, metadata := range []json.RawMessage{t.Annotations, t.Meta} {
+		if extracted := jsonrpc.ExtractStringsFromJSONResult(metadata); !extracted.Truncated {
+			parts = append(parts, extracted.Strings...)
+		}
+		appendJSONKeys(metadata)
+	}
+	unknownKeys := make([]string, 0, len(t.unknown))
+	for key := range t.unknown {
+		unknownKeys = append(unknownKeys, key)
+	}
+	sort.Strings(unknownKeys)
+	for _, key := range unknownKeys {
+		if !isIdentifierToken(key) {
+			parts = append(parts, key)
+		}
+		if extracted := jsonrpc.ExtractStringsFromJSONResult(t.unknown[key]); !extracted.Truncated {
+			parts = append(parts, extracted.Strings...)
+		}
+		appendJSONKeys(t.unknown[key])
+	}
+	return strings.Join(parts, ". ")
+}
+
+// extractToolDirectiveKeys returns agent-visible JSON keys whose identifier
+// spelling is itself a directive. Ordinary identifiers remain outside the
+// prose scanner, but directive-shaped keys must be checked across every schema
+// surface rather than only inputSchema properties.
+func extractToolDirectiveKeys(t ToolDef) []string {
+	var keys []string
+	appendDirectiveKeys := func(field json.RawMessage) {
+		if len(field) == 0 {
+			return
+		}
+		for _, key := range jsonrpc.ExtractKeysFromJSONResult(field).Keys {
+			expanded := normalize.ForToolText(expandParamName(key))
+			if directiveParamPattern.MatchString(expanded) {
+				keys = append(keys, key)
+			}
+		}
+	}
+	for _, field := range []json.RawMessage{t.InputSchema, t.OutputSchema, t.Annotations, t.Meta} {
+		appendDirectiveKeys(field)
+	}
+	for key, field := range t.unknown {
+		expanded := normalize.ForToolText(expandParamName(key))
+		if directiveParamPattern.MatchString(expanded) {
+			keys = append(keys, key)
+		}
+		appendDirectiveKeys(field)
+	}
+	return keys
+}
+
+// toolFieldContainsOpaqueMedia recognizes the MCP media encodings that cannot
+// be inspected as text. A plain extension field named "data" remains
+// inspectable and is scanned; it becomes opaque only when paired with an
+// explicit binary encoding, MIME type, or image/audio/video content type.
+// toolKeyExtractionTruncated reports whether key extraction for a field hit its
+// bound. Key extraction truncates on breadth as well as depth, so a field that
+// is shallow and merely enormous is invisible to the string-extraction and
+// schema-depth checks. Without this the keys past the bound are dropped and
+// never scanned, which turns padding into a way to hide a directive in a key.
+func toolKeyExtractionTruncated(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	return jsonrpc.ExtractKeysFromJSONResult(raw).Truncated
+}
+
+func toolFieldContainsOpaqueMedia(raw json.RawMessage) bool {
+	var parsed interface{}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return false
+	}
+	return valueContainsOpaqueToolMedia(parsed)
+}
+
+func valueContainsOpaqueToolMedia(value interface{}) bool {
+	switch v := value.(type) {
+	case []interface{}:
+		for _, child := range v {
+			if valueContainsOpaqueToolMedia(child) {
+				return true
+			}
+		}
+	case map[string]interface{}:
+		for key, child := range v {
+			if child == nil {
+				continue
+			}
+			switch strings.ToLower(key) {
+			// blob, raw and data are one class and are judged the same way: a
+			// key name alone does not make a value uninspectable. Treating
+			// blob/raw as unconditionally opaque refused an entire tools/list
+			// over an ordinary string that happened to sit under one of those
+			// names, which is a legitimate shape for a cursor or cache key.
+			// Opacity requires an explicit binary signal on the value itself.
+			case "blob", "raw", "data":
+				// The signal can sit beside the payload key or inside it.
+				// Checking only the outer map read
+				// {"data":"<base64>","encoding":"base64"} and missed
+				// {"raw":{"encoding":"base64","value":"<base64>"}}, whose
+				// inner map carries the signal but has no payload key of its
+				// own for the walk below to re-check. The nested form then
+				// reached the readable-text path as an ordinary string.
+				if toolMediaDataIsOpaque(v) {
+					return true
+				}
+				if valueContainsOpaqueMediaSignal(child) {
+					return true
+				}
+			}
+			if valueContainsOpaqueToolMedia(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// valueContainsOpaqueMediaSignal checks the entire value beneath a payload
+// key. MCP extension payloads may wrap encoded media in objects or arrays, so
+// limiting the signal check to the immediate child leaves deeper content
+// incorrectly classified as inspectable text.
+func valueContainsOpaqueMediaSignal(value interface{}) bool {
+	switch v := value.(type) {
+	case []interface{}:
+		for _, child := range v {
+			if valueContainsOpaqueMediaSignal(child) {
+				return true
+			}
+		}
+	case map[string]interface{}:
+		if toolMediaDataIsOpaque(v) {
+			return true
+		}
+		for _, child := range v {
+			if valueContainsOpaqueMediaSignal(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func toolMediaDataIsOpaque(fields map[string]interface{}) bool {
+	// The upstream server chooses the casing of its own JSON keys, and the
+	// container key is already matched case-insensitively, so looking these
+	// signals up by exact case let one capital letter decide whether the
+	// fail-closed path runs at all: `{"data":..., "Encoding":"base64"}` was
+	// treated as ordinary text while the same payload with `encoding` was
+	// refused. Normalize once, then read the signals from the normalized set.
+	// Every case variant is inspected rather than folded into one map entry.
+	// Collapsing them let a server send both "encoding":"text" and
+	// "Encoding":"base64" so that whichever survived decided the verdict, and
+	// because Go randomizes map iteration the same payload was refused on some
+	// runs and forwarded on others. A security decision that changes between
+	// identical runs cannot be reproduced or tested, so any opaque variant wins.
+	var mimeTypes []string
+	for key, value := range fields {
+		switch strings.ToLower(key) {
+		case "encoding":
+			if encoding, ok := value.(string); ok {
+				switch strings.ToLower(encoding) {
+				case "base64", "binary":
+					return true
+				}
+			}
+		case "type":
+			if kind, ok := value.(string); ok {
+				switch strings.ToLower(kind) {
+				case "image", "audio", "video", "blob":
+					return true
+				}
+			}
+		case "mimetype":
+			if mime, ok := value.(string); ok {
+				mimeTypes = append(mimeTypes, mime)
+			}
+		}
+	}
+	if len(mimeTypes) == 0 {
+		return false
+	}
+	for _, candidate := range mimeTypes {
+		if toolMimeTypeIsOpaque(candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+// toolMimeTypeIsOpaque reports whether a media type carries content this code
+// cannot inspect as text.
+func toolMimeTypeIsOpaque(mimeType string) bool {
+	mimeType = strings.ToLower(mimeType)
+	return !strings.HasPrefix(mimeType, "text/") &&
+		mimeType != "application/json" &&
+		!strings.HasSuffix(mimeType, "+json") &&
+		mimeType != "application/xml" &&
+		mimeType != "application/javascript"
+}
+
+// expandParamName expands a parameter name into space-separated words by:
+//  1. Replacing underscores and hyphens with spaces.
+//  2. Splitting camelCase boundaries (lowercase to uppercase transitions).
+//  3. Splitting acronym boundaries (uppercase run followed by uppercase+lowercase,
+//     e.g. "APIKey" becomes "api key", "SSHKey" becomes "ssh key").
+//  4. Lowercasing the result.
+//
+// Example: "contentFromReadingSshIdRsa" becomes "content from reading ssh id rsa".
+// Example: "fetchAPIKey" becomes "fetch api key".
+func expandParamName(name string) string {
+	var b strings.Builder
+	runes := []rune(name)
+	for i, r := range runes {
+		if r == '_' || r == '-' {
+			b.WriteRune(' ')
+			continue
+		}
+		if i > 0 && r >= 'A' && r <= 'Z' {
+			prev := runes[i-1]
+			// Split at lowercase to uppercase: fooBar -> foo Bar.
+			if prev >= 'a' && prev <= 'z' {
+				b.WriteRune(' ')
+			} else if prev >= 'A' && prev <= 'Z' {
+				// Split at acronym boundary: APIKey -> API Key.
+				// Only split when current uppercase is followed by lowercase,
+				// indicating the start of a new word after an acronym run.
+				if i+1 < len(runes) && runes[i+1] >= 'a' && runes[i+1] <= 'z' {
+					b.WriteRune(' ')
+				}
+			}
+		}
+		b.WriteRune(r)
+	}
+	return strings.ToLower(b.String())
+}
+
+// ExtractParamNames extracts all property key names from a JSON Schema.
+// Walks "properties" at all nesting levels (including allOf/oneOf/anyOf branches,
+// definitions, items, and additionalProperties). Returns sorted, deduplicated names.
+func ExtractParamNames(schema json.RawMessage) []string {
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(schema, &parsed); err != nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	collectParamNames(parsed, seen, 0)
+	names := make([]string, 0, len(seen))
+	for n := range seen {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// collectParamNames walks a JSON Schema tree collecting property key names.
+// Recurses into all nested objects/arrays to find properties at any depth.
+func collectParamNames(obj map[string]interface{}, seen map[string]bool, depth int) {
+	if depth > maxSchemaDepth {
+		return
+	}
+	// Collect property names from "properties" object.
+	if props, ok := obj["properties"].(map[string]interface{}); ok {
+		for key := range props {
+			seen[key] = true
+		}
+	}
+	// Recurse into all nested objects and arrays.
+	for _, v := range obj {
+		switch val := v.(type) {
+		case map[string]interface{}:
+			collectParamNames(val, seen, depth+1)
+		case []interface{}:
+			for _, item := range val {
+				if m, ok := item.(map[string]interface{}); ok {
+					collectParamNames(m, seen, depth+1)
+				}
+			}
+		}
+	}
+}
+
+// ExtractSchemaDescriptions recursively extracts text field values from a
+// JSON Schema. Collects all text-bearing fields from all nested objects:
+// description, title, default, const, pattern, $comment, x-* extensions,
+// plus string members of enum and examples arrays.
+// Falls back to extracting string schemas (non-object JSON values).
+func ExtractSchemaDescriptions(schema json.RawMessage) []string {
+	var parsed interface{}
+	if err := json.Unmarshal(schema, &parsed); err != nil {
+		return nil
+	}
+	var result []string
+	collectSchemaValueText(parsed, &result, 0)
+	return result
+}
+
+// collectSchemaValueText extracts agent-visible text from a schema value of any
+// JSON shape, not only an object.
+//
+// A well-formed MCP schema is an object, but nothing forces an upstream server
+// to send one and the agent reads whatever arrives. Parsing straight into a map
+// dropped every other shape: a top-level array carried its instructions past
+// the scanner entirely, leaving only the key names behind, and ScanTools then
+// marked the tools/list clean so the proxy skipped general response scanning
+// and forwarded it. Dispatch on the actual shape instead, so an unexpected one
+// is scanned rather than silently unread.
+func collectSchemaValueText(value interface{}, result *[]string, depth int) {
+	if depth > maxSchemaDepth {
+		return
+	}
+	switch v := value.(type) {
+	case map[string]interface{}:
+		collectAllSchemaText(v, result, depth)
+	case []interface{}:
+		for _, item := range v {
+			collectSchemaValueText(item, result, depth+1)
+		}
+	case string:
+		if v != "" {
+			*result = append(*result, v)
+		}
+	}
+}
+
+// schemaTextExtractionTruncated reports whether schema text lies beyond the
+// depth that ExtractSchemaDescriptions can inspect. It keeps the fail-closed
+// boundary aligned with the actual scanner instead of treating a deeper schema
+// as clean merely because the more general JSON extractor can traverse it.
+func schemaTextExtractionTruncated(schema json.RawMessage) bool {
+	var parsed interface{}
+	if err := json.Unmarshal(schema, &parsed); err != nil {
+		return false
+	}
+	return schemaValueDepthTruncated(parsed, 0)
+}
+
+func schemaValueDepthTruncated(value interface{}, depth int) bool {
+	if depth > maxSchemaDepth {
+		return true
+	}
+	switch v := value.(type) {
+	case map[string]interface{}:
+		for _, child := range v {
+			if schemaValueDepthTruncated(child, depth+1) {
+				return true
+			}
+		}
+	case []interface{}:
+		for _, child := range v {
+			if schemaValueDepthTruncated(child, depth+1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// maxSchemaDepth limits recursion depth for schema walking to prevent stack
+// overflow on maliciously deep schemas.
+const maxSchemaDepth = 20
+
+// schemaTextFields are JSON Schema fields whose string values should be
+// extracted for poisoning detection. CyberArk research showed attackers
+// embed malicious instructions in default, const, pattern, and $comment -
+// not just description/title.
+var schemaTextFields = [...]string{
+	"description", "title", "default", "const", "pattern", "$comment",
+}
+
+// collectAllSchemaText walks a JSON Schema tree collecting all text values
+// that an LLM might ingest. Extracts string values from metadata fields
+// (description, title, default, const, pattern, $comment, x-* extensions),
+// string members from enum/examples arrays, then recurses into all nested
+// objects and arrays to catch text hidden in composition keywords
+// (allOf, anyOf, oneOf, if/then/else, $defs, items, etc.).
+func collectAllSchemaText(obj map[string]interface{}, result *[]string, depth int) {
+	if depth > maxSchemaDepth {
+		return
+	}
+
+	for key, v := range obj {
+		handledSubtree := false
+
+		// Extract values from known metadata fields.
+		// default and const can hold objects/arrays with nested strings,
+		// so use collectStringLeaves for full subtree extraction.
+		for _, field := range schemaTextFields {
+			if key == field {
+				if key == "default" || key == "const" {
+					collectStringLeaves(v, result, depth+1)
+					handledSubtree = true
+				} else if s, ok := v.(string); ok && s != "" {
+					*result = append(*result, s)
+					// Consumed here. Without this the value is appended
+					// again by the string case in the walk below, which
+					// doubles the scanner input for every modelled field.
+					handledSubtree = true
+				}
+				break
+			}
+		}
+
+		// Extract all string leaves from vendor extension fields (x-*).
+		// Extensions can hold objects, arrays, or strings.
+		if strings.HasPrefix(key, "x-") || strings.HasPrefix(key, "X-") {
+			collectStringLeaves(v, result, depth+1)
+			handledSubtree = true
+		}
+
+		// Extract all string leaves from enum and examples.
+		// These can hold objects (e.g., examples: [{"prompt":"..."}]),
+		// not just flat strings.
+		if key == "enum" || key == "examples" {
+			collectStringLeaves(v, result, depth+1)
+			handledSubtree = true
+		}
+
+		if handledSubtree {
+			continue
+		}
+
+		// Recurse into nested objects and arrays for schema composition
+		// keywords (allOf, anyOf, oneOf, if/then/else, items, $defs, etc.),
+		// and take string values under keys this walk does not model.
+		//
+		// Only the modelled field names were being read here, so a string
+		// under any other key was dropped: a schema carrying
+		// "instructions":"Ignore all previous instructions" reached the agent
+		// having never been scanned, because the tools/list response is
+		// excluded from general response scanning once ScanTools calls it
+		// clean. The agent reads whatever the schema contains, so the walk
+		// takes every string it contains rather than only the ones named in
+		// the specification.
+		switch val := v.(type) {
+		case map[string]interface{}:
+			collectAllSchemaText(val, result, depth+1)
+		case []interface{}:
+			// Every element, not only the objects. A bare string sitting
+			// directly in a composition array is agent-visible text and was
+			// being dropped by an object-only walk.
+			for _, item := range val {
+				collectSchemaValueText(item, result, depth+1)
+			}
+		case string:
+			if isAgentReadableSchemaText(val) {
+				*result = append(*result, val)
+			}
+		}
+	}
+}
+
+// schemaTypeKeywords are the JSON Schema type names. A string equal to one of
+// them is structure rather than anything an agent acts on.
+var schemaTypeKeywords = map[string]bool{
+	"object": true, "array": true, "string": true,
+	"number": true, "integer": true, "boolean": true, "null": true,
+}
+
+// isAgentReadableSchemaText reports whether a string found under a schema key
+// this walk does not model is worth scanning.
+//
+// The test is on the VALUE, not the key. Skipping by key name would mean
+// "type": "Ignore all previous instructions" is never scanned, which is the
+// bypass this walk exists to close. Skipping the seven type keywords by value
+// costs an attacker nothing, because a payload that is exactly the word
+// "object" instructs no one, and it keeps every tools/list scan from carrying
+// the structural vocabulary of the schema.
+func isAgentReadableSchemaText(value string) bool {
+	return value != "" && !schemaTypeKeywords[value]
+}
+
+// collectStringLeaves recursively extracts all string values from an
+// arbitrary JSON value (string, object, or array). Used for schema fields
+// like default, const, enum, examples, and x-* extensions that can hold
+// nested structures containing poisoned text.
+func collectStringLeaves(v interface{}, result *[]string, depth int) {
+	if depth > maxSchemaDepth {
+		return
+	}
+	switch val := v.(type) {
+	case string:
+		if val != "" {
+			*result = append(*result, val)
+		}
+	case map[string]interface{}:
+		for _, child := range val {
+			collectStringLeaves(child, result, depth+1)
+		}
+	case []interface{}:
+		for _, child := range val {
+			collectStringLeaves(child, result, depth+1)
+		}
+	}
+}
+
+// tryParseToolsList attempts to parse a JSON-RPC result as a tools/list response.
+// Uses shape-based detection: result must have a "tools" array with named entries.
+// Returns nil if the shape doesn't match.
+// isToolsListResult returns true if the result JSON contains a "tools" key,
+// indicating this is a tools/list response. An empty tools array still counts
+// as a tools/list response - the response scanner must skip general injection
+// scanning regardless of whether there are tools to scan for poisoning.
+func isToolsListResult(result json.RawMessage) bool {
+	if len(result) == 0 || string(result) == jsonrpc.Null {
+		return false
+	}
+	var probe struct {
+		Tools json.RawMessage `json:"tools"`
+	}
+	if err := json.Unmarshal(result, &probe); err != nil {
+		return false
+	}
+	// json.RawMessage("null") is non-nil in Go - must check string value.
+	// Only treat as tools/list if tools is a JSON array (including empty []).
+	// A string or object in the tools field is malformed and must NOT suppress
+	// general response scanning - otherwise an attacker hides injection there.
+	trimmed := bytes.TrimSpace(probe.Tools)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return false
+	}
+	// Verify array elements are JSON objects. An array of strings like
+	// ["Ignore previous instructions"] would bypass general scanning
+	// since tryParseToolsList returns nil but IsToolsList would be true.
+	var elems []json.RawMessage
+	if err := json.Unmarshal(probe.Tools, &elems); err != nil {
+		return false
+	}
+	for _, elem := range elems {
+		e := bytes.TrimSpace(elem)
+		if len(e) == 0 || e[0] != '{' {
+			return false
+		}
+	}
+	return true
+}
+
+func tryParseToolsList(result json.RawMessage) []ToolDef {
+	tools, err := parseToolsList(result)
+	if err != nil {
+		return nil
+	}
+	return tools
+}
+
+func parseToolsList(result json.RawMessage) ([]ToolDef, error) {
+	if len(result) == 0 || string(result) == jsonrpc.Null {
+		return nil, nil
+	}
+
+	var tl toolsListResult
+	if err := json.Unmarshal(result, &tl); err != nil {
+		return nil, err
+	}
+
+	if len(tl.Tools) == 0 {
+		return nil, nil
+	}
+
+	for _, t := range tl.Tools {
+		if t.Name != "" {
+			continue
+		}
+		// A tools/list entry without its required name is not a tool that a
+		// conforming MCP client can safely use. Treating it as ignorable would
+		// also make the response-scanner carve-out an injection bypass: the
+		// malformed entry is still forwarded, but neither scanner sees it.
+		return nil, errors.New("tool definition is missing required name")
+	}
+
+	return tl.Tools, nil
+}
+
+// checkToolPoison runs tool-specific poisoning patterns against normalized text.
+func checkToolPoison(text string) []string {
+	var findings []string
+	for _, p := range toolPoisonPatterns {
+		// FindStringIndex on the remaining suffix has FindAll's non-overlap
+		// semantics without allocating an index slice for every match.
+		for offset := 0; offset < len(text); {
+			loc := p.re.FindStringIndex(text[offset:])
+			if loc == nil {
+				break
+			}
+			loc[0] += offset
+			loc[1] += offset
+			if p.name == "File Exfiltration Directive" && isNegatedFileExfiltration(text, loc) {
+				offset = loc[1]
+				continue
+			}
+			findings = append(findings, p.name)
+			break
+		}
+	}
+	return findings
+}
+
+var negatedFileExfiltrationPrefix = regexp.MustCompile(
+	`(?i)(?:\b(?:do|does|did|will|would|should|must|can|could)\s+not|\b(?:never|don't|doesn't|didn't|cannot|can't|won't))(?:\s+(?:read|send|include|exfiltrate|steal|access|retrieve|fetch|dump|upload|cat|prepend|append|add|attach|embed))?(?:\s+[\w'-]+){0,8}\s*$`,
+)
+
+var commaSeparatedFileExfilDirective = regexp.MustCompile(
+	`(?i),\s*(?:read|send|include|exfiltrate|steal|access|retrieve|fetch|dump|upload|cat|prepend|append|add|attach|embed)\b`,
+)
+
+// isNegatedFileExfiltration excludes a narrow false-positive shape: a tool
+// capability boundary such as "does not fetch files, inspect credentials".
+// The exfiltration pattern intentionally permits a short span between an
+// action and sensitive target to catch natural prose. That span must not turn
+// an immediate, uninterrupted negated action into a finding. A sentence or
+// contrast boundary keeps a later malicious instruction load-bearing.
+func isNegatedFileExfiltration(text string, loc []int) bool {
+	if len(loc) != 2 || loc[0] < 0 || loc[1] > len(text) {
+		return false
+	}
+
+	// The prefix matcher itself is capped at eight words. Bound the lookback
+	// too, so repeated short matches cannot turn clause discovery into a
+	// quadratic scan of an attacker-controlled description.
+	prefixStart := loc[0] - 1024
+	if prefixStart < 0 {
+		prefixStart = 0
+	}
+	for i := loc[0]; i > prefixStart; {
+		r, size := utf8.DecodeLastRuneInString(text[:i])
+		i -= size
+		if isClauseBoundary(r) {
+			prefixStart = i + size
+			break
+		}
+	}
+	prefix := strings.TrimSpace(text[prefixStart:loc[0]])
+	if !negatedFileExfiltrationPrefix.MatchString(prefix) {
+		return false
+	}
+
+	return !hasContrastBoundary(text[loc[0]:loc[1]])
+}
+
+func isClauseBoundary(r rune) bool {
+	switch r {
+	case '.', ';', ':', '!', '?', '\n', '\r', '\u2013', '\u2014':
+		return true
+	default:
+		return false
+	}
+}
+
+func hasContrastBoundary(text string) bool {
+	for _, r := range text {
+		if isClauseBoundary(r) {
+			return true
+		}
+	}
+	// A comma alone is common inside a benign capability statement. Treat it
+	// as a boundary only when it introduces a fresh exfiltration action, so a
+	// negated first match cannot swallow a later directive in the same regex
+	// span ("does not fetch credentials, upload credentials").
+	if commaSeparatedFileExfilDirective.MatchString(text) {
+		return true
+	}
+	words := strings.Fields(strings.ToLower(text))
+	for _, word := range words {
+		if strings.Trim(word, ",") == "but" || strings.Trim(word, ",") == "however" || strings.Trim(word, ",") == "instead" || strings.Trim(word, ",") == "then" {
+			return true
+		}
+	}
+	return false
+}
+
+// ScanTools scans a JSON-RPC 2.0 response for tool description poisoning.
+// Detects tools/list responses by shape, scans each tool's description for
+// injection patterns (general + tool-specific), and optionally tracks tool
+// definition hashes for rug pull (drift) detection.
+// Batch responses (JSON arrays) are detected and each element scanned individually.
+func ScanTools(line []byte, sc *scanner.Scanner, cfg *ToolScanConfig) ToolScanResult {
+	if cfg == nil {
+		return ToolScanResult{IsToolsList: false, Clean: true}
+	}
+
+	// Detect batch response (JSON-RPC 2.0 batch = JSON array).
+	// Trim so a leading-whitespace array is not treated as an unparseable
+	// single object, which would return Clean and skip per-element scanning.
+	if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 && trimmed[0] == '[' {
+		return scanToolsBatch(trimmed, sc, cfg)
+	}
+
+	return scanToolsSingle(line, sc, cfg)
+}
+
+// scanToolsSingle scans a single JSON-RPC 2.0 response for tool poisoning.
+func scanToolsSingle(line []byte, sc *scanner.Scanner, cfg *ToolScanConfig) ToolScanResult {
+	var rpc jsonrpc.RPCResponse
+	if err := json.Unmarshal(line, &rpc); err != nil {
+		return ToolScanResult{IsToolsList: false, Clean: true}
+	}
+
+	// Check if this is a tools/list response at all (even with empty tools array).
+	// This ensures the general response scanner skips tools/list responses
+	// regardless of whether there are tool definitions to scan for poisoning.
+	if !isToolsListResult(rpc.Result) {
+		return ToolScanResult{IsToolsList: false, Clean: true}
+	}
+
+	tools, err := parseToolsList(rpc.Result)
+	if err != nil {
+		// A malformed tool definition cannot be parsed into a complete
+		// inspectable inventory. Unknown extension fields are preserved and
+		// scanned by ToolDef.UnmarshalJSON, so they do not take this path.
+		return ToolScanResult{IsToolsList: true, Clean: false, ResourceLimit: "tool_definition_uninspectable", RPCID: rpc.ID}
+	}
+	if tools == nil {
+		// tools/list response with empty or all-unnamed tools - still a tools/list,
+		// just nothing to scan for poisoning.
+		return ToolScanResult{IsToolsList: true, Clean: true, RPCID: rpc.ID}
+	}
+
+	// Extract tool names for session binding.
+	names := make([]string, len(tools))
+	for i, t := range tools {
+		names[i] = t.Name
+	}
+
+	if toolDefinitionsHaveUninspectableText(tools) {
+		return ToolScanResult{IsToolsList: true, Clean: false, ResourceLimit: "tool_definition_uninspectable", RPCID: rpc.ID, ToolNames: names, ToolDefs: tools}
+	}
+	if resourceLimit := toolScanCapacityLimit(tools, names, cfg); resourceLimit != "" {
+		return ToolScanResult{IsToolsList: true, Clean: false, ResourceLimit: resourceLimit, RPCID: rpc.ID, ToolNames: names, ToolDefs: tools}
+	}
+
+	matches, observations, capacityExceeded, epochChanged := scanToolDefs(tools, sc, cfg)
+	if epochChanged {
+		return ToolScanResult{IsToolsList: true, Clean: false, ResourceLimit: "tool_definition_baseline_reset", RPCID: rpc.ID, ToolNames: names, ToolDefs: tools, Observations: observations}
+	}
+	if capacityExceeded {
+		return ToolScanResult{IsToolsList: true, Clean: false, ResourceLimit: "tool_definition_baseline_capacity", RPCID: rpc.ID, ToolNames: names, ToolDefs: tools, Observations: observations}
+	}
+
+	if len(matches) == 0 {
+		return ToolScanResult{IsToolsList: true, Clean: true, RPCID: rpc.ID, ToolNames: names, ToolDefs: tools, Observations: observations}
+	}
+
+	return ToolScanResult{IsToolsList: true, Clean: false, Matches: matches, Observations: observations, RPCID: rpc.ID, ToolNames: names, ToolDefs: tools}
+}
+
+// toolDefinitionsHaveUninspectableText rejects a definition whose structured
+// or extension fields exceed extraction bounds, or contain opaque media that
+// cannot be scanned as text. Unknown names alone are never uninspectable:
+// their readable values are scanned by extractToolGeneralText.
+// maxToolDefinitionTextBytes bounds the agent-visible text one tool definition
+// may contribute to the scan input. Sized far above any real definition: a tool
+// with a long description, a rich schema and populated metadata is orders of
+// magnitude below it, while a field built purely for size stops here. The depth
+// and key budgets do not cover this, because one string can be arbitrarily long
+// at depth one under a single key.
+const maxToolDefinitionTextBytes = 1 << 20 // 1MB per tool definition
+
+// toolDefinitionTextExceedsBudget reports whether the readable text of one tool
+// definition is too large to scan. It counts rather than concatenates, so
+// measuring the input does not itself allocate a copy of it.
+func toolDefinitionTextExceedsBudget(t ToolDef) bool {
+	total := len(t.Name) + len(t.Title) + len(t.Description)
+	if total > maxToolDefinitionTextBytes {
+		return true
+	}
+	for _, field := range []json.RawMessage{
+		t.InputSchema, t.OutputSchema, t.Annotations, t.Meta,
+	} {
+		if len(field) == 0 {
+			continue
+		}
+		total += len(field)
+		if total > maxToolDefinitionTextBytes {
+			return true
+		}
+	}
+	// The extension NAME is the map key, so it is not part of the value length.
+	// Names are scanned as agent-visible text, so a definition carrying a name
+	// of several megabytes and an empty value slipped the budget entirely and
+	// was forwarded after thirteen seconds of scanning.
+	for name, field := range t.unknown {
+		total += len(name) + len(field)
+		if total > maxToolDefinitionTextBytes {
+			return true
+		}
+	}
+	return false
+}
+
+func toolDefinitionsHaveUninspectableText(defs []ToolDef) bool {
+	for _, tool := range defs {
+		// Bound the total agent-visible text before any of it is scanned. The
+		// depth and key budgets do not constrain SIZE: one enormous string, or
+		// a wide array of strings, sits under both while still producing
+		// megabytes of input that every pattern then runs over. Measured on an
+		// 8MB single-string field: sixty-five seconds on the request path, and
+		// the definition was forwarded. Refusing here is fail-closed and keeps
+		// the bound local to tool scanning, so the shared extractor and its
+		// other consumers are unaffected.
+		if toolDefinitionTextExceedsBudget(tool) {
+			return true
+		}
+		for _, field := range []json.RawMessage{tool.InputSchema, tool.OutputSchema} {
+			// Schemas get the opaque-media check too, not just the depth check.
+			// A schema can carry a content block under default, const or
+			// examples, so a server that moved a binary payload out of _meta
+			// and into outputSchema would otherwise skip the refusal that the
+			// same payload triggers anywhere else.
+			if len(field) == 0 {
+				continue
+			}
+			if schemaTextExtractionTruncated(field) || toolKeyExtractionTruncated(field) ||
+				toolFieldContainsOpaqueMedia(field) {
+				return true
+			}
+		}
+		for _, field := range []json.RawMessage{tool.Annotations, tool.Meta} {
+			if len(field) == 0 {
+				continue
+			}
+			extracted := jsonrpc.ExtractStringsFromJSONResult(field)
+			if extracted.Truncated || toolKeyExtractionTruncated(field) ||
+				toolFieldContainsOpaqueMedia(field) {
+				return true
+			}
+		}
+		for _, field := range tool.unknown {
+			extracted := jsonrpc.ExtractStringsFromJSONResult(field)
+			if extracted.Truncated || toolKeyExtractionTruncated(field) ||
+				toolFieldContainsOpaqueMedia(field) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// scanToolsBatch scans a JSON-RPC 2.0 batch response for tool poisoning.
+// Each element is checked independently; results are aggregated.
+func scanToolsBatch(line []byte, sc *scanner.Scanner, cfg *ToolScanConfig) ToolScanResult {
+	var batch []json.RawMessage
+	if err := json.Unmarshal(line, &batch); err != nil {
+		return ToolScanResult{IsToolsList: false, Clean: true}
+	}
+
+	var allMatches []ToolScanMatch
+	var allObservations []ToolScanMatch
+	var allNames []string
+	var allDefs []ToolDef
+	resourceLimit := ""
+	var firstID json.RawMessage
+	isToolsList := false
+
+	for _, elem := range batch {
+		r := scanToolsSingle(elem, sc, cfg)
+		if r.IsToolsList {
+			isToolsList = true
+			if firstID == nil && len(r.RPCID) > 0 {
+				firstID = r.RPCID
+			}
+			allMatches = append(allMatches, r.Matches...)
+			allObservations = append(allObservations, r.Observations...)
+			allNames = append(allNames, r.ToolNames...)
+			allDefs = append(allDefs, r.ToolDefs...)
+			if resourceLimit == "" {
+				resourceLimit = r.ResourceLimit
+			}
+		}
+	}
+
+	if !isToolsList {
+		return ToolScanResult{IsToolsList: false, Clean: true}
+	}
+
+	if resourceLimit != "" {
+		return ToolScanResult{IsToolsList: true, Clean: false, ResourceLimit: resourceLimit, RPCID: firstID, ToolNames: allNames, ToolDefs: allDefs, Observations: allObservations}
+	}
+
+	if len(allMatches) == 0 {
+		return ToolScanResult{IsToolsList: true, Clean: true, RPCID: firstID, ToolNames: allNames, ToolDefs: allDefs, Observations: allObservations}
+	}
+
+	return ToolScanResult{IsToolsList: true, Clean: false, Matches: allMatches, Observations: allObservations, RPCID: firstID, ToolNames: allNames, ToolDefs: allDefs}
+}
+
+// scanToolDefs scans a slice of tool definitions for injection, poisoning, and drift.
+func toolScanCapacityLimit(defs []ToolDef, names []string, cfg *ToolScanConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	if cfg.Baseline != nil && !cfg.Baseline.CanAdmitKnownTools(names) {
+		return "tool_inventory_capacity"
+	}
+	if cfg.Baseline != nil && !cfg.Baseline.CanAdmitHeaderBindings(defs) {
+		return "tool_header_binding_capacity"
+	}
+	driftBaseline := cfg.DriftBaseline
+	if driftBaseline == nil {
+		driftBaseline = cfg.Baseline
+	}
+	if cfg.ExpectedDriftEpoch != nil && !driftBaseline.matchesDriftEpoch(*cfg.ExpectedDriftEpoch) {
+		return "tool_definition_baseline_reset"
+	}
+	if cfg.DetectDrift && driftBaseline != nil && !driftBaseline.CanTrackDefinitions(names) {
+		return "tool_definition_baseline_capacity"
+	}
+	return ""
+}
+
+func scanToolDefs(tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (matches, observations []ToolScanMatch, capacityExceeded, epochChanged bool) {
+	confusableNames := confusableToolNameCollisions(tools)
+
+	for _, tool := range tools {
+		var match ToolScanMatch
+		match.ToolName = tool.Name
+		hasFinding := false
+
+		if confusableNames[tool.Name] {
+			match.ToolPoison = append(match.ToolPoison, "Confusable Tool Name Collision")
+			hasFinding = true
+		}
+
+		// Extract param names once for both text scanning and drift tracking.
+		var paramNames []string
+		if len(tool.InputSchema) > 0 {
+			paramNames = ExtractParamNames(tool.InputSchema)
+		}
+		directiveKeys := extractToolDirectiveKeys(tool)
+
+		descriptionText := extractToolText(tool)
+		generalText := extractToolGeneralText(tool)
+		text := strings.Trim(strings.Join([]string{descriptionText, generalText}, ". "), ". ")
+
+		if text != "" {
+			// This is the dedicated tool scanner, whose action is independent of
+			// response scanning. The response path itself never scans tool
+			// descriptions, preserving the tools/list false-positive carve-out.
+			result := sc.ScanResponse(context.Background(), text)
+			if !result.Clean {
+				match.Injection = result.Matches
+				hasFinding = true
+			}
+
+			// Tool-specific poisoning patterns on normalized text.
+			// Normalization prevents zero-width char and confusable bypasses.
+			poison := checkToolPoison(normalize.ForToolText(text))
+			if len(poison) > 0 {
+				match.ToolPoison = append(match.ToolPoison, poison...)
+				hasFinding = true
+			}
+
+			// Exfiltration + context-leak param patterns: run per-param to avoid
+			// false positives from action words in the description pairing with
+			// sensitive targets in unrelated parameters. Each param is checked
+			// against both patterns; the first match per pattern is reported.
+			var exfilHit, contextHit bool
+			directiveHit := len(directiveKeys) > 0
+			if directiveHit {
+				match.ToolPoison = append(match.ToolPoison, "Directive Parameter Name")
+				hasFinding = true
+			}
+			for _, name := range paramNames {
+				if exfilHit && contextHit && directiveHit {
+					break
+				}
+				expanded := normalize.ForToolText(expandParamName(name))
+				if !directiveHit && directiveParamPattern.MatchString(expanded) {
+					match.ToolPoison = append(match.ToolPoison, "Directive Parameter Name")
+					hasFinding = true
+					directiveHit = true
+				}
+				if !exfilHit && exfilParamPattern.MatchString(expanded) {
+					match.ToolPoison = append(match.ToolPoison, "Exfiltration Parameter Name")
+					hasFinding = true
+					exfilHit = true
+				}
+				if !contextHit && !isOrdinaryContextLeakIdentifier(name) && contextLeakParamPattern.MatchString(expanded) {
+					match.ToolPoison = append(match.ToolPoison, "Context-Leak Parameter Name")
+					hasFinding = true
+					contextHit = true
+				}
+			}
+
+			// Community rule bundle extra-poison patterns.
+			if cfg != nil && len(cfg.ExtraPoison) > 0 {
+				normName := normalize.ForToolText(tool.Name)
+				normDesc := normalize.ForToolText(extractToolRuleDescriptionText(tool))
+				for _, ep := range cfg.ExtraPoison {
+					if ep == nil || ep.Re == nil || ep.Name == "" {
+						continue
+					}
+					var target string
+					switch ep.ScanField {
+					case "name":
+						target = normName
+					case "", "description":
+						target = normDesc
+					default:
+						continue
+					}
+					if ep.Re.MatchString(target) {
+						match.ToolPoison = append(match.ToolPoison, ep.Name)
+						hasFinding = true
+					}
+				}
+			}
+		}
+
+		// Drift detection (rug pull).
+		// Skip hash computation for unknown tools when at capacity to prevent
+		// CPU exhaustion from malicious servers sending unlimited unique names.
+		driftBaseline := cfg.DriftBaseline
+		if driftBaseline == nil {
+			driftBaseline = cfg.Baseline
+		}
+		if cfg.DetectDrift && driftBaseline != nil && driftBaseline.ShouldSkip(tool.Name) {
+			capacityExceeded = true
+			continue
+		}
+		if cfg.DetectDrift && driftBaseline != nil {
+			hash := hashTool(tool)
+			promoteNew := cfg.Action != "block" || !hasFinding
+			promoteChanged := cfg.Action != "block"
+			// Compare and promote atomically. A change is a lowered evidence
+			// bar, not a verdict: block on what it introduced, and accept a
+			// change that only adds descriptive text so a legitimate vendor
+			// update does not re-report forever.
+			eval := driftBaseline.EvaluateDefinition(DefinitionEvaluation{
+				Name:               tool.Name,
+				Hash:               hash,
+				Desc:               tool.Description,
+				Params:             paramNames,
+				Structural:         structuralDigest(tool),
+				ExpectedDriftEpoch: cfg.ExpectedDriftEpoch,
+				PromoteNew:         promoteNew,
+				PromoteChanged:     promoteChanged,
+				// hasFinding carries every earlier per-tool verdict in this
+				// loop: injection, poison, confusable name, exfil parameter.
+				PromoteAccepted: cfg.Action != "block" || !hasFinding,
+				Classify: func(prevDesc string, structuralChanged bool) []string {
+					return introducedDriftCues(prevDesc, tool.Description, structuralChanged)
+				},
+			})
+			if eval.EpochChanged {
+				return matches, observations, false, true
+			}
+			if eval.CapacityExceeded {
+				capacityExceeded = true
+				continue
+			}
+
+			if eval.Drifted {
+				match.PreviousHash = eval.PreviousHash
+				match.CurrentHash = hash
+				match.DriftDetail = eval.Detail
+
+				if len(eval.Cues) > 0 {
+					match.DriftDetected = true
+					match.DriftCues = eval.Cues
+					hasFinding = true
+				} else {
+					observations = append(observations, ToolScanMatch{
+						ToolName:      tool.Name,
+						DriftAccepted: true,
+						PreviousHash:  eval.PreviousHash,
+						CurrentHash:   hash,
+						DriftDetail:   eval.Detail,
+					})
+				}
+			}
+		}
+
+		if hasFinding {
+			matches = append(matches, match)
+		}
+	}
+
+	return matches, observations, capacityExceeded, false
+}
+
+func confusableToolNameCollisions(tools []ToolDef) map[string]bool {
+	byNormalized := make(map[string]string, len(tools))
+	collisions := make(map[string]bool)
+	for _, tool := range tools {
+		normalized := normalize.ForMatching(tool.Name)
+		if prev, ok := byNormalized[normalized]; ok {
+			if prev != tool.Name {
+				collisions[prev] = true
+				collisions[tool.Name] = true
+			}
+			continue
+		}
+		byNormalized[normalized] = tool.Name
+	}
+	return collisions
+}
+
+// LogToolFindings writes per-tool scan findings to the log writer.
+func LogToolFindings(logW io.Writer, lineNum int, result ToolScanResult) {
+	if result.ResourceLimit != "" {
+		_, _ = fmt.Fprintf(logW, "pipelock: line %d: tools/list cannot be safely inspected: %s\n", lineNum, result.ResourceLimit)
+	}
+	for _, m := range result.Matches {
+		var reasons []string
+		for _, inj := range m.Injection {
+			reasons = append(reasons, inj.PatternName)
+		}
+		reasons = append(reasons, m.ToolPoison...)
+		if m.DriftDetected {
+			reasons = append(reasons, "definition-drift")
+			if len(m.DriftCues) > 0 {
+				reasons = append(reasons, "introduced: "+strings.Join(m.DriftCues, "+"))
+			}
+		}
+		_, _ = fmt.Fprintf(logW, "pipelock: line %d: tool %q: %s\n",
+			lineNum, m.ToolName, strings.Join(reasons, ", "))
+		if m.DriftDetail != "" {
+			_, _ = fmt.Fprintf(logW, "  %s\n", m.DriftDetail)
+		}
+	}
+}
+
+// LogToolObservations writes non-blocking drift notices. Accepted drift is not
+// a finding, so it is reported separately from LogToolFindings and on every
+// tools/list, including a clean one.
+func LogToolObservations(logW io.Writer, lineNum int, result ToolScanResult) {
+	for _, o := range result.Observations {
+		if !o.DriftAccepted {
+			continue
+		}
+		_, _ = fmt.Fprintf(logW,
+			"pipelock: line %d: tool %q: definition-drift accepted, no risk cue introduced; new definition is now the baseline\n",
+			lineNum, o.ToolName)
+		if o.DriftDetail != "" {
+			_, _ = fmt.Fprintf(logW, "  %s\n", o.DriftDetail)
+		}
+	}
+}
