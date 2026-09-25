@@ -338,7 +338,7 @@ runs:
         fi
     - name: Upload audit report
       if: always()
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      uses: chainguard-actions/actions-upload-artifact@f9571ddcfab0329c68a1e92a4b612bee5d8e5042 # v7.0.1
       with:
         name: pipelock-audit-report
         path: ${{ runner.temp }}/pipelock-reports/
