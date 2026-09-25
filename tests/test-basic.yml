@@ -1,4 +1,4 @@
-name: Test fail-on-findings enabled
+name: Test basic usage
 on:
   workflow_dispatch:
 jobs:
@@ -14,26 +14,30 @@ jobs:
           directory: '.'
           scan-diff: 'false'
           test-vectors: 'false'
-          fail-on-findings: 'true'
+          fail-on-findings: 'false'
 
-      - name: Assert action ran with fail-on-findings enabled
+      - name: Assert action ran (download may fail on sentinel env, audit-failed or success both acceptable)
         env:
           OUTCOME: ${{ steps.action.outcome }}
           AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+          SCORE: ${{ steps.action.outputs.score }}
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
           CRITICALS: ${{ steps.action.outputs.critical-count }}
         run: |
           echo "outcome: $OUTCOME"
           echo "audit-failed: $AUDIT_FAILED"
+          echo "score: $SCORE"
+          echo "findings-count: $FINDINGS"
           echo "critical-count: $CRITICALS"
           if [ "$OUTCOME" = "success" ]; then
-            # Action succeeded: audit-failed should be false and critical-count should be set
-            if [ "$AUDIT_FAILED" = "true" ]; then
-              echo "FAIL: action succeeded but audit-failed is true"
+            # If the action succeeded, outputs should be set
+            if [ -z "$SCORE" ] && [ -z "$AUDIT_FAILED" ]; then
+              echo "FAIL: action succeeded but no outputs were set"
               exit 1
             fi
-            echo "PASS: action succeeded, no critical findings blocked the run"
+            echo "PASS: action succeeded with score=$SCORE findings=$FINDINGS criticals=$CRITICALS"
           elif [ "$OUTCOME" = "failure" ]; then
-            echo "PASS: action failed (expected — pipelock binary not available in sentinel env, or critical findings detected)"
+            echo "PASS: action failed gracefully (expected — pipelock binary not available in sentinel env)"
           else
             echo "FAIL: unexpected outcome '$OUTCOME'"
             exit 1

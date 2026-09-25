@@ -1,6 +1,6 @@
 <!-- markdownlint-disable -->
 
-# Hardening Report: luckyPipewrench--pipelock--/v3.0.0
+# Hardening Report: luckyPipewrench--pipelock/v3.0.0
 
 > This file was generated automatically by the hardening agent.
 
@@ -8,35 +8,27 @@
 
 **Test Policy SHA:** `843adf9e4b8f85d0c08b27b9d0b09dd094b54702`
 
-**Harden Agent Version:** `1`
+**Harden Agent Version:** `2`
 
-Action **luckyPipewrench--pipelock--/v3.0.0** was hardened automatically. 2 finding(s) were identified and resolved across 1 iteration(s).
+Action **luckyPipewrench--pipelock/v3.0.0** was hardened automatically. 1 finding(s) were identified and resolved across 1 iteration(s).
 
 ## Findings Fixed
 
-### broad-permissions (severity: medium)
-
-The workflow file .github/workflows/scorecard.yaml has a top-level 'permissions: read-all' which grants overly broad read access to all scopes. This should be replaced with specific minimal permissions.
-
-Locations:
-
-- `.github/workflows/scorecard.yaml:11`
-
 ### github-env-injection (severity: high)
 
-In action.yml, the 'Run audit' step writes the value of inputs.config (user-controlled) directly to $GITHUB_OUTPUT without sanitization: `echo "config_path=${CONFIG}" >> "$GITHUB_OUTPUT"`. The variable $CONFIG is set from $PIPELOCK_CONFIG which is ${{ inputs.config }}. An attacker can inject newlines into this value to poison subsequent GITHUB_OUTPUT entries. The fix is to sanitize with: safe=$(printf '%s' "$CONFIG" | tr -d '\n\r') before writing.
+In the 'Run audit' step, the shell variable CONFIG (derived from env var PIPELOCK_CONFIG, which is set from inputs.config — a user-controlled composite action input) is written directly to $GITHUB_OUTPUT without sanitization: `echo "config_path=${CONFIG}" >> "$GITHUB_OUTPUT"`. An attacker who controls the inputs.config value can inject newline characters to poison GITHUB_OUTPUT and set arbitrary output variables. The required sanitization step (`safe=$(printf '%s' "$CONFIG" | tr -d '\n\r')`) is missing before the write.
 
 Locations:
 
-- `action.yml:230`
+- `action.yml:228`
 
 ## Iteration Notes
 
 ### Iteration 1
 
-**Fixes applied:** broad-permissions, github-env-injection
+**Fixes applied:** github-env-injection
 
 **Notes:**
 
-1. scorecard.yaml: Replaced top-level 'permissions: read-all' with 'permissions: {}'. The job already has a specific permissions block (security-events: write, id-token: write) that grants only what's needed. 2. action.yml: In the 'Run audit' step, sanitized the user-controlled $CONFIG value before writing to $GITHUB_OUTPUT by using 'safe_config=$(printf '%s' "$CONFIG" | tr -d '\n\r')' and then writing 'config_path=${safe_config}' to prevent newline injection attacks.
+Fixed the github-env-injection finding in the 'Run audit' step of hardened/action/action.yml. The CONFIG variable (derived from user-controlled inputs.config via PIPELOCK_CONFIG env var) was being written directly to $GITHUB_OUTPUT without sanitization. Added `safe_config=$(printf '%s' "$CONFIG" | tr -d '\n\r')` before the write, and changed the echo to use `safe_config` instead of `CONFIG`. This strips any newline characters that could be used to inject additional key=value pairs into GITHUB_OUTPUT.
 
