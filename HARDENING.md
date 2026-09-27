@@ -10,25 +10,25 @@
 
 **Harden Agent Version:** `2`
 
-Action **luckyPipewrench--pipelock/v3.5.0** was hardened automatically. 2 finding(s) were identified and resolved across 2 iteration(s).
+Action **luckyPipewrench--pipelock/v3.5.0** was hardened automatically. 2 finding(s) were identified and resolved across 1 iteration(s).
 
 ## Findings Fixed
 
 ### github-env-injection (severity: high)
 
-In the 'Download Pipelock' step, the variable VERSION is derived from inputs.version (via env var PIPELOCK_VERSION, which is user-controlled) and written to $GITHUB_OUTPUT without sanitization: `echo "version=${VERSION}" >> "$GITHUB_OUTPUT"`. An attacker-supplied newline in inputs.version could inject arbitrary key=value pairs into GITHUB_OUTPUT, potentially overwriting other outputs or injecting environment variables consumed by downstream steps.
+In the 'Download Pipelock' step, two unsanitized values are written to special environment files without applying `printf '%s' ... | tr -d '\n\r'` sanitization: (1) `echo "$INSTALL_DIR" >> "$GITHUB_PATH"` — INSTALL_DIR is derived from `${RUNNER_TEMP:-/tmp}/pipelock-bin` where RUNNER_TEMP is an inherited process env var from the calling workflow (treated as untrusted in composite actions); (2) `echo "version=${VERSION}" >> "$GITHUB_OUTPUT"` — VERSION is derived from PIPELOCK_VERSION which is `${{ inputs.version }}` (user-controlled). A newline in either value could inject additional entries into GITHUB_PATH or GITHUB_OUTPUT.
 
 Locations:
 
-- `action.yml:148`
+- `action.yml:160`
 
 ### github-env-injection (severity: high)
 
-In the 'Run audit' step, the variable CONFIG is derived from inputs.config (via env var PIPELOCK_CONFIG, which is user-controlled) and written to $GITHUB_OUTPUT without sanitization: `echo "config_path=${CONFIG}" >> "$GITHUB_OUTPUT"`. An attacker-supplied newline in inputs.config could inject arbitrary key=value pairs into GITHUB_OUTPUT, potentially overwriting other outputs or injecting environment variables consumed by downstream steps.
+In the 'Run audit' step, `echo "config_path=${CONFIG}" >> "$GITHUB_OUTPUT"` writes an unsanitized user-controlled value to GITHUB_OUTPUT without applying `printf '%s' ... | tr -d '\n\r'` sanitization. CONFIG is derived from PIPELOCK_CONFIG which is set to `${{ inputs.config }}` (user-controlled input). A newline embedded in the config path input could inject additional key=value pairs into GITHUB_OUTPUT.
 
 Locations:
 
-- `action.yml:225`
+- `action.yml:231`
 
 ## Iteration Notes
 
@@ -39,14 +39,6 @@ Locations:
 **Notes:**
 
 Fixed two github-env-injection findings in hardened/action/action.yml:
-1. 'Download Pipelock' step (line ~148): Added `safe_version=$(printf '%s' "$VERSION" | tr -d '\n\r')` before writing to GITHUB_OUTPUT, replacing the direct `echo "version=${VERSION}"` with `echo "version=${safe_version}"`.
-2. 'Run audit' step (line ~225): Added `safe_config=$(printf '%s' "$CONFIG" | tr -d '\n\r')` before writing the user-provided config path to GITHUB_OUTPUT. Also sanitized the auto-generated suggested.yaml path for consistency using `safe_suggested=$(printf '%s' "${REPORT_DIR}/suggested.yaml" | tr -d '\n\r')`.
-
-### Iteration 2
-
-**Fixes applied:** script-injection, broad-permissions
-
-**Notes:**
-
-Fixed script injection in ci.yaml test-go125 and test-go126 jobs by moving all ${{ needs.*.result }} expressions out of run: blocks and into env: blocks, then referencing them as plain shell variables ($SECURITY_SCAN_RESULT, etc.). Fixed broad-permissions in scorecard.yaml by replacing top-level `permissions: read-all` with `permissions: contents: read`; the analysis job already had `id-token: write` at the job level for OIDC publishing.
+1. 'Download Pipelock' step (line ~160): Sanitized INSTALL_DIR before writing to GITHUB_PATH using `safe_install_dir=$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')`, and sanitized VERSION before writing to GITHUB_OUTPUT using `safe_version=$(printf '%s' "$VERSION" | tr -d '\n\r')`.
+2. 'Run audit' step (line ~231): Sanitized CONFIG before writing to GITHUB_OUTPUT using `safe_config=$(printf '%s' "$CONFIG" | tr -d '\n\r')`. The auto-generated config path (REPORT_DIR/suggested.yaml) is not user-controlled so it was left as-is.
 
