@@ -16,19 +16,19 @@ Action **luckyPipewrench--pipelock/v3.0.0** was hardened automatically. 2 findin
 
 ### github-env-injection (severity: high)
 
-In the 'Download Pipelock' step, the shell variable VERSION is derived from inputs.version (via the PIPELOCK_VERSION env var, which is set to ${{ inputs.version }}). It is written directly to $GITHUB_OUTPUT without the required sanitization step (printf '%s' "$VERSION" | tr -d '\n\r'): `echo "version=${VERSION}" >> "$GITHUB_OUTPUT"`. A caller supplying a version string containing newlines could inject arbitrary key=value pairs into GITHUB_OUTPUT, poisoning downstream step outputs.
+In the 'Download Pipelock' step, the user-controlled input `inputs.version` is mapped to the env var `PIPELOCK_VERSION` and then assigned to `VERSION` inside the run script. The value is written to `$GITHUB_OUTPUT` without the required sanitization step (`printf '%s' ... | tr -d '\n\r'`): `echo "version=${VERSION}" >> "$GITHUB_OUTPUT"`. An attacker supplying a version string containing newlines could inject arbitrary key=value pairs into GITHUB_OUTPUT, potentially overwriting subsequent step outputs.
 
 Locations:
 
-- `action.yml:148`
+- `action.yml:130`
 
 ### github-env-injection (severity: high)
 
-In the 'Run audit' step, the shell variable CONFIG is derived from inputs.config (via the PIPELOCK_CONFIG env var, which is set to ${{ inputs.config }}). It is written directly to $GITHUB_OUTPUT without the required sanitization step (printf '%s' "$CONFIG" | tr -d '\n\r'): `echo "config_path=${CONFIG}" >> "$GITHUB_OUTPUT"`. A caller supplying a config path containing newlines could inject arbitrary key=value pairs into GITHUB_OUTPUT, poisoning downstream step outputs.
+In the 'Run audit' step, the user-controlled input `inputs.config` is mapped to the env var `PIPELOCK_CONFIG` and then assigned to `CONFIG` inside the run script. The value is written to `$GITHUB_OUTPUT` without the required sanitization step (`printf '%s' ... | tr -d '\n\r'`): `echo "config_path=${CONFIG}" >> "$GITHUB_OUTPUT"`. An attacker supplying a config path containing newlines could inject arbitrary key=value pairs into GITHUB_OUTPUT.
 
 Locations:
 
-- `action.yml:231`
+- `action.yml:200`
 
 ## Iteration Notes
 
@@ -39,7 +39,7 @@ Locations:
 **Notes:**
 
 Fixed two github-env-injection findings in hardened/action/action.yml:
-1. Line ~148 ('Download Pipelock' step): Added `safe_version=$(printf '%s' "$VERSION" | tr -d '\n\r')` and changed the GITHUB_OUTPUT write to use `safe_version` instead of `VERSION`.
-2. Line ~231 ('Run audit' step): Added `safe_config=$(printf '%s' "$CONFIG" | tr -d '\n\r')` and changed the GITHUB_OUTPUT write to use `safe_config` instead of `CONFIG`.
-Both variables are derived from user-controlled inputs (inputs.version and inputs.config respectively), so stripping newlines prevents injection of arbitrary key=value pairs into GITHUB_OUTPUT.
+1. 'Download Pipelock' step (line ~130): Added `safe_version=$(printf '%s' "$VERSION" | tr -d '\n\r')` before writing to GITHUB_OUTPUT, replacing the raw `echo "version=${VERSION}"` with `echo "version=${safe_version}"`.
+2. 'Run audit' step (line ~200): Added `safe_config=$(printf '%s' "$CONFIG" | tr -d '\n\r')` before writing to GITHUB_OUTPUT, replacing the raw `echo "config_path=${CONFIG}"` with `echo "config_path=${safe_config}"`.
+Both user-controlled values are now stripped of newline characters before being written to $GITHUB_OUTPUT, preventing newline injection attacks.
 
