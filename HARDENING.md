@@ -10,25 +10,17 @@
 
 **Harden Agent Version:** `2`
 
-Action **luckyPipewrench--pipelock/v3.4.0** was hardened automatically. 2 finding(s) were identified and resolved across 1 iteration(s).
+Action **luckyPipewrench--pipelock/v3.4.0** was hardened automatically. 1 finding(s) were identified and resolved across 2 iteration(s).
 
 ## Findings Fixed
 
 ### github-env-injection (severity: high)
 
-In the 'Run audit' step, the variable CONFIG (derived from PIPELOCK_CONFIG, which is set from inputs.config) is written directly to $GITHUB_OUTPUT without sanitization: `echo "config_path=${CONFIG}" >> "$GITHUB_OUTPUT"`. An attacker-controlled value for inputs.config containing newline characters could inject arbitrary key=value pairs into GITHUB_OUTPUT, potentially overwriting other outputs. The required sanitization step (`safe=$(printf '%s' "$CONFIG" | tr -d '\n\r')`) is absent before this write.
+In the 'Run audit' step, the env var CONFIG is set from inputs.config (via PIPELOCK_CONFIG: ${{ inputs.config }}), which is user-controlled. The value is then written directly to $GITHUB_OUTPUT without sanitization: `echo "config_path=${CONFIG}" >> "$GITHUB_OUTPUT"`. An attacker can inject newlines into the inputs.config value to poison subsequent GITHUB_OUTPUT entries. The required sanitization step (`safe=$(printf '%s' "$CONFIG" | tr -d '\n\r')`) is missing before the write.
 
 Locations:
 
 - `action.yml:196`
-
-### github-env-injection (severity: high)
-
-In the 'Download Pipelock' step, the variable VERSION (derived from PIPELOCK_VERSION, which is set from inputs.version) is written to $GITHUB_OUTPUT without sanitization: `echo "version=${VERSION}" >> "$GITHUB_OUTPUT"`. When inputs.version is not 'latest', VERSION is taken directly from the user-supplied input (only stripped of a leading 'v' via parameter expansion). A value containing newline characters could inject arbitrary key=value pairs into GITHUB_OUTPUT. The required sanitization step (`safe=$(printf '%s' "$VERSION" | tr -d '\n\r')`) is absent before this write.
-
-Locations:
-
-- `action.yml:131`
 
 ## Iteration Notes
 
@@ -38,8 +30,13 @@ Locations:
 
 **Notes:**
 
-Fixed two github-env-injection findings in hardened/action/action.yml:
-1. 'Download Pipelock' step (line 131): Added `safe_version=$(printf '%s' "$VERSION" | tr -d '\n\r')` before writing to GITHUB_OUTPUT, replacing the direct `echo "version=${VERSION}"` with `echo "version=${safe_version}"`.
-2. 'Run audit' step (line 196): Added `safe_config=$(printf '%s' "$CONFIG" | tr -d '\n\r')` before writing to GITHUB_OUTPUT, replacing the direct `echo "config_path=${CONFIG}"` with `echo "config_path=${safe_config}"`.
-Both fixes strip newline and carriage return characters from user-controlled input values before writing them to GITHUB_OUTPUT, preventing newline injection attacks that could allow an attacker to inject arbitrary key=value pairs into the output.
+Fixed the github-env-injection finding in the 'Run audit' step of action.yml. The user-controlled CONFIG variable (from inputs.config via PIPELOCK_CONFIG env var) was being written directly to $GITHUB_OUTPUT without sanitization. Added `safe_config=$(printf '%s' "$CONFIG" | tr -d '\n\r')` before the write, and changed the echo to use `safe_config` instead of `CONFIG`. This strips all newline and carriage return characters from the user-controlled value, preventing newline injection attacks that could poison subsequent GITHUB_OUTPUT entries.
+
+### Iteration 2
+
+**Fixes applied:** github-env-injection
+
+**Notes:**
+
+Fixed the github-env-injection finding in the 'Download Pipelock' step of hardened/action/action.yml. Added sanitization before writing the version output to GITHUB_OUTPUT: replaced `echo "version=${VERSION}" >> "$GITHUB_OUTPUT"` with `safe_version=$(printf '%s' "$VERSION" | tr -d '\n\r'); echo "version=${safe_version}" >> "$GITHUB_OUTPUT"`. This prevents a crafted version string containing newline characters from injecting additional key=value pairs into GITHUB_OUTPUT. The fix is consistent with the existing sanitization pattern already used for the config_path output in the same file.
 
