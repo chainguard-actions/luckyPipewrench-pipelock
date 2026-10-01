@@ -182,8 +182,7 @@ runs:
 
         tar -xzf "${INSTALL_DIR}/pipelock.tar.gz" -C "$INSTALL_DIR" pipelock
         chmod +x "${INSTALL_DIR}/pipelock"
-        safe_install_dir=$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')
-        echo "$safe_install_dir" >> "$GITHUB_PATH"
+        echo "$INSTALL_DIR" >> "$GITHUB_PATH"
         safe_version=$(printf '%s' "$VERSION" | tr -d '\n\r')
         echo "version=${safe_version}" >> "$GITHUB_OUTPUT"
     - name: Verify binary
