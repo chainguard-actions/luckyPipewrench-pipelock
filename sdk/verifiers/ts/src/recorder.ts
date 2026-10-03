@@ -1,0 +1,211 @@
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Apache-2.0
+
+import type { Receipt, RecorderEntry } from "./types.js";
+import { validateV1Receipt } from "./strict.js";
+import { validateTimestamp } from "./aarp/numbers.js";
+import { parseJSONStrict, RawNumber } from "./aarp/strictjson.js";
+import { bindRecorderLineExtSource, objectMemberSpan } from "./rawjson.js";
+import { validateSecretEgressSource } from "./secret-egress.js";
+import { readSessionReceipts, withPinnedEvidenceDirectorySync } from "./chain-set.js";
+import type { RecorderLine } from "./recorder-chain.js";
+import {
+  InvalidError,
+  RuntimeError,
+  decodeUTF8,
+  parseJSON,
+  readVerifierBytes,
+  rejectDuplicateKeys,
+} from "./util.js";
+
+const actionReceiptType = "action_receipt";
+const evidenceReceiptType = "evidence_receipt";
+
+// Receipt-chain mode: the known non-receipt operational entry types that
+// extraction legitimately skips. Any entry whose type is outside the union of
+// the receipt types and this set is REJECTED (fail-closed) rather than silently
+// skipped, so a file mixing a valid chain with an unknown record type cannot be
+// reported as a valid receipt subsequence.
+const skippableEntryTypes = new Set([
+  "checkpoint",
+  "transcript_root",
+  "decision",
+  "capture",
+  "capture_drop",
+]);
+
+export function readEntries(file: string): RecorderEntry[] {
+  return readEntryLines(file).map((l) => l.entry);
+}
+
+// ParsedRecorderLine is one validated entry with its trimmed source line,
+// which the recorder hash chain check needs byte for byte.
+export interface ParsedRecorderLine extends RecorderLine {
+  entry: RecorderEntry;
+}
+
+export function readEntryLines(file: string, directoryChild = false): ParsedRecorderLine[] {
+  const text = decodeUTF8(readVerifierBytes(file, directoryChild), "evidence jsonl");
+  const entries: ParsedRecorderLine[] = [];
+  const lines = text.split(/\r?\n/u);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]?.trim() ?? "";
+    if (line === "") continue;
+    const entry = parseJSON<RecorderEntry>(line, `line ${i + 1}`);
+    if (entry.v !== 1 && entry.v !== 2 && entry.v !== 3) {
+      throw new RuntimeError(
+        `line ${i + 1}: unsupported entry version ${String(entry.v)} (accepted: 1, 2, 3)`,
+      );
+    }
+    if (entry.v === 3) {
+      entry.seq = validateV3Sequence(line, i + 1);
+    } else {
+      rejectDuplicateKeys(line);
+    }
+    validateProjectedStrings(entry, i + 1, entry.v);
+    bindRecorderLineExtSource(entry.detail, line);
+    if (entry.type === evidenceReceiptType) {
+      const detailSpan = objectMemberSpan(line, 0, "detail");
+      if (detailSpan !== undefined)
+        validateSecretEgressSource(entry.detail, line, detailSpan.start);
+    }
+    if (
+      entry.v !== 3 &&
+      (legacyNamespaceFieldIsSet(entry.chain_kind) ||
+        legacyNamespaceFieldIsSet(entry.writer_instance_id))
+    ) {
+      throw new RuntimeError(
+        `line ${i + 1}: legacy entry cannot carry v3 recorder namespace fields`,
+      );
+    }
+    entries.push({ entry, line });
+  }
+  return entries;
+}
+
+function validateV3Sequence(rawLine: string, line: number): string {
+  const raw = parseJSONStrict(rawLine) as Record<string, unknown>;
+  const seq = raw.seq;
+  if (!(seq instanceof RawNumber) || !/^(?:0|[1-9][0-9]*)$/u.test(seq.literal)) {
+    throw new RuntimeError(`line ${line}: v3 seq must be an unsigned 64-bit integer`);
+  }
+  if (BigInt(seq.literal) > 18446744073709551615n) {
+    throw new RuntimeError(`line ${line}: v3 seq must be an unsigned 64-bit integer`);
+  }
+  return seq.literal;
+}
+
+function validateProjectedStrings(entry: RecorderEntry, line: number, version: number): void {
+  const fields: (keyof RecorderEntry)[] = [
+    "ts",
+    "session_id",
+    "trace_id",
+    "type",
+    "event_kind",
+    "transport",
+    "summary",
+    "raw_ref",
+    "prev_hash",
+  ];
+  if (version === 3) fields.push("chain_kind", "writer_instance_id");
+  for (const field of fields) {
+    const value = entry[field];
+    if (value !== undefined && typeof value !== "string") {
+      if (version !== 3) continue;
+      throw new RuntimeError(`line ${line}: v3 ${field} must be a string`);
+    }
+    const required =
+      version === 3 &&
+      [
+        "ts",
+        "session_id",
+        "chain_kind",
+        "writer_instance_id",
+        "type",
+        "transport",
+        "summary",
+        "prev_hash",
+      ].includes(field);
+    const namespaceRequired = field === "chain_kind" || field === "writer_instance_id";
+    if ((required && value === undefined) || (version === 3 && namespaceRequired && value === "")) {
+      throw new RuntimeError(`line ${line}: v3 ${field} required`);
+    }
+    if (typeof value === "string" && value.includes("\0")) {
+      throw new RuntimeError(`line ${line}: v${version} ${field} cannot contain NUL`);
+    }
+    if (version === 3 && field === "ts" && typeof value === "string") {
+      try {
+        validateTimestamp(value);
+      } catch (err) {
+        throw new RuntimeError(`line ${line}: recorder ts ${(err as Error).message}`);
+      }
+    }
+  }
+}
+
+function legacyNamespaceFieldIsSet(value: unknown): boolean {
+  return value !== undefined && value !== null && value !== "";
+}
+
+export interface ExtractedReceipts {
+  action: Receipt[];
+  evidence: Receipt[];
+}
+
+export function extractTypedReceipts(file: string): ExtractedReceipts {
+  return extractTypedFromEntries(readEntries(file));
+}
+
+// extractTypedFromEntries splits already-read recorder entries into the two
+// receipt chains, refusing any entry type it does not know.
+export function extractTypedFromEntries(entries: readonly RecorderEntry[]): ExtractedReceipts {
+  const extracted: ExtractedReceipts = { action: [], evidence: [] };
+  for (const entry of entries) {
+    const isReceipt = entry.type === actionReceiptType || entry.type === evidenceReceiptType;
+    if (!isReceipt) {
+      if (entry.type !== undefined && skippableEntryTypes.has(entry.type)) continue;
+      throw new InvalidError(
+        `unexpected recorder entry type "${String(entry.type)}" at seq ${String(entry.seq)}`,
+      );
+    }
+    if (typeof entry.detail !== "object" || entry.detail === null) {
+      throw new RuntimeError(`entry seq ${String(entry.seq)}: receipt detail is not an object`);
+    }
+    // EV2-FU-1: an extracted v1 action receipt must satisfy the strict
+    // unknown-field contract (evidence_receipt v2 has its own schema).
+    if (entry.type === actionReceiptType) {
+      try {
+        validateV1Receipt(entry.detail);
+      } catch (err) {
+        throw new InvalidError(`entry seq ${String(entry.seq)}: ${(err as Error).message}`);
+      }
+      extracted.action.push(entry.detail as Receipt);
+    } else {
+      extracted.evidence.push(entry.detail as Receipt);
+    }
+  }
+  return extracted;
+}
+
+// selectReceiptChain mirrors the Go reference receipt-chain mode, which
+// verifies the action_receipt subsequence and skips evidence_receipt entries.
+// A default Pipelock run interleaves both types in one file, each on its own
+// chain. A file that carries only evidence_receipt entries is verified as an
+// evidence_receipt_v2 chain.
+export function selectReceiptChain(extracted: ExtractedReceipts): Receipt[] {
+  return extracted.action.length > 0 ? extracted.action : extracted.evidence;
+}
+
+export function extractReceipts(file: string): Receipt[] {
+  return selectReceiptChain(extractTypedReceipts(file));
+}
+
+// extractReceiptsFromSessionDir returns one session's selected receipt chain.
+// Membership is Go's parsed-equality rule (evidencename.Parse), shared with the
+// chain-set reader: for session "s", "evidence-s-evil-0.jsonl" belongs to
+// session "s-evil" and is not read, although it starts with "evidence-s-".
+export function extractReceiptsFromSessionDir(dir: string, sessionId: string): Receipt[] {
+  return withPinnedEvidenceDirectorySync(dir, () =>
+    selectReceiptChain(readSessionReceipts(".", sessionId)),
+  );
+}

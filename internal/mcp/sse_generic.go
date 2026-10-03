@@ -1,0 +1,859 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package mcp
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/transport"
+	"github.com/luckyPipewrench/pipelock/internal/normalize"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+)
+
+// ErrSSEStreamFinding is returned by ScanGenericSSEStream when scanning
+// detects a DLP or injection finding inside a generic SSE event payload.
+// Callers distinguish findings from IO errors via errors.Is so warn-mode
+// behavior can mirror the A2A path (log only) while block-mode terminates
+// with a receipt.
+var ErrSSEStreamFinding = errors.New("sse stream finding")
+
+// ErrSSEStreamScanError reports that an SSE response could not be completely
+// scanned. It is distinct from ErrSSEStreamFinding so callers never turn a
+// scanner failure into a prompt-injection finding or warn-mode pass-through.
+var ErrSSEStreamScanError = errors.New("sse stream scan error")
+
+// ErrSSEEventTooLarge is wrapped inside ErrSSEStreamFinding when a single
+// event's joined data: payload exceeds cfg.MaxEventBytes. The check
+// measures the data-payload bytes returned by transport.SSEReader, NOT
+// the full wire size of the re-emitted event (event:/id:/retry: metadata
+// is added by writeSSEEvent on top). Operators sizing the ceiling
+// against expected payload - token deltas, JSON chunks - get the
+// behavior they want; sizing it against total wire bytes will see
+// metadata overhead on top.
+var ErrSSEEventTooLarge = errors.New("sse event exceeds max_event_bytes")
+
+// ErrSSEInvalidUTF8 is wrapped inside ErrSSEStreamFinding when an event's
+// data: payload or metadata contains bytes that are not valid UTF-8. The SSE wire
+// format is defined as UTF-8 by WHATWG, and Go's `string(b)` conversion
+// silently replaces invalid sequences with U+FFFD, which would create a
+// parser-differential between what the scanner regexes inspect and what
+// the client actually receives. Failing closed on invalid UTF-8 closes
+// that evasion vector.
+var ErrSSEInvalidUTF8 = errors.New("sse event contains invalid UTF-8")
+
+// DefaultGenericSSEMaxEventBytes caps per-event scanning to 64 KB. LLM
+// streaming events are typically a few hundred bytes; 64 KB carries
+// about 16k tokens, far above any realistic single-event payload. The
+// limit measures the data-payload only (see ErrSSEEventTooLarge); the
+// metadata fields (event:, id:, retry:) are negligible in practice.
+const DefaultGenericSSEMaxEventBytes = 64 * 1024
+
+// passthroughChunkSize is the buffer size used when scanning is disabled
+// and the function falls through to flushing pass-through. Small enough
+// to keep latency low, large enough to avoid syscall pressure.
+const passthroughChunkSize = 4096
+
+// GenericSSEScanOptions carries transport-level policy context for generic
+// SSE scanning. It lets proxy transports preserve the existing response
+// scanning contract for exempt domains and suppress rules without coupling
+// this package to proxy logging or receipt emission.
+type GenericSSEScanOptions struct {
+	// Target is the URL/path used to evaluate suppress rules.
+	Target string
+	// Suppress contains global suppress rules from pipelock.yaml.
+	Suppress []config.SuppressEntry
+	// ResponseScanExempt means prompt-injection findings should be treated
+	// as visibility-only for this target. DLP findings still apply.
+	ResponseScanExempt bool
+	// OnFinding is called for warn-mode findings that are forwarded rather
+	// than returned. It must be safe to call inline from the stream loop.
+	OnFinding func(error)
+	// OnDroppedDLP receives DLP matches removed by a scoped suppression. It is
+	// observational only and must not alter stream control flow.
+	OnDroppedDLP func(scanner.TextDLPMatch, string)
+	// OnObservedCoreResponse receives core-floor findings a declared operator
+	// exception downgraded from block to observe. Observational only; without
+	// it a streamed floor finding could be withheld from blocking and never
+	// recorded.
+	OnObservedCoreResponse func(scanner.ObservedCoreMatch)
+}
+
+// ScanGenericSSEStream handles non-A2A text/event-stream responses with
+// per-event DLP and injection scanning, plus a rolling-tail scan across
+// adjacent events. Used for OpenAI, Anthropic, OpenAI-compatible gateways, and any
+// other LLM SSE traffic the proxy intercepts.
+//
+// Contract:
+//   - Caller copies response headers to w BEFORE calling this function.
+//   - Caller has already verified the response is NOT compressed.
+//   - Clean events are flushed immediately when flusher is non-nil.
+//   - Block-mode detection returns an error wrapping ErrSSEStreamFinding;
+//     caller closes the connection.
+//   - Warn-mode detection calls opts.OnFinding and keeps forwarding.
+//   - IO errors return the underlying error wrapped with "sse stream read:".
+//     Incomplete response scans wrap ErrSSEStreamScanError. Both close the
+//     connection without treating the failure as a content finding.
+//   - End of stream returns nil.
+//
+// When cfg is nil or cfg.Enabled is false the function falls through to
+// flushing pass-through so the disabled mode preserves token-by-token UX
+// instead of silently buffering a streaming protocol it recognizes.
+//
+// The scanner intentionally does NOT field-walk JSON (that's the A2A
+// scanner's job). Generic SSE data: payloads can be non-JSON: OpenAI
+// emits "[DONE]" as a literal sentinel and some providers send raw text
+// deltas. Treating the joined data: payload as text is the lowest-common
+// denominator that catches DLP and injection patterns across providers,
+// including payloads split across sequential token events.
+func ScanGenericSSEStream(
+	ctx context.Context,
+	body io.Reader,
+	w io.Writer,
+	flusher http.Flusher,
+	sc *scanner.Scanner,
+	cfg *config.GenericSSEScanning,
+) error {
+	return ScanGenericSSEStreamWithOptions(ctx, body, w, flusher, sc, cfg, GenericSSEScanOptions{})
+}
+
+// ScanGenericSSEStreamWithOptions is ScanGenericSSEStream with transport-level
+// policy context for suppress rules, response-scan exemptions, and warn-mode
+// finding callbacks.
+func ScanGenericSSEStreamWithOptions(
+	ctx context.Context,
+	body io.Reader,
+	w io.Writer,
+	flusher http.Flusher,
+	sc *scanner.Scanner,
+	cfg *config.GenericSSEScanning,
+	opts GenericSSEScanOptions,
+) error {
+	if cfg == nil || !cfg.Enabled {
+		return passthroughSSE(ctx, body, w, flusher)
+	}
+
+	maxEventBytes := cfg.MaxEventBytes
+	if maxEventBytes <= 0 {
+		maxEventBytes = DefaultGenericSSEMaxEventBytes
+	}
+
+	reader := transport.NewSSEReader(body)
+	var tail string
+	var injectionTail string
+	var payloadTail string
+	var payloadInjectionTail string
+	// Stream-scoped on purpose. injectionTail carries bytes from one event into
+	// the next event's scan, so a finding in event N is presented again by
+	// event N+1's rolling scan. A per-event recorder starts with an empty seen
+	// map and reports that second sighting as a new observation, which is the
+	// duplicate this recorder exists to stop.
+	observedCore := newSSEObservedCoreRecorder(opts)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		event, err := reader.ReadMessage()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("sse stream read: %w", err)
+		}
+
+		if len(event) > maxEventBytes {
+			findingErr := fmt.Errorf("%w: %w (size=%d, limit=%d)",
+				ErrSSEStreamFinding, ErrSSEEventTooLarge, len(event), maxEventBytes)
+			if cfg.Action == config.ActionWarn {
+				// Warn-mode parity with injection + DLP: surface the finding
+				// to the caller via OnFinding, drop this oversize event so
+				// unscanned bytes never reach the client, and keep streaming
+				// subsequent events. Block mode terminates the stream.
+				if opts.OnFinding != nil {
+					opts.OnFinding(findingErr)
+				}
+				continue
+			}
+			return findingErr
+		}
+
+		droppedDLP := newSSEDLPDropRecorder(opts)
+		// SSE is UTF-8 per WHATWG. Invalid UTF-8 in the event, including
+		// metadata, must not reach the client through the re-emitted fields.
+		// It would be silently mapped to U+FFFD by Go's string(...) view
+		// while the original bytes still get re-emitted to the client,
+		// creating a parser-differential where the scanner regexes
+		// inspect different bytes than the client receives. Fail
+		// closed in scan-enabled mode (matching the oversize-event
+		// pattern: warn-mode drops the event and continues, block
+		// mode terminates the stream). Passthrough mode (cfg disabled
+		// or nil) does not enter this branch and forwards bytes
+		// verbatim, which is the correct behavior for opt-out.
+		if !utf8.Valid(event) || !utf8.ValidString(canonicalSSEEventText(event, reader)) {
+			findingErr := fmt.Errorf("%w: %w", ErrSSEStreamFinding, ErrSSEInvalidUTF8)
+			if cfg.Action == config.ActionWarn {
+				if opts.OnFinding != nil {
+					opts.OnFinding(findingErr)
+				}
+				reader.ClearInvalidLastEventID()
+				continue
+			}
+			return findingErr
+		}
+
+		// canonicalSSEEventText includes event:/id:/retry: metadata
+		// alongside the data: payload so scanning sees the full event
+		// the client would observe. Without this, DLP content or
+		// prompt-injection content placed in the metadata fields
+		// rides through unscanned (external review finding #2).
+		text := canonicalSSEEventText(event, reader)
+		rollingText := sseRollingEventText(text, "")
+		rollingInjectionText := sseRollingEventText(text, " ")
+		// The rolling view leaves the id out so a persisted id cannot split
+		// an event/data value; this view joins the id to the data instead.
+		idDataText := sseIDDataEventText(text, "")
+		idDataInjectionText := sseIDDataEventText(text, " ")
+		payloadText := string(event)
+
+		clearDLPTailAfterCurrent := false
+		clearInjectionTailAfterCurrent := false
+		skipTailInjection := false
+		skipTailDLP := false
+		injectResult := sc.ScanResponseWithSuppress(ctx, text, opts.Target, opts.Suppress)
+		observedCore.record(injectResult)
+		if injectResult.Failed() {
+			return fmt.Errorf("%w: response scan incomplete: %s", ErrSSEStreamScanError, injectResult.ScanError)
+		}
+		for _, view := range []string{rollingInjectionText, idDataInjectionText} {
+			if !injectResult.Clean || view == "" {
+				continue
+			}
+			injectResult = sc.ScanResponseWithSuppress(ctx, view, opts.Target, opts.Suppress)
+			observedCore.record(injectResult)
+			if injectResult.Failed() {
+				return fmt.Errorf("%w: response scan incomplete: %s", ErrSSEStreamScanError, injectResult.ScanError)
+			}
+		}
+		if !injectResult.Clean {
+			findingErr := fmt.Errorf("%w: injection: %s",
+				ErrSSEStreamFinding, sseInjectionNames(injectResult.Matches))
+			if opts.ResponseScanExempt || cfg.Action == config.ActionWarn {
+				if opts.OnFinding != nil {
+					opts.OnFinding(findingErr)
+				}
+				clearInjectionTailAfterCurrent = true
+				skipTailInjection = true
+			} else {
+				return findingErr
+			}
+		}
+
+		dlpResult, droppedMatches := keepUnsuppressedDLP(sc.ScanTextForDLP(ctx, text), opts.Target, opts.Suppress)
+		if err := checkSSEDLPContext(ctx); err != nil {
+			return err
+		}
+		droppedDLP.record(droppedMatches)
+		if dlpResult.Clean {
+			// Keep scanning the joined data payload too. The canonical
+			// wire-shaped text preserves per-line data: prefixes for
+			// metadata visibility, while the joined payload catches
+			// split-secret patterns that are easier to recognize before
+			// those prefixes are reintroduced.
+			dlpResult, droppedMatches = keepUnsuppressedDLP(sc.ScanTextForDLP(ctx, string(event)), opts.Target, opts.Suppress)
+			if err := checkSSEDLPContext(ctx); err != nil {
+				return err
+			}
+			droppedDLP.record(droppedMatches)
+		}
+		for _, view := range []string{rollingText, idDataText} {
+			if !dlpResult.Clean || view == "" {
+				continue
+			}
+			dlpResult, droppedMatches = keepUnsuppressedDLP(sc.ScanTextForDLP(ctx, view), opts.Target, opts.Suppress)
+			if err := checkSSEDLPContext(ctx); err != nil {
+				return err
+			}
+			droppedDLP.record(droppedMatches)
+		}
+		if !dlpResult.Clean {
+			findingErr := fmt.Errorf("%w: dlp: %s",
+				ErrSSEStreamFinding, sseDLPMatchNames(dlpResult.Matches))
+			if cfg.Action == config.ActionWarn {
+				if opts.OnFinding != nil {
+					opts.OnFinding(findingErr)
+				}
+				clearDLPTailAfterCurrent = true
+				skipTailDLP = true
+			} else {
+				return findingErr
+			}
+		}
+
+		resetInjectionTail := false
+		if !skipTailInjection && injectionTail != "" {
+			combined := injectionTail + " " + rollingInjectionText
+			tailInjectResult := sc.ScanResponseWithSuppress(ctx, combined, opts.Target, opts.Suppress)
+			observedCore.record(tailInjectResult)
+			if tailInjectResult.Failed() {
+				return fmt.Errorf("%w: response scan incomplete: %s", ErrSSEStreamScanError, tailInjectResult.ScanError)
+			}
+			if tailInjectResult.Clean && idDataInjectionText != "" {
+				tailInjectResult = sc.ScanResponseWithSuppress(ctx, injectionTail+" "+idDataInjectionText, opts.Target, opts.Suppress)
+				observedCore.record(tailInjectResult)
+				if tailInjectResult.Failed() {
+					return fmt.Errorf("%w: response scan incomplete: %s", ErrSSEStreamScanError, tailInjectResult.ScanError)
+				}
+			}
+			if !tailInjectResult.Clean {
+				findingErr := fmt.Errorf("%w: cross-event injection: %s",
+					ErrSSEStreamFinding, sseInjectionNames(tailInjectResult.Matches))
+				if opts.ResponseScanExempt || cfg.Action == config.ActionWarn {
+					if opts.OnFinding != nil {
+						opts.OnFinding(findingErr)
+					}
+					resetInjectionTail = true
+				} else {
+					return findingErr
+				}
+			}
+		}
+		if !skipTailInjection && !resetInjectionTail && payloadInjectionTail != "" {
+			result := sc.ScanResponseWithSuppress(ctx, payloadInjectionTail+" "+payloadText, opts.Target, opts.Suppress)
+			observedCore.record(result)
+			if result.Failed() {
+				return fmt.Errorf("%w: response scan incomplete: %s", ErrSSEStreamScanError, result.ScanError)
+			}
+			if !result.Clean {
+				findingErr := fmt.Errorf("%w: cross-event injection: %s", ErrSSEStreamFinding, sseInjectionNames(result.Matches))
+				if opts.ResponseScanExempt || cfg.Action == config.ActionWarn {
+					if opts.OnFinding != nil {
+						opts.OnFinding(findingErr)
+					}
+					resetInjectionTail = true
+				} else {
+					return findingErr
+				}
+			}
+		}
+
+		resetDLPTail := false
+		if !skipTailDLP && tail != "" {
+			combined := tail + rollingText
+			// Only suppression bookkeeping reads this scan, so skip it when
+			// nothing can be dropped or recorded, and keep it out of warn
+			// telemetry for content an earlier event already reported.
+			if opts.OnDroppedDLP != nil && len(opts.Suppress) > 0 {
+				_, priorTailDrops := keepUnsuppressedDLP(sc.ScanTextForDLPQuiet(ctx, tail), opts.Target, opts.Suppress)
+				if err := checkSSEDLPContext(ctx); err != nil {
+					return err
+				}
+				droppedDLP.markSeen(priorTailDrops)
+			}
+			tailDLPResult, droppedMatches := keepUnsuppressedDLP(sc.ScanTextForDLP(ctx, combined), opts.Target, opts.Suppress)
+			if err := checkSSEDLPContext(ctx); err != nil {
+				return err
+			}
+			droppedDLP.record(droppedMatches)
+			if tailDLPResult.Clean && idDataText != "" {
+				tailDLPResult, droppedMatches = keepUnsuppressedDLP(sc.ScanTextForDLP(ctx, tail+idDataText), opts.Target, opts.Suppress)
+				if err := checkSSEDLPContext(ctx); err != nil {
+					return err
+				}
+				droppedDLP.record(droppedMatches)
+			}
+			if !tailDLPResult.Clean {
+				findingErr := fmt.Errorf("%w: cross-event dlp: %s",
+					ErrSSEStreamFinding, sseDLPMatchNames(tailDLPResult.Matches))
+				if cfg.Action == config.ActionWarn {
+					if opts.OnFinding != nil {
+						opts.OnFinding(findingErr)
+					}
+					resetDLPTail = true
+				} else {
+					return findingErr
+				}
+			}
+		}
+		if !skipTailDLP && !resetDLPTail && payloadTail != "" {
+			result, droppedMatches := keepUnsuppressedDLP(sc.ScanTextForDLP(ctx, payloadTail+payloadText), opts.Target, opts.Suppress)
+			if err := checkSSEDLPContext(ctx); err != nil {
+				return err
+			}
+			droppedDLP.record(droppedMatches)
+			if !result.Clean {
+				findingErr := fmt.Errorf("%w: cross-event dlp: %s", ErrSSEStreamFinding, sseDLPMatchNames(result.Matches))
+				if cfg.Action == config.ActionWarn {
+					if opts.OnFinding != nil {
+						opts.OnFinding(findingErr)
+					}
+					resetDLPTail = true
+				} else {
+					return findingErr
+				}
+			}
+		}
+
+		if clearDLPTailAfterCurrent {
+			if boundary := strings.LastIndexByte(rollingText, ' '); boundary >= 0 {
+				rollingText = rollingText[boundary+1:]
+			}
+			if boundary := strings.LastIndexByte(payloadText, ' '); boundary >= 0 {
+				payloadText = payloadText[boundary+1:]
+			}
+			tail = advanceSSERollingTail("", []byte(rollingText), true, "")
+			payloadTail = advanceSSERollingTail("", []byte(payloadText), true, "")
+		} else {
+			if resetDLPTail {
+				// The prior tail held the prefix that just fired, and the reset
+				// drops it. The fragment after the last space comes from this
+				// event alone, so it may start a new credential and is kept.
+				if boundary := strings.LastIndexByte(rollingText, ' '); boundary >= 0 {
+					rollingText = rollingText[boundary+1:]
+				}
+				if boundary := strings.LastIndexByte(payloadText, ' '); boundary >= 0 {
+					payloadText = payloadText[boundary+1:]
+				}
+			}
+			tail = advanceSSERollingTail(tail, []byte(rollingText), resetDLPTail, "")
+			payloadTail = advanceSSERollingTail(payloadTail, []byte(payloadText), resetDLPTail, "")
+		}
+		if clearDLPTailAfterCurrent || resetDLPTail {
+			// A fragment with no whitespace boundary can still hold the whole
+			// credential that was just reported. Carrying it forward makes the
+			// next benign event report the same value again, so a tail that
+			// matches on its own is dropped.
+			var err error
+			if tail, err = dropSelfMatchingSSETail(ctx, sc, tail, opts); err != nil {
+				return err
+			}
+			if payloadTail, err = dropSelfMatchingSSETail(ctx, sc, payloadTail, opts); err != nil {
+				return err
+			}
+		}
+		if clearInjectionTailAfterCurrent {
+			for i, current := range []string{rollingInjectionText, string(event)} {
+				next, err := dropSelfMatchingSSEInjectionTail(ctx, sc, current, opts)
+				if err != nil {
+					return err
+				}
+				if i == 0 {
+					injectionTail = next
+				} else {
+					payloadInjectionTail = next
+				}
+			}
+		} else {
+			injectionTail = advanceSSERollingTail(injectionTail, []byte(rollingInjectionText), resetInjectionTail, " ")
+			payloadInjectionTail = advanceSSERollingTail(payloadInjectionTail, event, resetInjectionTail, " ")
+		}
+		if werr := writeSSEEvent(w, event, reader.LastEventID(), reader.LastEventType(), reader.LastRetry()); werr != nil {
+			// Downstream consumer went away (e.g. the io.Pipe in the
+			// reverse-proxy hijack was closed by the client). Returning
+			// here breaks the loop and lets the goroutine close the
+			// upstream body via its own deferred cleanup, instead of
+			// reading more events into a sink that no longer exists.
+			return fmt.Errorf("sse stream write: %w", werr)
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+}
+
+// dropSelfMatchingSSEInjectionTail keeps text after findings already reported
+// for this event so a later event can complete another phrase without a repeat.
+// Each reported phrase is cut and the remainder rescanned, so a second phrase
+// in the same event is not carried into the next event's scan.
+func dropSelfMatchingSSEInjectionTail(ctx context.Context, sc *scanner.Scanner, tail string, opts GenericSSEScanOptions) (string, error) {
+	scan := func(text string) (bool, error) {
+		result := sc.ScanResponseWithSuppress(ctx, text, opts.Target, opts.Suppress)
+		if result.Failed() {
+			return false, fmt.Errorf("%w: response scan incomplete: %s", ErrSSEStreamScanError, result.ScanError)
+		}
+		return !result.Clean, nil
+	}
+	probes := 0
+	for tail != "" && probes < sseTailProbeLimit {
+		result := sc.ScanResponseWithSuppress(ctx, tail, opts.Target, opts.Suppress)
+		probes++
+		if result.Failed() {
+			return "", fmt.Errorf("%w: response scan incomplete: %s", ErrSSEStreamScanError, result.ScanError)
+		}
+		if result.Clean {
+			break
+		}
+		end := 0
+		start := len(tail)
+		// ForMatching preserves byte offsets only for ASCII input with no
+		// length-changing normalization. Other views cannot index the raw event.
+		if len(normalize.ForMatching(tail)) == len(tail) && isASCII(tail) {
+			for _, match := range result.Matches {
+				span := match.Span()
+				if span.ViewLabel == scanner.ViewForMatching && span.ByteStart >= 0 && span.ByteEnd > span.ByteStart && span.ByteEnd <= len(tail) {
+					if span.ByteStart < start {
+						start = span.ByteStart
+					}
+				}
+				if span.ViewLabel == scanner.ViewForMatching && span.ByteEnd > end && span.ByteEnd <= len(tail) {
+					end = span.ByteEnd
+				}
+			}
+		}
+		if end == 0 {
+			// A decoded or normalized view has no raw offset. Bisect for the
+			// end of the reported phrase; text after it may still begin a
+			// second phrase and is kept.
+			cut, err := sseBisectMatchEnd(tail, &probes, scan)
+			if err != nil {
+				return "", err
+			}
+			tail = tail[cut:]
+			continue
+		}
+		// A separate phrase may already have started before the reported match.
+		// Keep both unreported sides while removing the reported span.
+		remaining := tail[end:]
+		if start > 0 && start < end {
+			remaining = tail[:start] + " " + remaining
+		}
+		tail = remaining
+	}
+	// An exhausted budget keeps the unexamined remainder.
+	return advanceSSERollingTail("", []byte(tail), true, " "), nil
+}
+
+func isASCII(s string) bool {
+	for i := range len(s) {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
+// dropSelfMatchingSSETail keeps only the bytes after a match already reported
+// for the current event. That suffix may begin another credential. The quiet
+// scans keep this bookkeeping check out of warn telemetry.
+func dropSelfMatchingSSETail(ctx context.Context, sc *scanner.Scanner, tail string, opts GenericSSEScanOptions) (string, error) {
+	return dropSelfMatchingSSETailWithScan(ctx, tail, opts, sc.ScanTextForDLPQuiet)
+}
+
+// A dirty normalized or decoded view has no safe raw match offset, so the end
+// of the reported value is found by bisecting prefixes: about 13 scans for a
+// full rolling tail. The limit bounds work per event when a tail holds several
+// such values; an exhausted budget keeps the unexamined remainder.
+const sseTailProbeLimit = 32
+
+func dropSelfMatchingSSETailWithScan(ctx context.Context, tail string, opts GenericSSEScanOptions, scan func(context.Context, string) scanner.TextDLPResult) (string, error) {
+	probes := 0
+	for tail != "" {
+		if probes >= sseTailProbeLimit {
+			return tail, nil
+		}
+		result, _ := keepUnsuppressedDLP(scan(ctx, tail), opts.Target, opts.Suppress)
+		probes++
+		if err := checkSSEDLPContext(ctx); err != nil {
+			return "", err
+		}
+		if result.Clean {
+			return tail, nil
+		}
+		matchEnd := 0
+		for _, match := range result.Matches {
+			span := match.Span()
+			if match.Encoded == "" && span.ViewLabel == scanner.ViewDLPNormalized && span.ByteEnd > 0 && span.ByteEnd <= len(tail) &&
+				(span.ByteEnd == len(tail) || sseTailRuneBoundary(tail, span.ByteEnd)) && strings.HasPrefix(normalize.ForDLP(tail), tail[:span.ByteEnd]) &&
+				(matchEnd == 0 || span.ByteEnd < matchEnd) {
+				matchEnd = span.ByteEnd
+			}
+		}
+		if matchEnd == 0 {
+			end, err := sseBisectMatchEnd(tail, &probes, func(prefix string) (bool, error) {
+				result, _ := keepUnsuppressedDLP(scan(ctx, prefix), opts.Target, opts.Suppress)
+				if err := checkSSEDLPContext(ctx); err != nil {
+					return false, err
+				}
+				return !result.Clean, nil
+			})
+			if err != nil {
+				return "", err
+			}
+			matchEnd = end
+		}
+		tail = tail[matchEnd:]
+	}
+	return "", nil
+}
+
+// sseBisectMatchEnd returns a prefix end where tail[:end] still matches, given
+// that the whole tail matches. It narrows toward the shortest such prefix, and
+// an exhausted budget returns the shortest one proven so far.
+func sseBisectMatchEnd(tail string, probes *int, matches func(string) (bool, error)) (int, error) {
+	lo, hi := 0, len(tail)
+	for *probes < sseTailProbeLimit {
+		mid := lo + (hi-lo)/2
+		for mid < hi && !sseTailRuneBoundary(tail, mid) {
+			mid++
+		}
+		if mid <= lo || mid >= hi {
+			break
+		}
+		dirty, err := matches(tail[:mid])
+		*probes++
+		if err != nil {
+			return 0, err
+		}
+		if dirty {
+			hi = mid
+		} else {
+			lo = mid
+		}
+	}
+	return hi, nil
+}
+
+func sseTailRuneBoundary(tail string, end int) bool {
+	return end > 0 && end < len(tail) && utf8.RuneStart(tail[end])
+}
+
+func checkSSEDLPContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: dlp scan incomplete: %w", ErrSSEStreamScanError, err)
+	}
+	return nil
+}
+
+// sseRollingEventText keeps the values from the canonical, wire-shaped event
+// while removing SSE field labels that can interrupt a split value at a
+// boundary. The id is left out: it persists from earlier events and sits
+// between the event and data values, so it would split a value across them.
+// Current-event checks still scan the complete canonical text, id included.
+func sseRollingEventText(canonical, separator string) string {
+	var b strings.Builder
+	for line := range strings.SplitSeq(canonical, "\n") {
+		if strings.HasPrefix(line, "id:") {
+			continue
+		}
+		for _, field := range []string{"event:", "retry:", "data:"} {
+			if value, ok := strings.CutPrefix(line, field); ok {
+				value = strings.TrimPrefix(value, " ")
+				if value != "" {
+					if b.Len() > 0 {
+						b.WriteString(separator)
+					}
+					b.WriteString(value)
+				}
+				break
+			}
+		}
+	}
+	return b.String()
+}
+
+// sseIDDataEventText joins the id value with the data values, dropping the
+// field labels. It is empty when the event has no id, since the rolling and
+// payload views already cover data alone.
+func sseIDDataEventText(canonical, separator string) string {
+	var values []string
+	hasID := false
+	for line := range strings.SplitSeq(canonical, "\n") {
+		value, ok := strings.CutPrefix(line, "id:")
+		if ok {
+			hasID = true
+		} else if value, ok = strings.CutPrefix(line, "data:"); !ok {
+			continue
+		}
+		if value = strings.TrimPrefix(value, " "); value != "" {
+			values = append(values, value)
+		}
+	}
+	if !hasID {
+		return ""
+	}
+	return strings.Join(values, separator)
+}
+
+func advanceSSERollingTail(tail string, event []byte, reset bool, separator string) string {
+	if len(event) >= rollingTailSize {
+		return string(event[len(event)-rollingTailSize:])
+	}
+	if reset || tail == "" {
+		return string(event)
+	}
+	combined := tail + separator + string(event)
+	if len(combined) > rollingTailSize {
+		return combined[len(combined)-rollingTailSize:]
+	}
+	return combined
+}
+
+// passthroughSSE forwards body to w in small chunks, flushing after
+// every successful read so the client sees bytes as soon as they arrive
+// even when scanning is opt-out. Used by both the generic-SSE and A2A
+// disabled-mode branches so SSE TTFB stays in microseconds whenever an
+// operator turns scanning off. Bare io.Copy here would batch in the
+// server's bufio.Writer until the chunk threshold trips and break the
+// "still stream when SSE scanning is off" contract.
+func passthroughSSE(ctx context.Context, body io.Reader, w io.Writer, flusher http.Flusher) error {
+	buf := make([]byte, passthroughChunkSize)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		n, err := body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return werr
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+// keepUnsuppressedDLP removes suppressed DLP matches and recomputes Clean.
+func keepUnsuppressedDLP(res scanner.TextDLPResult, target string, suppress []config.SuppressEntry) (scanner.TextDLPResult, []scanner.TextDLPMatch) {
+	if res.Clean || len(suppress) == 0 {
+		return res, nil
+	}
+	var kept []scanner.TextDLPMatch
+	var dropped []scanner.TextDLPMatch
+	for _, m := range res.Matches {
+		if config.IsCoreDLPPatternName(m.PatternName) || !config.IsSuppressed(m.PatternName, target, suppress) {
+			kept = append(kept, m)
+		} else {
+			dropped = append(dropped, m)
+		}
+	}
+	res.Matches = kept
+	res.Clean = len(kept) == 0
+	return res, dropped
+}
+
+func recordDroppedSSEDLP(opts GenericSSEScanOptions, matches []scanner.TextDLPMatch) {
+	if opts.OnDroppedDLP == nil {
+		return
+	}
+	for _, match := range matches {
+		opts.OnDroppedDLP(match, "suppressed")
+	}
+}
+
+type sseDLPDropRecorder struct {
+	opts GenericSSEScanOptions
+	seen map[string]struct{}
+}
+
+func newSSEDLPDropRecorder(opts GenericSSEScanOptions) *sseDLPDropRecorder {
+	return &sseDLPDropRecorder{opts: opts, seen: make(map[string]struct{})}
+}
+
+func (r *sseDLPDropRecorder) record(matches []scanner.TextDLPMatch) {
+	if r == nil || r.opts.OnDroppedDLP == nil {
+		return
+	}
+	for _, match := range matches {
+		key := sseDLPDropKey(match)
+		if _, ok := r.seen[key]; ok {
+			continue
+		}
+		r.seen[key] = struct{}{}
+		r.opts.OnDroppedDLP(match, "suppressed")
+	}
+}
+
+func (r *sseDLPDropRecorder) markSeen(matches []scanner.TextDLPMatch) {
+	if r == nil {
+		return
+	}
+	for _, match := range matches {
+		r.seen[sseDLPDropKey(match)] = struct{}{}
+	}
+}
+
+func sseDLPDropKey(match scanner.TextDLPMatch) string {
+	return match.PatternName + "\x00" + match.Bundle + "\x00" + match.BundleVersion
+}
+
+func sseInjectionNames(matches []scanner.ResponseMatch) string {
+	if len(matches) == 0 {
+		return patternUnknown
+	}
+	names := make([]string, 0, len(matches))
+	for _, m := range matches {
+		names = append(names, m.PatternName)
+	}
+	return strings.Join(names, ", ")
+}
+
+func sseDLPMatchNames(matches []scanner.TextDLPMatch) string {
+	if len(matches) == 0 {
+		return patternUnknown
+	}
+	names := make([]string, 0, len(matches))
+	for _, m := range matches {
+		names = append(names, m.PatternName)
+	}
+	return strings.Join(names, ", ")
+}
+
+// sseObservedCoreRecorder reports declared core-floor observations from an SSE
+// scan exactly once per stream.
+//
+// Two scans see the same bytes: the current event, and then the rolling tail,
+// which is the retained prior bytes plus this event. The scanner's own
+// duplicate guard is per-call, so without a stream-local seen set the same
+// observation reaches audit and metrics twice and inflates both. This mirrors
+// sseDLPDropRecorder, which already solves the identical problem for dropped
+// DLP matches.
+type sseObservedCoreRecorder struct {
+	opts GenericSSEScanOptions
+	seen map[string]struct{}
+}
+
+func newSSEObservedCoreRecorder(opts GenericSSEScanOptions) *sseObservedCoreRecorder {
+	return &sseObservedCoreRecorder{opts: opts, seen: make(map[string]struct{})}
+}
+
+func (r *sseObservedCoreRecorder) record(result scanner.ResponseScanResult) {
+	if r == nil || r.opts.OnObservedCoreResponse == nil {
+		return
+	}
+	for _, observed := range result.ObservedCoreMatches {
+		key := sseObservedCoreKey(observed)
+		if _, ok := r.seen[key]; ok {
+			continue
+		}
+		r.seen[key] = struct{}{}
+		r.opts.OnObservedCoreResponse(observed)
+	}
+}
+
+// sseObservedCoreKey identifies an observation by what it asserts, not by
+// where it was found. Offsets shift between the current-event scan and the
+// rolling-tail scan for the same finding, so including one would defeat the
+// deduplication this exists for.
+func sseObservedCoreKey(observed scanner.ObservedCoreMatch) string {
+	return observed.Match.PatternName + "\x00" + observed.Host + "\x00" + observed.Match.MatchText
+}

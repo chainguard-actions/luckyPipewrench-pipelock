@@ -1,0 +1,797 @@
+<!--
+Copyright 2026 Josh Waldrep
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# Receipt verification
+
+Pipelock's flight recorder generates Ed25519-signed action receipts for
+mediated actions. Each writer process links its receipts to the previous
+receipt it wrote via a SHA-256 hash chain. That makes the records in one writer
+stream tamper-evident, but it is not a guarantee that several pipelock
+processes sharing one recorder directory produced a single deployment-wide
+sequence. This guide covers how to verify receipts, check chain integrity, and
+use the cross-implementation conformance suite.
+
+## When to verify
+
+- **After an incident:** Verify the evidence log to confirm it has not been
+  tampered with. A broken hash chain or invalid signature means evidence was
+  modified after the fact.
+- **During audit:** Provide the verified chain to auditors as signed proof of
+  what pipelock enforced during a session.
+- **In CI/CD:** Run `pipelock verify-receipt` against evidence files produced
+  by integration tests to confirm the flight recorder is functioning.
+- **Cross-implementation:** Use the conformance suite's golden files to verify
+  that a third-party receipt verifier (e.g. Python, TypeScript) agrees with
+  the reference Go implementation.
+
+## Verifying a single receipt
+
+Verification is **safe by default**: pin the trusted signer key with `--key` so
+the receipt is checked against a key you trust, not merely for internal
+consistency. The value is a hex key or a path to a public-key file.
+
+```bash
+pipelock verify-receipt receipt.json --key 70b991eb77816fc4ef0ae6a54d8a4119ddc5a16c9711c332c39e743079f6c63e
+```
+
+Output on success:
+
+```text
+OK: receipt.json
+  Action ID:   019...
+  Action Type: fetch
+  Verdict:     allowed
+  Target:      https://docs.python.org/3/
+  Transport:   fetch
+  Timestamp:   2026-04-10T14:30:00Z
+  Signer:      70b991eb...
+  Chain seq:   42
+  Chain prev:  sha256:a1b2c3d4...
+```
+
+### Unpinned (structural-only) verification
+
+Without `--key`, the verifier can confirm the signature is self-consistent and
+the hash linkage holds, but it cannot prove *who* signed the receipt. That is
+not a pass on its own, so an unpinned run prints a loud banner and **exits
+non-zero**:
+
+```text
+UNPINNED: receipt.json
+UNPINNED — signature is self-consistent but the signer was NOT checked against a trusted key
+  Action ID:   019...
+  ...
+```
+
+Pass `--allow-unpinned` to acknowledge the reduced guarantee and exit 0 for a
+structural-only check (for example, a quick local sanity check when you do not
+have the key on hand):
+
+```bash
+pipelock verify-receipt receipt.json --allow-unpinned
+```
+
+Exit code 0 means valid (and signer-pinned, unless you passed `--allow-unpinned`);
+exit code 1 means invalid, malformed, or unpinned without `--allow-unpinned`.
+
+## Verifying a Fleet Receipt Report
+
+Fleet Receipt Reports are DSSE envelopes wrapping an in-toto Statement v1
+payload with the `fleet-receipt/v1` predicate. They summarize a fleet's
+included signed audit batches and carry the mediated-fraction completeness
+metric. They do not claim non-bypass; they prove the signed report's source set
+and arithmetic for mediated actions inside that source set.
+
+Generate a dedicated fleet-report signing key once (the `fleet-report-signing`
+purpose is what `conductor fleet report --signing-key` requires):
+
+```bash
+pipelock signing key generate \
+  --purpose fleet-report-signing \
+  --out /etc/pipelock/keys/fleet-report.key \
+  --id fleet-report-key
+```
+
+The key file embeds the public key; distribute its hex to verifiers. Generating
+the key is free; minting a report is Enterprise-gated, verifying is free.
+
+Enterprise operators mint a report from the local Conductor audit store:
+
+```bash
+pipelock conductor fleet report \
+  --storage-dir /var/lib/pipelock/conductor \
+  --org-id example-org \
+  --fleet-id prod \
+  --from 2026-06-13T00:00:00Z \
+  --to 2026-06-14T00:00:00Z \
+  --signing-key /etc/pipelock/keys/fleet-report.key \
+  --out fleet-receipt.dsse.json
+```
+
+The mint command reads stored audit-batch envelopes and payloads locally. The
+remote `conductor audit query` API stays metadata-only.
+
+Pin the fleet-report public key. Pass the signer's 64-hex Ed25519 public key (or
+a file containing it) to `--key`; the verifier binds it to the report's signer
+key id and checks the Ed25519 signature, so the report's key id can be a human
+label like `fleet-report-key` rather than the public-key hex:
+
+```bash
+pipelock verify-receipt fleet-receipt.dsse.json --fleet-report --key fleet-report.pub
+```
+
+### Piping a report out of a distroless pod
+
+The Conductor ships as a distroless image with no shell, `cat`, or `tar`, so an
+operator cannot extract a minted file from the pod. Pass `--out -` to write the
+DSSE envelope to stdout (the human-readable summary then goes to stderr) and pipe
+it straight into the offline verifier:
+
+```bash
+kubectl exec deploy/conductor -- pipelock conductor fleet report \
+  --storage-dir /var/lib/pipelock/conductor \
+  --org-id example-org --fleet-id prod \
+  --from 2026-06-13T00:00:00Z --to 2026-06-14T00:00:00Z \
+  --signing-key /etc/pipelock/keys/fleet-report.key \
+  --out - > fleet-receipt.dsse.json
+
+pipelock verify-receipt fleet-receipt.dsse.json --fleet-report --key fleet-report.pub
+```
+
+Output on success:
+
+```text
+FLEET RECEIPT OK: fleet-receipt.dsse.json
+  Signer:           fleet-report-key
+  Payload SHA-256:  9c46a3...
+  Org/Fleet:        example-org/prod
+  Report ID:        019...
+  Level:            L1
+  Source batches:   12
+  Total actions:    481
+  Mediated fraction: 1
+```
+
+Without `--key`, the verifier can check structure and self-consistency only. It
+prints `FLEET RECEIPT UNPINNED` and exits non-zero unless `--allow-unpinned` is
+passed.
+
+See [Fleet Receipt Report v1](../specs/fleet-receipt-v1.md) for the wire
+format.
+
+## Verifying a receipt chain
+
+Pass a flight recorder JSONL file (or `--chain DIR` for a multi-file chain that
+spans restarts or rotations for one recorder session/writer stream) and pin the
+trusted key:
+
+The `evidence-proxy-0.jsonl` filenames in the historical examples below are legacy samples. A current process writes `evidence-proxy.run.<id>-0.jsonl`. A file argument checks only that shard; use `--chain DIR --session proxy.run.<id>` to check every shard of one run, or omit `--session` to check every run and link in the directory.
+
+```bash
+pipelock verify-receipt evidence-proxy-0.jsonl --key 70b991eb...
+```
+
+Output on success:
+
+```text
+CHAIN VALID: evidence-proxy-0.jsonl
+  Receipts:  142
+  Final seq: 141
+  Root hash:  sha256:e5f6a7b8...
+  Start:     2026-04-10T14:00:00Z
+  End:       2026-04-10T15:30:00Z
+  Signer:    70b991eb...
+```
+
+Chain verification checks:
+
+- Every receipt's Ed25519 signature is valid against its signer key.
+- `chain_seq` increments by exactly 1 from 0 to N-1 (per segment; see rotation below).
+- The first receipt either has the legacy `chain_prev_hash: "genesis"` or a
+  v3.1 bound-genesis `g1:<sha256>` value derived from the signed
+  `session_open` record.
+- Each subsequent receipt's `chain_prev_hash` equals the SHA-256 hash of
+  the previous receipt's canonical JSON. When the previous receipt carries a
+  top-level `ext` member, that JSON ends with `"ext":` followed by the ext
+  value's source bytes, compacted and HTML-escaped the way Go's
+  `encoding/json` re-encodes raw JSON, with key order, number spelling, and
+  escape spelling kept as written. An explicit `"ext": null` is included; an
+  absent `ext` adds nothing. Editing `ext` after the next receipt links it
+  breaks the chain. Adding or removing whitespace between JSON tokens does
+  not, but whitespace inside a string value is part of the value.
+- Signed v1 objects reject unknown fields. Only the unsigned top-level `ext`
+  object may carry advisory forward-compatible metadata. The signature never
+  covers it and its value never contributes to a verified claim; only its
+  bytes join the chain link hash.
+- In a flight-recorder file, the chain is the `action_receipt` subsequence.
+  `evidence_receipt` entries interleaved in the same file are skipped, as in
+  the Go verifier; a file with only `evidence_receipt` entries is verified as
+  an EvidenceReceipt v2 chain by the SDK verifiers.
+
+Without `--whole-recorder`, verification checks only the receipt subsequence. Add `--whole-recorder` to check every present recorder entry, reject unknown entry types and hash-chain breaks, and verify the commitment in a `transcript_root`.
+
+With `--chain DIR` and no `--session`, unsealed runs are listed under `INCOMPLETE RUNS` but don't cause a non-zero exit by themselves. Add `--require-seal` to fail if any run lacks a seal.
+
+After signing-key rotation, the root covers the final signing segment while verification checks every trusted segment and rotation continuity.
+
+The seal doesn't cover the trailing checkpoint written after it. Any other entry after the seal is reported as `INCOMPLETE` because the seal didn't commit to it.
+
+Signed checkpoints authenticate entries that aren't receipts, such as decisions and captures. Each checkpoint signs the chain hash of all earlier entries; `--whole-recorder` verifies these signatures against the pinned keys and reports the anchor state.
+
+The seal must be covered by the signed checkpoint written after the root. By default, verification refuses when no signed checkpoint follows the seal, since an older checkpoint doesn't prove the seal was included.
+
+If `flight_recorder.sign_checkpoints` is `false`, or the last entry filled a shard so no trailing checkpoint was written, pass `--allow-unanchored-seal` to accept the recorder. The output identifies entries that are hash-linked but not authenticated.
+
+As with a single receipt, an unpinned chain run (no `--key`) prints
+`CHAIN UNPINNED` and exits non-zero unless you pass `--allow-unpinned`; pinning
+the key is what proves the chain came from a signer you trust.
+
+If any check fails, the output reports which sequence number broke the chain.
+In a directory shared by concurrent writer processes, a `chain_prev_hash`
+mismatch can be caused by a recorder fork rather than by after-the-fact
+tampering. Run `pipelock evidence doctor DIR` to surface the structural damage
+for investigation. The doctor reports symptoms such as duplicate sequence
+numbers, conflicting predecessor hashes, and entries whose contents no longer
+match their recorded hash. Those symptoms narrow the cause but do not by
+themselves establish it: a fork and a crafted edit can present the same
+structure.
+
+### Falsify a captured record
+
+The runnable [receipt verification example](../../examples/receipt-verify/README.md)
+captures a blocked request, verifies it with a pinned key, then in step 5 changes
+the blocked receipt's `detail.action_record.verdict` from `block` to `allow`.
+The verifier fails closed (exit 1) with this output shape from an actual run:
+
+```text
+CHAIN BROKEN: /tmp/.../evidence-proxy-0.tampered.jsonl
+  Error:    seq 2: signature: signature verification failed
+  Broke at: seq 2
+```
+
+Receipt-chain verification authenticates the signed `action_record` (including
+the action, policy hash, verdict, target, and chain linkage), not the outer
+flight-recorder hash chain. An entry's `seq` and `summary` are not checked in
+this mode. Its `type` is not signed, but it does select whether the entry is
+extracted as an action receipt; unknown types fail closed. Changing an outer
+field is therefore not a tamper demonstration for receipt-chain verification.
+
+### Compacting an over-cap recorder directory
+
+Evidence readers refuse a session with more than 256 JSONL shards or an individual shard above 8 MiB. Stop the recorder and isolate the selected session as described below before running the offline compaction ceremony. The compactor has its own bounded reader for legacy oversized shards, so a normal `pipelock evidence doctor` run isn't a prerequisite.
+
+```bash
+sudo systemctl stop pipelock.service
+sudo pipelock evidence compact \
+  --receipt-dir /var/lib/pipelock/recorder \
+  --session proxy \
+  --key /etc/pipelock/keys/flight-recorder-signing.key.pub
+```
+
+`proxy` is the session older binaries wrote. Current binaries record one chain per process run, so pass the over-cap run session instead, for example `--session proxy.run.<id>`. The compactor requires its input directory to contain only that run's shards: `--session` does not filter a mixed directory. While the recorder is stopped, make a backup of the entire directory, then move every other run's shards and all link files to a separate, protected sibling directory. Check that only the selected run's shards remain before running compaction. After compaction, move the isolated files back into the active directory without replacing any compacted shard, verify the restored run directory and restart continuity, then start the recorder with `sudo systemctl start pipelock.service`. Retain both the full backup and the compactor's archive until verification succeeds. If the isolated files include raw-escrow sidecars, preserve them in the backup and restore them with the same names; the compactor cannot process sidecars in its input directory.
+
+The command refuses to run while a recorder holds the directory lock. It accepts oversized legacy input and uses bounded record memory. It verifies the trusted recorder hash chain, checkpoint signatures, and signed v1 or v2 receipts before and after compaction. It copies each JSONL record line without changing its bytes and keeps every replacement shard at or below the 8 MiB read limit. Linux installs the new active directory with one atomic exchange. The original directory then becomes a timestamped sibling archive with SHA-256 digests and byte mappings.
+
+Recorder histories created with checkpoint signing disabled contain unsigned checkpoints. The compactor preserves them only when a later checkpoint has a valid signature that seals the earlier records through the recorder hash chain. It reports the exact count and exits non-zero. Inspect the source, then rerun with `--allow-unsigned-checkpoints=N` to acknowledge that count. The compactor refuses an unsigned checkpoint at the end of the chain because no later signature covers it, and refuses histories with more than 10,000 unsigned checkpoints so manifest generation remains bounded. The archive manifest lists each acknowledged checkpoint and the later-signature coverage result. Signed checkpoints still require a valid signature.
+
+Early version 1 recorders could append another `seq=0` genesis after a restart. Those entries form independent histories, so `evidence compact` refuses to put them back into a live recorder directory. Use `pipelock evidence inspect-epochs --receipt-dir /path/to/recorder --session proxy --key /path/to/public-key --out /safe/path/proxy-boundaries.json` while the recorder is stopped. The command verifies each history separately, writes the exact boundary hashes and source-file digests to a new `0600` file outside the evidence directory, and prints that file's SHA-256. Keep the file and digest together. A later retirement ceremony can use them to prove that it handled the inspected bytes instead of trusting an epoch count.
+
+Earlier recorder output may contain an entire signed v1 receipt replaced by a redaction tombstone. That receipt and its chain position can't be recovered. The compactor accepts known middle-of-chain tombstones and reports `receipt proof: DEGRADED`; a tombstone at the first or last v1 receipt is refused because the published directory would not be safe to resume. The command exits non-zero and reports the observed middle-gap count; after inspection, rerun with `--allow-degraded-receipts=N` to acknowledge exactly that count. After each gap, it verifies the remaining signed receipts as a contiguous suffix; the first predecessor remains untrusted, while deletion, reordering, or splicing later in that suffix still fails. The version 2 archive manifest records every tombstone, whether a later signed recorder checkpoint covers it, and each verified suffix boundary. It doesn't publish a complete v1 chain head for a degraded chain. Any other malformed receipt still stops compaction.
+
+This version accepts exactly one session, up to 4,096 input shards, and no raw-escrow sidecars in the active directory. It refuses mixed directories, unknown record types, duplicate shard starts, symlinks, and sources that change during the ceremony. A failed check leaves the original directory active. Restart the recorder after either success or failure. Retain the archive until bounded reads and fresh emission succeed; general receipt verification correctly remains non-green for a degraded historical chain.
+
+### Completeness analysis
+
+`pipelock-verifier completeness` analyzes the signed session lifecycle evidence
+in a receipt chain. The best possible result is LIMITED, never COMPLETE, PASS,
+or OK: Pipelock can bound mediated egress it observed, but cannot prove the
+agent had no path outside that boundary.
+
+```bash
+pipelock-verifier completeness /var/lib/pipelock/evidence \
+  --session agent-a \
+  --key /etc/pipelock/keys/flight-recorder-signing.key.pub
+```
+
+Exit code 0 means the analysis ran and the per-writer chain was not classified BROKEN;
+LIMITED and UNVERIFIED are successful analyses. Exit code 1 means broken
+completeness evidence, an unpinned non-empty chain without
+`--allow-unpinned`, or another verifier failure.
+
+### Chains that rotated the signing key
+
+A chain whose signing key was rotated mid-life splits into **segments**. The
+verifier understands this: a segment boundary is a sequence-0 receipt carrying a
+`KeyTransition` marker that links to the prior segment's tail hash, so the
+cross-segment hash chain still proves nothing was inserted or dropped at the
+rotation. Pass `--key` once per trusted segment key:
+
+```bash
+pipelock verify-receipt --chain /var/lib/pipelock/evidence --key old.pub --key new.pub
+```
+
+A rotated chain reports each segment and its signer for you to confirm:
+
+```text
+CHAIN VALID: /var/lib/pipelock/evidence (session proxy)
+  ...
+  Segments:  2 (signing key rotated)
+  CONFIRM every signer key below is one of yours:
+    segment 0: seq 0-140  signer 70b991eb...
+    segment 1: seq 0-87   signer a1b2c3d4...  (key rotation)
+```
+
+If a segment is signed by a key you did not pass, the chain reports
+`CHAIN BROKEN` and names the untrusted signer key — re-run with a `--key` for
+each key you trust. The verifier proves the segments are cryptographically
+linked; only the operator knows whether every key is one of theirs.
+
+## Computing a transcript root
+
+The transcript root is the hash of the final receipt in the verified writer
+chain, serving as a tamper-evident summary of the records in that chain:
+
+```bash
+pipelock transcript-root evidence-proxy-0.jsonl --key 70b991eb...
+```
+
+```
+Transcript Root: evidence-proxy-0.jsonl
+  Session:       proxy
+  Root hash:     sha256:e5f6a7b8...
+  Receipt count: 142
+  Final seq:     141
+  Start:         2026-04-10T14:00:00Z
+  End:           2026-04-10T15:30:00Z
+```
+
+The `--key` flag is required for transcript roots: the root is only
+meaningful if every receipt in the selected writer chain was verified against a
+trusted key.
+
+For a directory with one run chain, `transcript-root --chain DIR` selects that
+run. If the directory has several run chains, pass `--session` with the exact
+run ID. A transcript root summarizes one chain, not the whole directory.
+
+When verifying a file-based evidence capture, `transcript-root` derives the
+`SessionID` from the first entry in the file rather than the `--session`
+flag (which still controls the session ID for directory-based chain scans).
+An empty evidence file — zero receipts — fails with a non-zero exit code
+rather than silently printing a valid-looking root, so scripts can trust an
+exit-0 status to mean receipts were present and the selected writer chain
+verified.
+
+`verify-receipt --chain DIR --whole-recorder` checks every run chain. A clean
+report describes one chain: `--clean-report` selects a lone run, and requires
+`--session` when several runs are present. An empty report is an error.
+
+Clean report v1 requires `schema_version: pipelock.clean_report.v1` and an explicit
+`verification_mode`: `pinned_provenance` means the receipt signer matched an
+operator-supplied key; `unpinned_structural` means `--allow-unpinned` accepted
+a self-consistent chain without signer provenance. The required fields are in
+[`clean-report-v1.schema.json`](../evidence/clean-report-v1.schema.json).
+The terminal label also says `CLEAN REPORT UNPINNED` for structural verification.
+Upgrade report parsers to require both fields. For older reports with no mode,
+treat trust as unknown and require re-verification before accepting provenance.
+
+## Anchoring receipts
+
+`pipelock anchor receipts` verifies a receipt chain with pinned signer keys,
+writes the verified chain head to an anchor backend, and emits an anchor bundle
+for later offline verification.
+
+The `--out` path must name a file inside the receipt directory. Relative paths are resolved from that directory; absolute paths outside it are rejected.
+
+With `--dir`, anchoring selects a lone run chain automatically. If the
+directory holds several runs, pass `--session` with the exact run ID; each
+anchor bundle covers one chain.
+
+The local backend is deterministic test/development plumbing, not an
+operator-independent witness:
+
+Local anchor appends require file sync before returning a proof. If the log has a torn final write, the next submission preserves that file and continues the verified complete prefix in a numbered `.segment-` file beside it. Keep those files together for local proof verification. Reading the damaged file directly still reports a torn tail; an invalid complete entry or hash link stops submissions.
+
+```bash
+pipelock anchor receipts /var/lib/pipelock/evidence \
+  --dir \
+  --session agent-a \
+  --key /etc/pipelock/keys/flight-recorder-signing.key.pub \
+  --backend local \
+  --local-log /var/lib/pipelock/anchors/local-log.jsonl \
+  --out /var/lib/pipelock/evidence/agent-a.anchor.json
+```
+
+The Rekor backend submits checkpoint material to a remote transparency log. It
+has no public default URL: name the log explicitly and acknowledge the remote
+submission. The hashedrekord data hash is `sha512`, which Ed25519 Rekor v1
+requires; the `--rekor-hash-algorithm` flag accepts only `sha512` and rejects
+anything else.
+
+```bash
+pipelock anchor receipts /var/lib/pipelock/evidence \
+  --dir \
+  --session agent-a \
+  --key /etc/pipelock/keys/flight-recorder-signing.key.pub \
+  --backend rekor \
+  --rekor-url https://rekor.vendor.example \
+  --rekor-key /etc/pipelock/keys/rekor-checkpoint.key \
+  --yes-send-to-remote-log \
+  --out /var/lib/pipelock/evidence/agent-a.rekor-anchor.json
+```
+
+Offline independent verification requires the receipt signer key and a pinned
+Rekor log public key. Without `--rekor-log-key`, Rekor inclusion material is not
+trusted.
+
+```bash
+pipelock-verifier independent /var/lib/pipelock/evidence \
+  --dir \
+  --session agent-a \
+  --bundle /var/lib/pipelock/evidence/agent-a.rekor-anchor.json \
+  --key /etc/pipelock/keys/flight-recorder-signing.key.pub \
+  --rekor-log-key /etc/pipelock/keys/rekor-log.pub
+```
+
+An anchor bundle covers the receipts that existed when it was made. The live
+chain keeps growing, so `pipelock-verifier independent` recomputes the checkpoint
+over the first `receipt_count` receipts. A chain shorter than the bundle claims
+fails.
+
+Receipts after the anchored prefix are not ignored. The verifier checks them as
+a chain (hash linkage and signatures under the `--key` values you supplied) and
+exits non-zero if the tail is broken, for example a tampered or re-signed
+receipt. When the tail verifies, the verdict stays valid, the OK line names the
+split (`receipts 0..2 of 5 anchored, 3..4 chain-verified`), and stderr carries a
+note that the later receipts are chain-verified but not anchored.
+
+With `--json` the verdict adds three fields next to the existing ones:
+
+| Field | Meaning |
+|-------|---------|
+| `covered_receipts` | Leading receipts the anchor commits to. |
+| `chain_length` | Receipts supplied to the verifier. |
+| `tail_chain_verified` | `true` when receipts after the anchored prefix exist and verified as a chain. |
+
+The tail is only chain-verified: a holder of the signing key can forge it, and
+no anchor vouches for it. By default that still counts as valid. To treat it as
+a failure, the way the dashboard treats a stale anchor, add
+`--require-full-coverage`: verification then exits non-zero with `valid: false`
+whenever `covered_receipts` is less than `chain_length`. A fully anchored chain
+is unaffected.
+
+```bash
+pipelock-verifier independent /var/lib/pipelock/evidence \
+  --dir --session agent-a \
+  --bundle /var/lib/pipelock/evidence/agent-a.rekor-anchor.json \
+  --key /etc/pipelock/keys/flight-recorder-signing.key.pub \
+  --rekor-log-key /etc/pipelock/keys/rekor-log.pub \
+  --require-full-coverage
+```
+
+Honest limit: anchoring narrows post-anchor omission and tampering windows, but
+it does not prove real-time truth by whoever held the receipt signing key and
+does not prove traffic outside the mediated boundary did not happen.
+
+### Automatic runtime anchoring
+
+`pipelock run` can anchor the live `proxy` receipt chain without a separate
+scheduled CLI job. Configuring exactly one anchor point is the opt-in; there is
+no enable flag and no public Rekor URL default. With no `rekor_url` or
+`local_log`, runtime anchoring is completely inert and receipts remain locally
+tamper-evident only.
+
+```yaml
+flight_recorder:
+  dir: /var/lib/pipelock/evidence
+  signing_key_path: /etc/pipelock/keys/flight-recorder-signing.key
+  anchor:
+    rekor_url: https://rekor.internal.example
+    rekor_key_path: /etc/pipelock/keys/rekor-entry.key
+    interval: 1h
+    receipt_threshold: 1000
+```
+
+The first pass that finds at least one receipt anchors immediately. After that,
+the time and receipt-count triggers are ORed: a new checkpoint is submitted when
+either `interval` has elapsed or `receipt_threshold` new receipts have arrived.
+Set either trigger to `0` to disable it; at least one must remain active. Trigger
+changes and anchor-point additions/removals take effect on config reload. The
+loop never submits an unchanged or empty receipt head.
+
+Rekor submission uses the v1 `hashedrekord` API. Only the checkpoint's SHA-512
+digest and signature leave the box; receipt content is never submitted. The
+configured `rekor_key_path` Ed25519 key signs the log entry and is reloaded for
+each attempt so replacing the key file does not require restarting Pipelock.
+Pipelock does not currently verify that this key differs from the receipt
+signing key.
+
+Anchoring is fail-degraded, not a traffic gate. An unavailable log, unreadable
+entry key, invalid chain, write failure, or a non-Rekor backend proof that
+fails its own verification right after submission (never persisted) increments
+`pipelock_evidence_auto_anchor_failures_total`, records the last error in the
+`/stats` evidence-health JSON, and prints a `CRITICAL` line to stderr. Rekor
+proofs are the one exception: the runtime holds no Rekor log public key, so
+they are recorded unverified and checked only offline, with
+`pipelock-verifier independent --rekor-log-key`. Proxy traffic and receipt
+emission continue without waiting for the retry, which runs on a later pass. Successful markers feed the `anchoring_fresh` evidence-health
+diagnostic and anchor-lag metrics. They do not award an AEL grade. The deprecated
+`current_ael` surface is unavailable because a live process cannot independently
+grade its own evidence.
+
+The log operator determines the ceiling of the proof. A self-hosted Rekor log
+adds tamper evidence and durability, but it is not independent from its
+operator. A public log can provide an independent witness, but it publishes
+checkpoint metadata and may impose rate limits. Pipelock deliberately chooses
+neither for you. Re-submitting an already-logged checkpoint reuses the
+existing Rekor entry recovered from the `409` conflict response's `Location`
+header, rather than failing the retry.
+
+For hermetic development, configure the deterministic local backend instead:
+
+```yaml
+flight_recorder:
+  anchor:
+    local_log: /var/lib/pipelock/anchor-log.jsonl
+    log_id: local-fake-log
+    interval: 1h
+    receipt_threshold: 1000
+```
+
+`rekor_url` and `local_log` are mutually exclusive. The local backend exercises
+the same checkpoint, bundle, and marker flow but is not an independent witness.
+
+External systems can parse the emitted JSON using the experimental [Anchor
+Bundle v1 specification](../specs/anchor-bundle-v1.md). The published shape is
+not an anchor-backend plugin API and does not make an external proof verifiable
+by `pipelock-verifier`.
+
+## How the per-writer chain works
+
+Each receipt contains:
+
+- **action_record**: The security decision (action ID, verdict, target,
+  transport, policy hash, chain sequence, chain previous hash). When present, a
+  `run_nonce` — generated once per process run and folded into the signed
+  preimage — binds the receipt to a single run so it cannot be replayed as
+  evidence of a different one. Receipts emitted before the nonce was added omit
+  the field and still verify.
+- **signature**: `ed25519:` prefix + hex-encoded Ed25519 signature over
+  `SHA-256(canonical JSON of action_record)`.
+- **signer_key**: Hex-encoded Ed25519 public key of the signer.
+
+Within one writer stream, the chain links receipts via `chain_prev_hash`:
+
+```
+Receipt 0:  chain_seq=0, chain_prev_hash="genesis" (legacy) or "g1:<sha256>"
+Receipt 1:  chain_seq=1, chain_prev_hash=sha256(receipt_0)
+Receipt 2:  chain_seq=2, chain_prev_hash=sha256(receipt_1)
+...
+```
+
+Inserting, removing, or modifying any receipt in that writer stream breaks the
+chain at that point. Current releases do not reject a deployment where multiple
+pipelock processes share one recorder directory; if they race and choose the
+same next sequence, the directory can fork and become structurally
+unverifiable. `pipelock evidence doctor DIR` reports duplicate sequence values,
+conflicting `prev_hash` values, receipt-chain collisions, missing genesis, and
+gaps without modifying the directory.
+
+## Resume and rotation integrity
+
+When one pipelock writer process restarts or rotates the evidence file, the
+receipt emitter resumes its chain from the last persisted receipt. v2.2.0 hardens the
+resume path in three ways:
+
+- **Tail signature verification:** the resume code verifies the Ed25519
+  signature of the tail receipt before trusting its `chain_seq` and
+  chain hash. A tampered or partially-corrupted evidence file fails
+  fast rather than letting the next emitted receipt silently continue
+  from attacker-controlled state.
+- **Atomic resume:** the recorder computes the resumed sequence number,
+  previous hash, and first-sequence-in-span into local temporaries and
+  only mutates its internal state after all filesystem reads succeed.
+  A transient read error no longer leaves a half-initialised writer chain
+  that restarts from genesis.
+- **uint64 sequence parsing:** file ordering during resume uses
+  `strconv.ParseUint` so evidence filenames with sequence numbers
+  greater than `math.MaxInt` (or 32-bit builds) order correctly.
+
+These restart hardenings are transparent to verifiers — the wire format is
+unchanged. They protect the emitter side from bugs and tampering that
+would have produced broken or forgeable per-writer chains at restart.
+
+**Signing-key rotation no longer bricks a writer chain.** Earlier builds
+resumed by hard-verifying the persisted tail against the *current* signing key,
+so any legitimate operator key rotation orphaned that writer chain and failed
+every subsequent emit. When a configuration reload replaces the signing key,
+the new emitter opens a new chain segment for that writer: its first receipt
+links to the prior tail hash and carries a `KeyTransition` marker, so the
+boundary is provable and that writer chain stays offline-verifiable across the
+switch (see
+[Chains that rotated the signing key](#chains-that-rotated-the-signing-key)).
+The rotation is accepted only from a key this process itself loaded to sign
+receipts earlier in the run. A tail signed by any other key, even one whose signature is valid
+under the key embedded in it, is refused rather than vouched for, and the
+emitter fails closed with an error naming that key; since every run begins a new
+recorder session, such a tail means the evidence directory was altered. A tail
+whose own signature is invalid still fails closed as before.
+
+## Standalone `pipelock-verifier` CLI
+
+As of v2.5.0, Pipelock ships a standalone `pipelock-verifier` binary under
+`cmd/pipelock-verifier/`. It verifies legacy ActionReceipt v1 receipts and
+chains, EvidenceReceipt v2 envelopes and chains, and Audit Packets without
+running the proxy — auditors and SIEMs can drop it next to the agent platform
+without inheriting any of Pipelock's runtime surface.
+
+```bash
+# Verify an individual receipt
+pipelock-verifier receipt receipt.json
+
+# Verify a full chain
+pipelock-verifier chain evidence-proxy-0.jsonl
+
+# Verify an EvidenceReceipt v2 shadow chain with provenance
+pipelock-verifier chain evidence-proxy-0.jsonl \
+  --key receipt-signing.pub \
+  --expect-payload-kind shadow_delta \
+  --expect-contract sha256:...
+
+# Verify an EvidenceReceipt v2 chain against a known head, which is the only
+# check that detects entries dropped from the end
+pipelock-verifier chain evidence-proxy-0.jsonl \
+  --key receipt-signing.pub \
+  --expect-head 8f84164e084b32e25d3cd4ca0421599ab6fbbda52d839457acf0894ee6f467ee
+
+# Verify an Audit Packet with a signer key obtained outside the packet
+pipelock-verifier audit-packet ./audit-packet --key ./trusted-signing-key.pub
+```
+
+An Audit Packet report separates chain integrity from run lifecycle evidence.
+After chain re-verification, its `lifecycle` line reports the lifecycle status
+and reason, such as `LIMITED (abnormal_end)` when a valid in-flight chain has
+no signed `session_close`. That status does not change the packet's integrity
+verdict. With `--offline`, the report says lifecycle was not assessed because
+it did not re-read the receipt chain. The Go, Rust, and TypeScript
+verifiers emit `verdict: schema_checked_trust_unverified`, `trusted: false`,
+and `valid: false` in this mode, and their CLIs exit nonzero. This means only
+the packet schema was checked; the packet-authored verdict was not verified.
+Upgrade JSON consumers and CI jobs to treat this status as untrusted and
+require full chain verification for an authenticated verdict.
+
+For EvidenceReceipt v2, `--key` pins the trusted Ed25519 receipt-signing public
+key. Without `--key`, the verifier can check structure, hash linkage, sequence
+monotonicity, and signer-id consistency, but it reports signatures as not
+checked because v2 receipts do not embed public keys.
+
+**A valid chain is not a complete chain.** Structure, linkage, sequence, and
+signatures are all satisfied by any prefix of a chain, so a file with its
+trailing entries removed still verifies. The verifier reports this as
+`completeness: not proven` and returns `head_verified: false` in `--json`
+output. Pass `--expect-head` with the receipt hash of the entry the chain should
+end on to close it: a truncated or forked chain is then rejected, and the report
+reads `completeness: head verified`. Source that hash from trusted context
+outside the chain, such as a signed checkpoint or an anchored root. A head read
+from the same directory proves nothing on its own, because anyone able to remove
+entries can rewrite an unsigned value stored beside them.
+
+The standalone binary reads the same Audit Packet v0 schema and receipt signing
+conventions as the in-tree `pipelock verify-receipt` subcommand, plus the
+EvidenceReceipt v2 schema used by learn-and-lock. It returns exit 0 for valid
+evidence, exit 1 for invalid evidence, exit 2 for runtime errors, and exit 64
+for CLI usage errors. Use this binary in post-incident review and nightly audit
+jobs.
+
+## Language-portable verifier packages
+
+Pipelock provides four independent cross-language verifier implementations
+(Go, TypeScript, Rust, and Python) that run against the shared conformance
+corpus. A browser wasm surface reuses the Go verifier implementation. Pick the
+surface that fits your downstream audit pipeline:
+
+| Runtime | Path | Use case |
+|---|---|---|
+| Go (in-tree reference) | `sdk/audit-packet/` and `cmd/pipelock-verifier/` | Server-side audit pipelines, CI workflows, EvidenceReceipt v2 receipt/chain verification |
+| TypeScript | [`sdk/verifiers/ts/`](../../sdk/verifiers/ts/) | Node-based audit / SIEM, browser-side evidence inspection |
+| Rust | [`sdk/verifiers/rust/`](../../sdk/verifiers/rust/) | Embedded use, audit-platform sidecars, no-runtime environments |
+| Python (companion) | [`pipelock-verify-python`](https://github.com/luckyPipewrench/pipelock-verify-python) | Python-based audit pipelines and Jupyter analysis. Verifies ActionReceipt v1 chains and individual EvidenceReceipt v2 envelopes; install from PyPI as `pipelock-verify`. |
+| Browser wasm (Go implementation) | `cmd/pipelock-verifier-wasm/` | In-browser receipt and chain verification without treating wasm as an independent fifth implementation |
+
+The TypeScript and Rust verifiers ship with their own test suites that
+exercise the canonical vectors from the Go schema package, so a schema
+change that breaks any verifier fails the release before the tag. The
+verifier-CI workflow runs these tests on every PR.
+
+For TypeScript and Rust CLI directory verification, `--dir` defaults to the legacy `proxy` session. Pass `--session-id proxy.run.<id>` for a full run chain, using the full ID from its evidence filename. A direct JSONL file argument checks only that shard.
+
+## Audit Packet v0 schema
+
+The canonical packet schema lives at [`sdk/audit-packet/`](../../sdk/audit-packet/).
+It defines the evidence bundle around a receipt chain: run identity, observed
+policy hashes, verdict totals, verifier trust state, posture claims, and
+artifact paths. Downstream verifiers in any language read the same schema, so
+a verifier you write against the schema today keeps working as long as the
+schema major version (`v0`) stays stable.
+
+The schema covers:
+
+- **Run identity.** Provider, repository, workflow, ref, SHA, agent identity,
+  and run timestamps.
+- **Policy evidence.** Sorted policy hashes observed in receipts plus optional
+  config snapshot digest.
+- **Receipt summary.** Eight verdict buckets (`allow`, `block`, `warn`, `ask`,
+  `strip`, `forward`, `redirect`, `other`), transport counts, blocked-layer
+  counts, domains touched, and optional inline receipt summaries.
+- **Verifier trust.** `valid` evidence must be tied to a pinned signer key;
+  `self_consistent_only` proves hash-chain consistency but not signer
+  provenance.
+- **Posture claims.** Runtime status for raw sockets, Docker socket exposure,
+  DNS/UDP, browser proxying, WebSocket frame scanning, and explicit
+  unsupported paths.
+- **Artifact containment.** Packet artifact paths are relative, non-empty, and
+  cannot escape the packet directory.
+
+The Go bindings under `sdk/audit-packet/` are the language reference;
+they ship the canonical conformance vectors that every other verifier
+implementation tests against.
+
+## Cross-implementation conformance suite
+
+The `sdk/conformance/` directory contains golden test vectors for any
+receipt verifier implementation:
+
+| File | Purpose |
+|------|---------|
+| `testdata/test-key.json` | Test keypair seed and public key hex |
+| `testdata/valid-single.json` | Single valid receipt, seq 0, genesis prev |
+| `testdata/valid-chain.jsonl` | Five-receipt chain (one JSON per line) |
+| `testdata/invalid-signature.json` | Valid structure with tampered signature |
+| `testdata/broken-chain.jsonl` | Five receipts with a prev_hash break at seq 3 |
+
+The signing key is deterministic (seeded from a known phrase) so the golden
+files can be regenerated bit-identical:
+
+```bash
+go test ./sdk/conformance/ -run TestGenerateGoldenFiles -update
+```
+
+### Writing a verifier in another language
+
+1. Parse `test-key.json` to get the test public key.
+2. Verify `valid-single.json`: signature must pass, action record must
+   parse correctly.
+3. Verify `valid-chain.jsonl`: all 5 signatures must pass, chain must be
+   unbroken (seq 0-4, genesis first, prev_hash links valid).
+4. Reject `invalid-signature.json`: signature verification must fail.
+5. Reject `broken-chain.jsonl`: chain verification must fail at seq 3.
+
+A reference Python verifier is available at
+[pipelock-verify-python](https://github.com/luckyPipewrench/pipelock-verify-python).
+First-party TypeScript and Rust verifiers ship in-tree under
+`sdk/verifiers/ts/` and `sdk/verifiers/rust/`; the standalone
+`pipelock-verifier` Go CLI ships under `cmd/pipelock-verifier/`. The Go,
+TypeScript, and Rust implementations validate the same canonical conformance
+vectors; the Python companion continues to cover the v1 chain surface noted
+above.
+
+## Exporting the signer key
+
+On a Pipelock host, export the verifier key from the configured
+flight-recorder signing key:
+
+```bash
+pipelock signing pubkey --config /etc/pipelock/pipelock.yaml --out /etc/pipelock/keys/flight-recorder-signing.key.pub
+pipelock verify-receipt receipt.json --key /etc/pipelock/keys/flight-recorder-signing.key.pub
+```
+
+The exported file is public key material only. Do not hand verifiers the private
+file named by `flight_recorder.signing_key_path`.
+
+## See also
+
+- [Flight recorder guide](flight-recorder.md) for configuring evidence logging
+- [Mediation envelope guide](mediation-envelope.md) for receipt ID correlation
+- [Receipt transport coverage](receipt-transports.md) for the per-transport emission matrix and error-path receipt coverage
+- [Configuration reference](../configuration.md#flight-recorder-v21) for all recorder fields

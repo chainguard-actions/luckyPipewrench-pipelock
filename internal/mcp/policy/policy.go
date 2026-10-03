@@ -1,0 +1,1777 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+// Package policy provides MCP tool call policy rules for pre-execution checking.
+// Rules match tool names and argument patterns to detect dangerous operations.
+package policy
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"math/big"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/a2amethods"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/jsonrpc"
+	"github.com/luckyPipewrench/pipelock/internal/normalize"
+	"github.com/luckyPipewrench/pipelock/internal/redact"
+)
+
+const (
+	uninspectableJSONDepthRule    = "uninspectable_json_depth"
+	uninspectablePatchTargetsRule = "uninspectable_patch_targets"
+	duplicateJSONKeyRule          = "duplicate_json_object_key"
+	malformedA2AParamsRule        = "malformed_a2a_params"
+)
+
+// shellExpansionRe matches shell variable expansions used as whitespace substitutes.
+// Attackers use ${IFS} or $IFS to replace spaces: "rm${IFS}-rf" expands to "rm -rf"
+// at runtime, but policy sees the literal "${IFS}" token. Normalizing these to spaces
+// before regex matching ensures policy catches the intended command.
+//
+// Covers common parameter expansion forms:
+//   - $IFS (bare), ${IFS} (braced)
+//   - ${IFS:0:1} (substring), ${IFS%%?} / ${IFS#?} (pattern removal)
+//   - ${!IFS} (indirect expansion)
+var shellExpansionRe = regexp.MustCompile(`\$\{!?IFS(?:[^a-zA-Z0-9_}][^}]*)?\}|\$IFS\b`)
+
+// shellOctalRe matches shell octal escape sequences (\NNN where N is 0-7).
+// In bash, $'\155' decodes to 'm'. Decoding these reveals the intended command:
+// "r\155 -rf" becomes "rm -rf". Must run before shellEscapeRe.
+var shellOctalRe = regexp.MustCompile(`\\([0-7]{1,3})`)
+
+// shellHexRe matches shell hex escape sequences (\xHH).
+// In bash, $'\x6d' decodes to 'm'. Decoding these reveals the intended command.
+var shellHexRe = regexp.MustCompile(`\\x([0-9a-fA-F]{2})`)
+
+// shellEscapeRe matches backslash-escaped word characters used to break command
+// keywords. In bash, backslash before a non-special character is a no-op:
+// "r\m -rf" executes identically to "rm -rf". Stripping these lets policy
+// regex see the intended command. Runs after octal/hex decode.
+var shellEscapeRe = regexp.MustCompile(`\\(\w)`)
+
+// shellPositionalRe strips $@ and $* which expand to empty when there are no
+// positional parameters (the common case in non-interactive MCP tool calls).
+// Attackers insert these to break command keywords: "r$@m" → "rm".
+// Only covers $@ $* ${@} ${*} - these are reliably empty in MCP contexts.
+// Does NOT strip $0-$9, $?, $_, etc. which are non-empty in real bash.
+//
+// Assumption: MCP tool calls execute commands without positional parameters.
+// If a wrapper script passes args into the shell (e.g. "set -- X; r$@m"),
+// $@ is non-empty and stripping it synthesizes a false match. This is an
+// accepted trade-off: blocking a benign wrapped command is safer than
+// letting "r$@m -rf /" through in the vastly more common parameterless case.
+var shellPositionalRe = regexp.MustCompile(`\$\{[@*]\}|\$[@*]`)
+
+// shellHomeSlashRe matches parameter substring expansions that evaluate to "/"
+// at runtime. Attackers use these to build file paths dynamically:
+// "cat ${HOME:0:1}etc${HOME:0:1}passwd" → "cat /etc/passwd".
+// Covers both bash substring forms:
+//   - ${HOME:0:1} (standard offset:length)
+//   - ${HOME::1}  (omitted offset, equivalent to :0:1)
+//
+// Matches HOME, PWD, OLDPWD - variables whose first character is always "/".
+var shellHomeSlashRe = regexp.MustCompile(`\$\{(?:HOME|PWD|OLDPWD)(?::0:1|::1)\}`)
+
+// simpleCmdSubRe matches simple command substitutions used to build command names.
+// $(printf rm), $(echo rm), and $(printf %s rm) are evasion techniques that hide
+// the real command. The optional (?:['"]?%\S*['"]?\s+)* handles printf format
+// arguments: $(printf %s rm), $(printf '%b' rm), etc.
+var simpleCmdSubRe = regexp.MustCompile(`\$\(\s*(?:echo|printf)\s+(?:['"]?%\S*['"]?\s+)*['"]?(\w+)['"]?\s*\)`)
+
+// backtickCmdSubRe matches backtick command substitutions equivalent to $().
+// `printf rm`, `echo rm` are evasion techniques identical to $(printf rm).
+// Backticks are stripped by shellQuoteStripper, but the command inside needs
+// to be resolved first - otherwise `printf rm` becomes "printf rm" (literal)
+// instead of "rm" (resolved).
+var backtickCmdSubRe = regexp.MustCompile("`\\s*(?:echo|printf)\\s+(?:['\"]?%\\S*['\"]?\\s+)*['\"]?(\\w+)['\"]?\\s*`")
+
+// simpleAssignRe matches shell variable assignment followed by separator.
+// "x=rm;$x -rf" hides the command name in a variable.
+// Value group captures non-whitespace/non-separator chars to handle IFS
+// manipulation: "IFS=,;CMD=r,m;$CMD" assigns `,` and `r,m` respectively.
+var simpleAssignRe = regexp.MustCompile(`(\w+)=([^\s;&|]+)\s*[;&|]`)
+
+// braceExpansionRe matches bash brace expansion used to construct commands.
+// {rm,-rf,/tmp} expands to "rm -rf /tmp" at runtime. Requires at least two
+// comma-separated items. Items may be empty to catch evasion patterns like
+// {rm,} (trailing empty) and {,rm} (leading empty), both of which bash
+// expands to include "rm". At least one item must contain a shell-safe
+// character to avoid false positives on JSON or other brace-delimited syntax.
+var braceExpansionRe = regexp.MustCompile(`\{([\w./:~@=*?+-]*(?:,[\w./:~@=*?+-]*)+)\}`)
+
+// shellQuoteStripper removes shell quoting artifacts left over from ANSI-C
+// quoting (e.g. $'\x6d' framing). After decodeShellEscapes, r$'\x6d' becomes
+// r$'m' - the $' prefix and trailing quote prevent regex from seeing "rm".
+// The $' pair is stripped first (ANSI-C opening), then remaining lone quotes.
+var shellQuoteStripper = strings.NewReplacer("$'", "", `$"`, "", "'", "", `"`, "", "`", "")
+
+// policyPreNormalize maps ambiguous confusables to their command-relevant Latin
+// equivalent. The shared confusableMap maps Cyrillic у → 'y' (correct for injection
+// detection: "you are now"), but this creates a bypass for command matching:
+// c\u0443rl normalizes to "cyrl" instead of "curl", evading the Network Exfiltration
+// rule. This replacer runs BEFORE normalize.ForMatching in the policy-specific
+// normalization view only.
+//
+// IMPORTANT: Some mappings here conflict with the shared confusable map:
+//   - в → 'b' here vs в → 'v' in confusableMap (affects mv, vi, shred)
+//   - н → 'n' here vs н → 'h' in confusableMap (affects sh, shred)
+//
+// The policy matcher uses dual-view matching to handle this: it checks BOTH
+// the policy-normalized form (pre-normalizer + ForMatching) and the baseline
+// form (ForMatching only). A match on either view triggers the rule.
+var policyPreNormalize = strings.NewReplacer(
+	"\u0443", "u", // Cyrillic у - used as 'u' in curl/sudo/su/run
+	"\u0423", "U", // Cyrillic У (uppercase)
+	"\u0432", "b", // Cyrillic в - used as 'b' in bash/base64
+	"\u0412", "B", // Cyrillic В (uppercase)
+	"\u043D", "n", // Cyrillic н - used as 'n' in node/npm/nc
+	"\u041D", "N", // Cyrillic Н (uppercase)
+)
+
+// Config holds compiled tool call policy rules for pre-execution checking.
+// A nil Config disables policy checking.
+type Config struct {
+	Action                string // default action: warn, block, redirect
+	Rules                 []*CompiledRule
+	RedirectProfiles      map[string]config.RedirectProfile      // keyed by profile name
+	DeferResolverProfiles map[string]config.DeferResolverProfile // keyed by profile name
+
+	// localPaths, when set, also matches what submitted paths resolve to on
+	// this host. See EnableLocalPathIdentity.
+	localPaths *localPathIdentity
+}
+
+// CompiledRule holds a pre-compiled policy rule ready for matching.
+type CompiledRule struct {
+	Name             string
+	ToolPattern      *regexp.Regexp
+	ArgPattern       *regexp.Regexp // nil = match on tool name alone
+	ArgKey           *regexp.Regexp // nil = match all arg values; non-nil = scope to matching keys
+	ArgSource        string
+	ArgType          string
+	ArgNumberGT      *json.Number
+	ArgNumberLT      *json.Number
+	ArgLenGT         *int
+	ArgLenLT         *int
+	ArgValueIn       map[string]struct{}
+	Action           string // per-rule override, empty = use Config.Action
+	RedirectProfile  string // key in redirect_profiles (when action=redirect)
+	ResolutionPolicy config.DeferResolutionPolicy
+}
+
+// Verdict describes the outcome of checking a tool call against policy.
+type Verdict struct {
+	Matched          bool
+	Action           string   // effective action (from rule override or default)
+	Rules            []string // names of matched rules
+	RedirectProfile  string   // redirect profile key (set when action=redirect)
+	ResolutionPolicy config.DeferResolutionPolicy
+	// Notes explain a cause the rule name does not show, such as a protected
+	// directory that could not be listed to rule out a hard link. They never
+	// change the action or the rule names.
+	Notes []string
+}
+
+// New compiles policy rules from config. Returns nil if disabled or no rules
+// are configured. Panics on invalid regex; the caller must validate config
+// first (config.Validate compiles all patterns).
+func New(cfg config.MCPToolPolicy) *Config {
+	if !cfg.Enabled || len(cfg.Rules) == 0 {
+		return nil
+	}
+	pc := &Config{
+		Action:                cfg.Action,
+		RedirectProfiles:      cfg.RedirectProfiles,
+		DeferResolverProfiles: cfg.DeferResolverProfiles,
+	}
+	for _, r := range cfg.Rules {
+		compiled := &CompiledRule{
+			Name:            r.Name,
+			ToolPattern:     regexp.MustCompile(r.ToolPattern),
+			ArgSource:       r.ArgSource,
+			ArgType:         r.ArgType,
+			ArgNumberGT:     r.ArgNumberGT,
+			ArgNumberLT:     r.ArgNumberLT,
+			ArgLenGT:        r.ArgLenGT,
+			ArgLenLT:        r.ArgLenLT,
+			Action:          r.Action,
+			RedirectProfile: r.RedirectProfile,
+		}
+		if r.ResolutionPolicy != nil {
+			compiled.ResolutionPolicy = *r.ResolutionPolicy
+		}
+		if r.ArgPattern != "" {
+			compiled.ArgPattern = regexp.MustCompile(r.ArgPattern)
+		}
+		if r.ArgKey != "" {
+			compiled.ArgKey = regexp.MustCompile(r.ArgKey)
+		}
+		if len(r.ArgValueIn) > 0 {
+			compiled.ArgValueIn = make(map[string]struct{}, len(r.ArgValueIn))
+			for _, value := range r.ArgValueIn {
+				compiled.ArgValueIn[value] = struct{}{}
+			}
+		}
+		pc.Rules = append(pc.Rules, compiled)
+	}
+	return pc
+}
+
+// CheckToolCall evaluates a tool call against policy rules.
+// toolName is the MCP tool name (params.name). argStrings are all string
+// values extracted from params.arguments.
+// Equivalent to CheckToolCallWithArgs(toolName, argStrings, nil).
+func (pc *Config) CheckToolCall(toolName string, argStrings []string) Verdict {
+	return pc.CheckToolCallWithArgs(toolName, argStrings, nil)
+}
+
+// CheckToolCallWithArgs evaluates a tool call against policy rules.
+// argStrings contains all argument values (for rules without arg_key).
+// rawArgs is the raw JSON arguments (for rules with arg_key or structural
+// validators that need parsed argument values). rawArgs may be nil when callers
+// cannot provide the original JSON.
+//
+// Three matching strategies handle different evasion techniques:
+//  1. Joined string - catches array-split evasion (["rm","-rf","/"])
+//  2. Individual strings - catches path patterns (.ssh/id_rsa)
+//  3. Pairwise token combinations - catches map-ordering evasion where
+//     command and flags land in separate values with non-deterministic order
+func (pc *Config) CheckToolCallWithArgs(toolName string, argStrings []string, rawArgs json.RawMessage) Verdict {
+	if pc == nil || len(pc.Rules) == 0 {
+		return Verdict{}
+	}
+
+	// Two tool-name normalization views catch both policy-specific and
+	// baseline confusable mappings. The policy pre-normalizer maps Cyrillic
+	// в→b and н→n (for bash/base64/node/npm/nc), but the shared confusable
+	// map maps в→v and н→h (for mv/shred/vi/sh). Running the pre-normalizer
+	// first permanently destroys the baseline mappings, so we check BOTH:
+	//  - policyToolName: policyPreNormalize then ForMatching (catches curl, sudo, bash, etc.)
+	//  - baselineToolName: ForMatching only (catches mv, vi, sh, etc.)
+	policyToolName := normalize.ForMatching(policyPreNormalize.Replace(toolName))
+	baselineToolName := normalize.ForMatching(toolName)
+
+	// Flatten multi-token values (e.g. "-r -f" → ["-r", "-f"]) so that
+	// flags split within a single field are treated as separate tokens.
+	//
+	// Normalization pipeline (order matters):
+	//  - Unicode normalization (zero-width, homoglyphs, combining marks)
+	//  - Octal/hex escape decode (\155 → m, \x6d → m)
+	//  - Backtick command substitution resolve (`printf rm` → rm)
+	//  - Shell quote strip ($'...' framing, lone quotes, backticks)
+	//  - Backslash escape strip (\m → m)
+	//  - Positional parameter strip ($@ / $* → empty)
+	//  - Command substitution + variable assignment resolve ($(printf rm) → rm)
+	//  - HOME/PWD slash replacement (${HOME:0:1}, ${HOME::1} → /)
+	//  - Brace expansion resolve ({rm,-rf,/tmp} → rm -rf /tmp)
+	//  - Shell expansion normalize (${IFS} → space)
+	//
+	// Three normalization views catch different evasion strategies:
+	//  - Primary (policy): policyPreNormalize + drop invisible (catches curl, bash, node)
+	//  - Alt (policy): policyPreNormalize + invisible→space (catches ZW separators)
+	//  - Baseline: no pre-normalizer + drop invisible (catches mv, shred, vi, sh via в→v, н→h)
+	// A match on ANY view triggers the rule.
+	//
+	// With local path identity enabled, the resolved location of each submitted
+	// path joins the match set, so a link to a protected file matches the rule
+	// that protects it.
+	matchArgs, linkNotes := pc.localPaths.expandNoted(argStrings)
+	tokens, joined := normalizeArgTokens(matchArgs, normalize.ForMatching, policyPreNormalize)
+	altTokens, altJoined := normalizeArgTokens(matchArgs, normalize.ForPolicy, policyPreNormalize)
+	baseTokens, baseJoined := normalizeArgTokens(matchArgs, normalize.ForMatching, nil)
+	// Literal view: each submitted string exactly as sent. Normalization strips
+	// shell quotes, which is right for command text but lets a file tool path
+	// such as `id_rsa.p'ub` read as `id_rsa.pub` while the tool opens the file
+	// with the quote in its name. Matching the literal string as well keeps a
+	// normalized spelling from narrowing what a pattern sees.
+	rawTokens, rawJoined := literalArgTokens(matchArgs)
+
+	var matchedRules []string
+	strictest := ""
+	redirectProfile := ""
+	var resolutionPolicy config.DeferResolutionPolicy
+
+	for _, rule := range pc.Rules {
+		// Check tool name against both normalization views.
+		if !rule.ToolPattern.MatchString(policyToolName) && !rule.ToolPattern.MatchString(baselineToolName) {
+			continue
+		}
+
+		// Key-scoped rules: extract only values under matching top-level keys,
+		// then normalize and match those instead of all values. If raw
+		// arguments are unavailable, skip best-effort pattern-only rules rather
+		// than falling back to unscoped matching; structural validators need raw
+		// JSON, so they fail closed instead.
+		ruleTokens, ruleJoined := tokens, joined
+		ruleAltTokens, ruleAltJoined := altTokens, altJoined
+		ruleBaseTokens, ruleBaseJoined := baseTokens, baseJoined
+		ruleRawTokens, ruleRawJoined := rawTokens, rawJoined
+		patchInspection := patchTargetsOrdinary
+		if rule.ArgKey != nil && len(rawArgs) == 0 {
+			if rule.hasStructuralValidators() {
+				return uninspectableStructuralArgsVerdict(rule.Name)
+			}
+			continue
+		}
+		if rule.ArgKey != nil && rule.ArgPattern != nil {
+			scoped := jsonrpc.ExtractStringsForKeysResult(rawArgs, rule.ArgKey)
+			if scoped.Truncated {
+				return uninspectableJSONDepthVerdict()
+			}
+			scopedStrings, scopedNotes := pc.localPaths.expandNoted(scoped.Strings)
+			linkNotes = appendUniqueNotes(linkNotes, scopedNotes)
+			ruleTokens, ruleJoined = normalizeArgTokens(scopedStrings, normalize.ForMatching, policyPreNormalize)
+			ruleAltTokens, ruleAltJoined = normalizeArgTokens(scopedStrings, normalize.ForPolicy, policyPreNormalize)
+			ruleBaseTokens, ruleBaseJoined = normalizeArgTokens(scopedStrings, normalize.ForMatching, nil)
+			ruleRawTokens, ruleRawJoined = literalArgTokens(scopedStrings)
+		}
+		if rule.ArgSource == config.ToolPolicyArgSourcePatchTargets {
+			patchTargets, inspection := extractPatchTargetPaths(argStrings)
+			patchInspection = inspection
+			if inspection != patchTargetsOrdinary {
+				expandedTargets, patchNotes := pc.localPaths.expandNoted(withPatchPrefixStripped(patchTargets))
+				linkNotes = appendUniqueNotes(linkNotes, patchNotes)
+				matchStrings := patchTargetMatchStrings(argStrings, expandedTargets)
+				ruleTokens, ruleJoined = normalizeArgTokens(matchStrings, normalize.ForMatching, policyPreNormalize)
+				ruleAltTokens, ruleAltJoined = normalizeArgTokens(matchStrings, normalize.ForPolicy, policyPreNormalize)
+				ruleBaseTokens, ruleBaseJoined = normalizeArgTokens(matchStrings, normalize.ForMatching, nil)
+				ruleRawTokens, ruleRawJoined = literalArgTokens(matchStrings)
+			}
+		}
+
+		argPatternMatched := patchInspection == patchTargetsUninspectable || rule.ArgPattern == nil ||
+			matchArgPattern(rule.ArgPattern, ruleTokens, ruleJoined) ||
+			matchArgPattern(rule.ArgPattern, ruleAltTokens, ruleAltJoined) ||
+			matchArgPattern(rule.ArgPattern, ruleBaseTokens, ruleBaseJoined) ||
+			matchArgPattern(rule.ArgPattern, ruleRawTokens, ruleRawJoined)
+		// The shipped credential exception describes one submitted value. JSON
+		// keys and local aliases are not additional arguments to that value.
+		// Keep the shared pairwise matcher unchanged for every other rule and
+		// for calls with more than one string value.
+		if matched, handled := pc.matchSingleCredentialArgument(rule, argStrings, rawArgs); handled {
+			argPatternMatched = matched
+		}
+		if !argPatternMatched {
+			continue
+		}
+
+		structuralMatched, uninspectable := rule.matchStructuralValidators(rawArgs)
+		if uninspectable {
+			return uninspectableJSONDepthVerdict()
+		}
+		if !structuralMatched {
+			continue
+		}
+
+		matchedRule := rule.Name
+		if patchInspection == patchTargetsUninspectable {
+			matchedRule = uninspectablePatchTargetsRule
+			matchedRules = appendUniqueRule(matchedRules, matchedRule)
+		} else {
+			matchedRules = append(matchedRules, matchedRule)
+		}
+		action := rule.Action
+		if action == "" {
+			action = pc.Action
+		}
+		prev := strictest
+		strictest = StricterAction(strictest, action)
+		if strictest != prev && action == config.ActionRedirect {
+			redirectProfile = rule.RedirectProfile
+		}
+		if strictest != prev && action == config.ActionDefer {
+			resolutionPolicy = rule.ResolutionPolicy
+		}
+	}
+
+	if len(matchedRules) == 0 {
+		return Verdict{}
+	}
+
+	// Clear redirect profile if a stricter action (block) won.
+	if strictest != config.ActionRedirect {
+		redirectProfile = ""
+	}
+	if strictest != config.ActionDefer {
+		resolutionPolicy = config.DeferResolutionPolicy{}
+	}
+
+	return Verdict{
+		Matched:          true,
+		Action:           strictest,
+		Rules:            matchedRules,
+		RedirectProfile:  redirectProfile,
+		ResolutionPolicy: resolutionPolicy,
+		Notes:            linkNotes,
+	}
+}
+
+func appendUniqueNotes(notes, more []string) []string {
+	for _, n := range more {
+		if !slices.Contains(notes, n) {
+			notes = append(notes, n)
+		}
+	}
+	return notes
+}
+
+func appendUniqueRule(rules []string, rule string) []string {
+	for _, existing := range rules {
+		if existing == rule {
+			return rules
+		}
+	}
+	return append(rules, rule)
+}
+
+// normalizeArgTokens applies an optional pre-normalizer, a Unicode normalization
+// function, shell escape decoding, and shell construction resolution to
+// each argument string, then splits into tokens. normFn selects the Unicode
+// normalization strategy (normalize.ForMatching drops invisible chars,
+// normalize.ForPolicy replaces them with spaces). preNorm applies policy-specific
+// confusable remapping before Unicode normalization; pass nil to use only the
+// baseline confusable map from normalize.ForMatching.
+func normalizeArgTokens(argStrings []string, normFn func(string) string, preNorm *strings.Replacer) ([]string, string) {
+	var tokens []string
+	for _, s := range argStrings {
+		if preNorm != nil {
+			s = preNorm.Replace(s)
+		}
+		normalized := normFn(s)
+		normalized = decodeShellEscapes(normalized)
+		normalized = backtickCmdSubRe.ReplaceAllString(normalized, "$1")
+		normalized = shellQuoteStripper.Replace(normalized)
+		normalized = shellEscapeRe.ReplaceAllString(normalized, "$1")
+		normalized = shellPositionalRe.ReplaceAllString(normalized, "")
+		normalized = resolveShellConstruction(normalized)
+		normalized = shellHomeSlashRe.ReplaceAllString(normalized, "/")
+		normalized = expandBraces(normalized)
+		normalized = shellExpansionRe.ReplaceAllString(normalized, " ")
+		normalized = collapsePathSeparators(normalized)
+		tokens = append(tokens, strings.Fields(normalized)...)
+	}
+	return tokens, strings.Join(tokens, " ")
+}
+
+// pathSeparatorRunRe matches a run of `/` and `./` segments that a filesystem
+// resolves to a single separator. The run must begin at the start of the text
+// or after a character other than `:`, so a URL keeps its `://`.
+var pathSeparatorRunRe = regexp.MustCompile(`(^|[^:/])/(?:\.?/)+`)
+
+// collapsePathSeparators rewrites `/var//log/x`, `/var/./log/x`, and
+// `//var/log/x` to `/var/log/x` before pattern matching, so a path rule sees
+// the spelling the server resolves rather than the one the caller typed.
+// `..` segments are left alone: the path rules match protected namespaces as
+// segments anywhere in the value, so a traversal spelling still matches.
+func collapsePathSeparators(s string) string {
+	return pathSeparatorRunRe.ReplaceAllString(s, "${1}/")
+}
+
+// maxPairwiseTokens caps token count for O(n²) pairwise matching.
+// Kept at 64 to bound worst-case regex work (~4K pairs × rules).
+// Higher values create DoS risk (256 tokens = ~2M regex matches).
+const maxPairwiseTokens = 64
+
+// matchArgPattern checks if a regex pattern matches against any view of the
+// argument tokens. It uses three strategies:
+//  1. Full joined string (fast path for ordered arrays)
+//  2. Individual tokens (catches self-contained patterns like file paths)
+//  3. Pairwise token combinations (catches map-ordering evasion where command
+//     and flags end up in separate tokens with non-deterministic iteration order)
+//
+// literalArgTokens returns the submitted strings unmodified, each as one
+// token, and their space-joined form.
+func literalArgTokens(args []string) ([]string, string) {
+	return args, strings.Join(args, " ")
+}
+
+func matchArgPattern(pat *regexp.Regexp, tokens []string, joined string) bool {
+	if pat.MatchString(joined) {
+		return true
+	}
+	for _, t := range tokens {
+		if pat.MatchString(t) {
+			return true
+		}
+	}
+	// Pairwise: check "A B" and "B A" for every distinct pair.
+	// Typical arg lists have 3-10 tokens, so this is 6-90 checks - negligible cost.
+	// Capped at maxPairwiseTokens to prevent DoS from adversarial inputs.
+	if len(tokens) <= maxPairwiseTokens {
+		for i, a := range tokens {
+			for j, b := range tokens {
+				if i != j && pat.MatchString(a+" "+b) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+const (
+	gitDiffMarker          = "diff --git"
+	gitDiffHeader          = gitDiffMarker + " "
+	gitRenameFromHeader    = "rename from "
+	gitRenameToHeader      = "rename to "
+	gitCopyFromHeader      = "copy from "
+	gitCopyToHeader        = "copy to "
+	unifiedOldFileHeader   = "--- "
+	unifiedNewFileHeader   = "+++ "
+	applyPatchHeaderPrefix = "*** "
+	applyPatchBeginHeader  = "*** Begin Patch"
+	applyPatchEndHeader    = "*** End Patch"
+	applyPatchUpdateHeader = "*** Update File: "
+	applyPatchAddHeader    = "*** Add File: "
+	applyPatchDeleteHeader = "*** Delete File: "
+	applyPatchMoveHeader   = "*** Move to: "
+)
+
+type gitPatchTargets struct {
+	oldPath    string
+	newPath    string
+	oldHeader  string
+	newHeader  string
+	renameFrom string
+	renameTo   string
+	copyFrom   string
+	copyTo     string
+}
+
+type patchTargetInspection uint8
+
+const (
+	patchTargetsOrdinary patchTargetInspection = iota
+	patchTargetsInspectable
+	patchTargetsUninspectable
+)
+
+// extractPatchTargetPaths returns the semantic file targets named by Git,
+// unified-diff, or Codex apply_patch headers. Move-class operations expose both
+// sides because they can remove or replace either protected path. Copy-class
+// operations expose only the destination so a protected source may be backed
+// up to an ordinary path. Input without a patch framing or target header is
+// ordinary structured tool input and falls back to all-argument matching.
+// Patch-shaped input that cannot be inspected fails in the configured direction.
+func extractPatchTargetPaths(argStrings []string) ([]string, patchTargetInspection) {
+	var targets []string
+	var gitSection *gitPatchTargets
+	var pendingUnifiedOld string
+	var sawPatchShape, sawTargetHeader, malformed bool
+	var applyPatchBegins, applyPatchEnds int
+	// Hunk bodies are consumed by the line counts in their `@@` header, the way
+	// git apply and GNU patch consume them, so a removed line that begins with
+	// `-- ` or an added line that begins with `++ ` is content and never a file
+	// header. Inside a Codex apply_patch envelope only `*** ` lines are headers.
+	var oldRemaining, newRemaining int
+
+	flushGitSection := func() {
+		if gitSection == nil {
+			return
+		}
+		copyOperation := gitSection.copyFrom != "" || gitSection.copyTo != ""
+		renameOperation := gitSection.renameFrom != "" || gitSection.renameTo != ""
+		if (gitSection.copyFrom == "") != (gitSection.copyTo == "") ||
+			(gitSection.renameFrom == "") != (gitSection.renameTo == "") ||
+			copyOperation && renameOperation {
+			malformed = true
+		}
+		if copyOperation {
+			for _, target := range []string{gitSection.newPath, gitSection.newHeader, gitSection.copyTo} {
+				targets = appendPatchTarget(targets, target)
+			}
+		} else {
+			for _, target := range []string{
+				gitSection.oldPath,
+				gitSection.newPath,
+				gitSection.oldHeader,
+				gitSection.newHeader,
+				gitSection.renameFrom,
+				gitSection.renameTo,
+			} {
+				targets = appendPatchTarget(targets, target)
+			}
+		}
+		gitSection = nil
+	}
+
+	for _, arg := range argStrings {
+		lines := strings.Split(arg, "\n")
+		if n := len(lines); n > 0 && lines[n-1] == "" {
+			lines = lines[:n-1]
+		}
+		for _, rawLine := range lines {
+			line := strings.TrimSuffix(rawLine, "\r")
+			if isPatchShapeMarker(line) {
+				sawPatchShape = true
+			}
+			if oldRemaining > 0 || newRemaining > 0 {
+				if consumeHunkLine(line, &oldRemaining, &newRemaining) {
+					continue
+				}
+				malformed = true
+				oldRemaining, newRemaining = 0, 0
+			}
+			if applyPatchBegins > applyPatchEnds && !strings.HasPrefix(line, applyPatchHeaderPrefix) {
+				continue
+			}
+			if m := unifiedHunkHeaderRe.FindStringSubmatch(line); m != nil {
+				oldCount, okOld := hunkLineCount(m[1])
+				newCount, okNew := hunkLineCount(m[2])
+				if !okOld || !okNew {
+					malformed = true
+					continue
+				}
+				oldRemaining, newRemaining = oldCount, newCount
+				continue
+			}
+			if strings.HasPrefix(line, gitDiffHeader) {
+				flushGitSection()
+				sawTargetHeader = true
+				oldPath, newPath, ok := parseGitDiffPaths(strings.TrimPrefix(line, gitDiffHeader))
+				if !ok {
+					malformed = true
+					continue
+				}
+				gitSection = &gitPatchTargets{oldPath: oldPath, newPath: newPath}
+				continue
+			}
+
+			switch {
+			case line == applyPatchBeginHeader:
+				applyPatchBegins++
+			case line == applyPatchEndHeader:
+				applyPatchEnds++
+			case strings.HasPrefix(line, unifiedOldFileHeader):
+				sawTargetHeader = true
+				path, ok := parsePatchPath(strings.TrimPrefix(line, unifiedOldFileHeader), true)
+				if !ok {
+					malformed = true
+					continue
+				}
+				pendingUnifiedOld = path
+				if gitSection != nil {
+					gitSection.oldHeader = path
+				}
+			case strings.HasPrefix(line, unifiedNewFileHeader):
+				sawTargetHeader = true
+				path, ok := parsePatchPath(strings.TrimPrefix(line, unifiedNewFileHeader), true)
+				if !ok {
+					malformed = true
+					continue
+				}
+				if gitSection != nil {
+					gitSection.newHeader = path
+				} else if pendingUnifiedOld != "" {
+					targets = appendPatchTarget(targets, pendingUnifiedOld)
+					targets = appendPatchTarget(targets, path)
+				}
+				pendingUnifiedOld = ""
+			case strings.HasPrefix(line, gitRenameFromHeader):
+				sawTargetHeader = true
+				path, ok := parsePatchPath(strings.TrimPrefix(line, gitRenameFromHeader), false)
+				if !ok || gitSection == nil {
+					malformed = true
+					continue
+				}
+				gitSection.renameFrom = path
+			case strings.HasPrefix(line, gitRenameToHeader):
+				sawTargetHeader = true
+				path, ok := parsePatchPath(strings.TrimPrefix(line, gitRenameToHeader), false)
+				if !ok || gitSection == nil {
+					malformed = true
+					continue
+				}
+				gitSection.renameTo = path
+			case strings.HasPrefix(line, gitCopyFromHeader):
+				sawTargetHeader = true
+				path, ok := parsePatchPath(strings.TrimPrefix(line, gitCopyFromHeader), false)
+				if !ok || gitSection == nil {
+					malformed = true
+					continue
+				}
+				gitSection.copyFrom = path
+			case strings.HasPrefix(line, gitCopyToHeader):
+				sawTargetHeader = true
+				path, ok := parsePatchPath(strings.TrimPrefix(line, gitCopyToHeader), false)
+				if !ok || gitSection == nil {
+					malformed = true
+					continue
+				}
+				gitSection.copyTo = path
+			case strings.HasPrefix(line, applyPatchUpdateHeader):
+				sawTargetHeader = true
+				path, ok := parsePatchPath(strings.TrimPrefix(line, applyPatchUpdateHeader), false)
+				if !ok {
+					malformed = true
+					continue
+				}
+				targets = appendPatchTarget(targets, path)
+			case strings.HasPrefix(line, applyPatchAddHeader):
+				sawTargetHeader = true
+				path, ok := parsePatchPath(strings.TrimPrefix(line, applyPatchAddHeader), false)
+				if !ok {
+					malformed = true
+					continue
+				}
+				targets = appendPatchTarget(targets, path)
+			case strings.HasPrefix(line, applyPatchDeleteHeader):
+				sawTargetHeader = true
+				path, ok := parsePatchPath(strings.TrimPrefix(line, applyPatchDeleteHeader), false)
+				if !ok {
+					malformed = true
+					continue
+				}
+				targets = appendPatchTarget(targets, path)
+			case strings.HasPrefix(line, applyPatchMoveHeader):
+				sawTargetHeader = true
+				path, ok := parsePatchPath(strings.TrimPrefix(line, applyPatchMoveHeader), false)
+				if !ok {
+					malformed = true
+					continue
+				}
+				targets = appendPatchTarget(targets, path)
+			}
+		}
+		if oldRemaining > 0 || newRemaining > 0 {
+			malformed = true
+			oldRemaining, newRemaining = 0, 0
+		}
+	}
+	flushGitSection()
+
+	if pendingUnifiedOld != "" {
+		malformed = true
+	}
+	if applyPatchBegins != applyPatchEnds {
+		malformed = true
+	}
+	if !sawPatchShape {
+		return nil, patchTargetsOrdinary
+	}
+	if !sawTargetHeader || malformed {
+		return targets, patchTargetsUninspectable
+	}
+	return targets, patchTargetsInspectable
+}
+
+// unifiedHunkHeaderRe captures the old and new line counts of a unified hunk
+// header. An omitted count means one line, as in `@@ -1 +1 @@`.
+var unifiedHunkHeaderRe = regexp.MustCompile(`^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@`)
+
+func hunkLineCount(count string) (int, bool) {
+	if count == "" {
+		return 1, true
+	}
+	n, err := strconv.Atoi(count)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// consumeHunkLine charges one body line against the counts declared by the
+// enclosing hunk header. It reports false for a line that no applier would
+// accept inside a hunk, or one that overruns the declared counts.
+func consumeHunkLine(line string, oldRemaining, newRemaining *int) bool {
+	switch {
+	case strings.HasPrefix(line, `\ `):
+		// "\ No newline at end of file" annotates the preceding line.
+		return true
+	case line == "" || line[0] == ' ':
+		*oldRemaining--
+		*newRemaining--
+	case line[0] == '-':
+		*oldRemaining--
+	case line[0] == '+':
+		*newRemaining--
+	default:
+		return false
+	}
+	return *oldRemaining >= 0 && *newRemaining >= 0
+}
+
+func isPatchShapeMarker(line string) bool {
+	return line == gitDiffMarker ||
+		strings.HasPrefix(line, gitDiffHeader) ||
+		line == strings.TrimSpace(unifiedOldFileHeader) ||
+		strings.HasPrefix(line, unifiedOldFileHeader) ||
+		line == strings.TrimSpace(unifiedNewFileHeader) ||
+		strings.HasPrefix(line, unifiedNewFileHeader) ||
+		line == applyPatchBeginHeader ||
+		line == applyPatchEndHeader ||
+		strings.HasPrefix(line, strings.TrimSuffix(applyPatchUpdateHeader, " ")) ||
+		strings.HasPrefix(line, strings.TrimSuffix(applyPatchAddHeader, " ")) ||
+		strings.HasPrefix(line, strings.TrimSuffix(applyPatchDeleteHeader, " ")) ||
+		strings.HasPrefix(line, strings.TrimSuffix(applyPatchMoveHeader, " "))
+}
+
+func patchTargetMatchStrings(argStrings, patchTargets []string) []string {
+	matchStrings := append([]string(nil), patchTargets...)
+	for _, arg := range argStrings {
+		patchShaped := false
+		for _, rawLine := range strings.Split(arg, "\n") {
+			if isPatchShapeMarker(strings.TrimSuffix(rawLine, "\r")) {
+				patchShaped = true
+				break
+			}
+		}
+		if !patchShaped {
+			matchStrings = append(matchStrings, arg)
+		}
+	}
+	return matchStrings
+}
+
+func appendPatchTarget(targets []string, target string) []string {
+	if target == "" || target == "/dev/null" {
+		return targets
+	}
+	return append(targets, target)
+}
+
+func parseGitDiffPaths(value string) (string, string, bool) {
+	if !strings.HasPrefix(value, "\"") {
+		var fallbackOld, fallbackNew string
+		for offset := 0; ; {
+			rel := strings.Index(value[offset:], " b/")
+			if rel < 0 {
+				break
+			}
+			delim := offset + rel
+			oldPath, newPath := value[:delim], value[delim+1:]
+			if strings.HasPrefix(oldPath, "a/") && strings.HasPrefix(newPath, "b/") {
+				fallbackOld, fallbackNew = oldPath, newPath
+				if strings.TrimPrefix(oldPath, "a/") == strings.TrimPrefix(newPath, "b/") {
+					return oldPath, newPath, true
+				}
+			}
+			offset = delim + len(" b/")
+		}
+		return fallbackOld, fallbackNew, fallbackOld != ""
+	}
+
+	oldPath, rest, ok := parseGitPathToken(value)
+	if !ok {
+		return "", "", false
+	}
+	newPath, rest, ok := parseGitPathToken(strings.TrimLeft(rest, " \t"))
+	if !ok || strings.TrimSpace(rest) != "" {
+		return "", "", false
+	}
+	return oldPath, newPath, true
+}
+
+func parseGitPathToken(value string) (string, string, bool) {
+	if value == "" {
+		return "", "", false
+	}
+	if value[0] != '"' {
+		end := strings.IndexAny(value, " \t")
+		if end < 0 {
+			return value, "", value != ""
+		}
+		return value[:end], value[end:], end > 0
+	}
+	for i, escaped := 1, false; i < len(value); i++ {
+		switch {
+		case escaped:
+			escaped = false
+		case value[i] == '\\':
+			escaped = true
+		case value[i] == '"':
+			path, err := strconv.Unquote(value[:i+1])
+			return path, value[i+1:], err == nil && path != ""
+		}
+	}
+	return "", "", false
+}
+
+func parsePatchPath(value string, stripTimestamp bool) (string, bool) {
+	if stripTimestamp {
+		if before, _, ok := strings.Cut(value, "\t"); ok {
+			value = before
+		}
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", false
+	}
+	if value[0] == '"' {
+		unquoted, err := strconv.Unquote(value)
+		if err != nil || unquoted == "" {
+			return "", false
+		}
+		return unquoted, true
+	}
+	return value, true
+}
+
+const structuralMaxArgDepth = 64
+
+func (rule *CompiledRule) hasStructuralValidators() bool {
+	return rule.ArgType != "" ||
+		rule.ArgNumberGT != nil ||
+		rule.ArgNumberLT != nil ||
+		rule.ArgLenGT != nil ||
+		rule.ArgLenLT != nil ||
+		len(rule.ArgValueIn) > 0
+}
+
+func (rule *CompiledRule) hasAbsentFailClosedValidator() bool {
+	return rule.ArgType != "" ||
+		rule.ArgNumberGT != nil ||
+		rule.ArgNumberLT != nil ||
+		rule.ArgLenGT != nil ||
+		rule.ArgLenLT != nil
+}
+
+func (rule *CompiledRule) matchStructuralValidators(rawArgs json.RawMessage) (matched bool, uninspectable bool) {
+	if !rule.hasStructuralValidators() {
+		return true, false
+	}
+
+	values, truncated, ok := structuralValuesForArgKey(rawArgs, rule.ArgKey)
+	if truncated || !ok {
+		return false, true
+	}
+	if len(values) == 0 {
+		return rule.hasAbsentFailClosedValidator(), false
+	}
+	for _, value := range values {
+		if rule.matchStructuralValue(value) {
+			return true, false
+		}
+	}
+	return false, false
+}
+
+func structuralValuesForArgKey(rawArgs json.RawMessage, keyPattern *regexp.Regexp) ([]interface{}, bool, bool) {
+	if len(rawArgs) == 0 || string(rawArgs) == jsonrpc.Null {
+		return nil, false, true
+	}
+	truncated, valid := structuralJSONDepthTruncated(rawArgs)
+	if truncated || !valid {
+		return nil, truncated, valid
+	}
+	dec := json.NewDecoder(bytes.NewReader(rawArgs))
+	dec.UseNumber()
+	var parsed interface{}
+	if err := dec.Decode(&parsed); err != nil {
+		return nil, false, false
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return nil, false, false
+	}
+	args, ok := parsed.(map[string]interface{})
+	if !ok || keyPattern == nil {
+		return nil, false, true
+	}
+
+	var values []interface{}
+	for _, key := range jsonrpc.SortedKeys(args) {
+		if keyPattern.MatchString(key) {
+			values = append(values, args[key])
+		}
+	}
+	return values, false, true
+}
+
+func structuralJSONDepthTruncated(rawArgs json.RawMessage) (bool, bool) {
+	dec := json.NewDecoder(bytes.NewReader(rawArgs))
+	depth := 0
+	sawToken := false
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			return false, sawToken && depth == 0
+		}
+		if err != nil {
+			return false, false
+		}
+		sawToken = true
+		delim, ok := tok.(json.Delim)
+		if !ok {
+			continue
+		}
+		switch delim {
+		case '{', '[':
+			depth++
+			if depth > structuralMaxArgDepth+1 {
+				return true, true
+			}
+		case '}', ']':
+			depth--
+		}
+	}
+}
+
+func (rule *CompiledRule) matchStructuralValue(value interface{}) bool {
+	hasNonTypeValidator := rule.ArgNumberGT != nil ||
+		rule.ArgNumberLT != nil ||
+		rule.ArgLenGT != nil ||
+		rule.ArgLenLT != nil ||
+		len(rule.ArgValueIn) > 0
+
+	if rule.ArgType != "" {
+		if !structuralValueHasType(value, rule.ArgType) {
+			return true
+		}
+		if !hasNonTypeValidator {
+			return false
+		}
+	}
+
+	if rule.ArgNumberGT != nil || rule.ArgNumberLT != nil {
+		valueNumber, ok := value.(json.Number)
+		if !ok {
+			return true
+		}
+		valueRat, ok := config.ParseBoundedJSONNumber(valueNumber)
+		if !ok {
+			return true
+		}
+		if rule.ArgNumberGT != nil {
+			threshold, ok := config.ParseBoundedJSONNumber(*rule.ArgNumberGT)
+			if !ok {
+				return true // unevaluable compiled threshold: fail closed (match)
+			}
+			if valueRat.Cmp(threshold) <= 0 {
+				return false
+			}
+		}
+		if rule.ArgNumberLT != nil {
+			threshold, ok := config.ParseBoundedJSONNumber(*rule.ArgNumberLT)
+			if !ok {
+				return true // unevaluable compiled threshold: fail closed (match)
+			}
+			if valueRat.Cmp(threshold) >= 0 {
+				return false
+			}
+		}
+	}
+
+	if rule.ArgLenGT != nil || rule.ArgLenLT != nil {
+		length, ok := structuralValueLength(value)
+		if !ok {
+			return true
+		}
+		if rule.ArgLenGT != nil && length <= *rule.ArgLenGT {
+			return false
+		}
+		if rule.ArgLenLT != nil && length >= *rule.ArgLenLT {
+			return false
+		}
+	}
+
+	if len(rule.ArgValueIn) > 0 {
+		canonical, ok := canonicalStructuralValue(value)
+		if !ok {
+			return true
+		}
+		if _, ok := rule.ArgValueIn[canonical]; !ok {
+			return false
+		}
+	}
+
+	return true
+}
+
+func structuralValueHasType(value interface{}, argType string) bool {
+	switch argType {
+	case "string":
+		_, ok := value.(string)
+		return ok
+	case "number":
+		_, ok := value.(json.Number)
+		return ok
+	case "integer":
+		number, ok := value.(json.Number)
+		if !ok {
+			return false
+		}
+		rat, ok := config.ParseBoundedJSONNumber(number)
+		return ok && rat.Denom().Cmp(big.NewInt(1)) == 0
+	case "boolean":
+		_, ok := value.(bool)
+		return ok
+	case "array":
+		_, ok := value.([]interface{})
+		return ok
+	case "object":
+		_, ok := value.(map[string]interface{})
+		return ok
+	default:
+		return false
+	}
+}
+
+func structuralValueLength(value interface{}) (int, bool) {
+	switch typed := value.(type) {
+	case string:
+		return utf8.RuneCountInString(typed), true
+	case []interface{}:
+		return len(typed), true
+	default:
+		return 0, false
+	}
+}
+
+func canonicalStructuralValue(value interface{}) (string, bool) {
+	switch typed := value.(type) {
+	case nil:
+		return "null", true
+	case string:
+		return typed, true
+	case json.Number:
+		return typed.String(), true
+	case bool:
+		return strconv.FormatBool(typed), true
+	default:
+		encoded, err := json.Marshal(typed)
+		if err != nil {
+			return "", false
+		}
+		return string(encoded), true
+	}
+}
+
+// CheckRequest evaluates a JSON-RPC request (single or batch) against policy.
+// Returns a clean verdict for non-callable methods and unparseable messages.
+func (pc *Config) CheckRequest(line []byte) Verdict {
+	if pc == nil {
+		return Verdict{}
+	}
+
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) == 0 {
+		return Verdict{}
+	}
+
+	// Batch request - iterate elements.
+	if trimmed[0] == '[' {
+		return pc.checkBatch(trimmed)
+	}
+
+	return pc.checkSingle(trimmed)
+}
+
+// checkSingle parses one JSON-RPC request and checks it against policy.
+func (pc *Config) checkSingle(line []byte) Verdict {
+	if err := redact.NoDuplicateJSONKeys(bytes.TrimSpace(line)); err != nil {
+		if redact.IsDuplicateKeyBlock(err) {
+			return duplicateJSONKeyVerdict()
+		}
+	}
+	if hasMalformedA2AParams(line) {
+		return malformedA2AParamsVerdict()
+	}
+	tc := parsePolicyCallable(line)
+	if tc == nil {
+		return Verdict{}
+	}
+	var argStrings []string
+	hasArgs := len(tc.Arguments) > 0 && string(tc.Arguments) != jsonrpc.Null
+	if hasArgs {
+		// Use values-only extraction (not extractAllStringsFromJSON which
+		// includes map keys). Keys like "cmd","flags","target" would pollute
+		// the joined string and break regex adjacency for policy matching.
+		extracted := jsonrpc.ExtractStringsFromJSONResult(tc.Arguments)
+		if extracted.Truncated {
+			return uninspectableJSONDepthVerdict()
+		}
+		argStrings = extracted.Strings
+	}
+
+	// If any rule uses ArgKey or structural validators, pass raw arguments so
+	// CheckToolCallWithArgs can extract per-key and inspect parsed JSON values.
+	var rawArgs json.RawMessage
+	if hasArgs {
+		for _, rule := range pc.Rules {
+			if rule.ArgKey != nil || rule.hasStructuralValidators() {
+				rawArgs = tc.Arguments
+				break
+			}
+		}
+	}
+
+	return pc.CheckToolCallWithArgs(tc.Name, argStrings, rawArgs)
+}
+
+// uninspectableJSONDepthVerdict is the synthetic block returned when policy
+// arguments are valid JSON but too deeply nested to inspect.
+func uninspectableJSONDepthVerdict() Verdict {
+	return Verdict{
+		Matched: true,
+		Action:  config.ActionBlock,
+		Rules:   []string{uninspectableJSONDepthRule},
+	}
+}
+
+// duplicateJSONKeyVerdict is a defense-in-depth fail-closed result for direct
+// policy callers. The transport gates already block duplicate-key frames before
+// policy evaluation; keeping policy block-capable prevents future callers from
+// reintroducing a last-wins policy view against a first-wins upstream parser.
+func duplicateJSONKeyVerdict() Verdict {
+	return Verdict{
+		Matched: true,
+		Action:  config.ActionBlock,
+		Rules:   []string{duplicateJSONKeyRule},
+	}
+}
+
+// malformedA2AParamsVerdict is a fail-closed result for known A2A methods with
+// present, non-null params that are not a JSON object. A2A policy rules inspect
+// object params; scalar and array params are malformed enough that skipping
+// policy would be fail-open.
+func malformedA2AParamsVerdict() Verdict {
+	return Verdict{
+		Matched: true,
+		Action:  config.ActionBlock,
+		Rules:   []string{malformedA2AParamsRule},
+	}
+}
+
+func hasMalformedA2AParams(line []byte) bool {
+	var rpc struct {
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+	}
+	if err := json.Unmarshal(line, &rpc); err != nil {
+		return false
+	}
+	if _, ok := a2amethods.Canonical(rpc.Method); !ok {
+		return false
+	}
+	if len(rpc.Params) == 0 || bytes.Equal(bytes.TrimSpace(rpc.Params), []byte(jsonrpc.Null)) {
+		return false
+	}
+	return !redact.IsJSONObject(rpc.Params)
+}
+
+func uninspectableStructuralArgsVerdict(ruleName string) Verdict {
+	rules := []string{uninspectableJSONDepthRule}
+	if ruleName != "" {
+		rules = []string{ruleName, uninspectableJSONDepthRule}
+	}
+	return Verdict{
+		Matched: true,
+		Action:  config.ActionBlock,
+		Rules:   rules,
+	}
+}
+
+// checkBatch evaluates a batch of JSON-RPC requests and aggregates policy results.
+func (pc *Config) checkBatch(line []byte) Verdict {
+	var batch []json.RawMessage
+	if err := json.Unmarshal(line, &batch); err != nil {
+		return Verdict{}
+	}
+
+	var allRules []string
+	strictest := ""
+	redirectProfile := ""
+	var resolutionPolicy config.DeferResolutionPolicy
+
+	for _, elem := range batch {
+		v := pc.checkSingle(elem)
+		if v.Matched {
+			allRules = append(allRules, v.Rules...)
+			prev := strictest
+			strictest = StricterAction(strictest, v.Action)
+			// Track redirect profile from the verdict that set the effective action.
+			if strictest != prev && v.Action == config.ActionRedirect {
+				redirectProfile = v.RedirectProfile
+			}
+			if strictest != prev && v.Action == config.ActionDefer {
+				resolutionPolicy = v.ResolutionPolicy
+			}
+		}
+	}
+
+	if len(allRules) == 0 {
+		return Verdict{}
+	}
+
+	// Clear redirect profile if a stricter action (block) won.
+	if strictest != config.ActionRedirect {
+		redirectProfile = ""
+	}
+	if strictest != config.ActionDefer {
+		resolutionPolicy = config.DeferResolutionPolicy{}
+	}
+
+	return Verdict{
+		Matched:          true,
+		Action:           strictest,
+		Rules:            allRules,
+		RedirectProfile:  redirectProfile,
+		ResolutionPolicy: resolutionPolicy,
+	}
+}
+
+// toolCallParams holds the parsed fields of a tools/call request.
+type toolCallParams struct {
+	Name      string
+	Arguments json.RawMessage
+}
+
+// parsePolicyCallable extracts the callable name and arguments from a JSON-RPC
+// request. tools/call returns params.name and params.arguments; A2A methods
+// return the method name and params object. Returns nil when the method is not a
+// policy-scoped callable or the message cannot be parsed.
+func parsePolicyCallable(line []byte) *toolCallParams {
+	var rpc struct {
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+	}
+	if err := json.Unmarshal(line, &rpc); err != nil {
+		return nil
+	}
+	if rpc.Method != "tools/call" {
+		canonical, ok := a2amethods.Canonical(rpc.Method)
+		if !ok {
+			return nil
+		}
+		return &toolCallParams{
+			Name:      canonical,
+			Arguments: rpc.Params,
+		}
+	}
+	if len(rpc.Params) == 0 || string(rpc.Params) == jsonrpc.Null {
+		return nil
+	}
+
+	var params struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal(rpc.Params, &params); err != nil {
+		return nil
+	}
+	if params.Name == "" {
+		return nil
+	}
+
+	return &toolCallParams{
+		Name:      params.Name,
+		Arguments: params.Arguments,
+	}
+}
+
+func parseToolCall(line []byte) *toolCallParams {
+	return parsePolicyCallable(line)
+}
+
+// actionRank maps action strings to strictness levels for comparison.
+// block > defer > redirect > ask > warn > "" (empty).
+// Unknown values are treated as block (fail-closed).
+var actionRank = map[string]int{
+	"":                    0,
+	config.ActionWarn:     1,
+	config.ActionAsk:      2,
+	config.ActionRedirect: 3,
+	config.ActionDefer:    4,
+	config.ActionBlock:    5,
+}
+
+// StricterAction returns the more restrictive of two actions.
+// block > defer > redirect > ask > warn > "" (empty). Unknown values are treated as block (fail-closed).
+func StricterAction(a, b string) string {
+	ra, aOK := actionRank[a]
+	rb, bOK := actionRank[b]
+	if !aOK {
+		a = config.ActionBlock
+		ra = actionRank[config.ActionBlock]
+	}
+	if !bOK {
+		b = config.ActionBlock
+		rb = actionRank[config.ActionBlock]
+	}
+	if rb > ra {
+		return b
+	}
+	return a
+}
+
+// decodeShellEscapes resolves octal (\NNN) and hex (\xHH) escape sequences
+// to their character equivalents. This catches evasion like r\155 → rm.
+func decodeShellEscapes(s string) string {
+	s = shellHexRe.ReplaceAllStringFunc(s, func(m string) string {
+		v, err := strconv.ParseUint(m[2:], 16, 8)
+		if err != nil {
+			return m
+		}
+		return string(rune(v))
+	})
+	s = shellOctalRe.ReplaceAllStringFunc(s, func(m string) string {
+		v, err := strconv.ParseUint(m[1:], 8, 8)
+		if err != nil {
+			return m
+		}
+		return string(rune(v))
+	})
+	return s
+}
+
+// resolveShellConstruction iteratively resolves simple command substitutions
+// and variable assignments used to build command names indirectly:
+//   - $(printf rm) → rm
+//   - $(echo rm) → rm
+//   - $($(printf echo) rm) → rm (nested, resolved over 2 iterations)
+//   - x=rm;$x → x=rm;rm
+//   - v=IFS;${!v} → v=IFS;${IFS} (indirect expansion)
+//
+// Iterates until no further changes occur, bounded to prevent infinite loops
+// on pathological input.
+func resolveShellConstruction(s string) string {
+	const maxIterations = 10
+	for range maxIterations {
+		prev := s
+		s = simpleCmdSubRe.ReplaceAllString(s, "$1")
+		matches := simpleAssignRe.FindAllStringSubmatch(s, 10)
+
+		// Detect IFS reassignment: IFS=<char> sets the field separator.
+		// When IFS is non-default, variable expansions should split on
+		// the IFS char. We apply this by replacing the IFS char with
+		// space in expanded values (over-approximation, safe for detection).
+		ifsChar := ""
+		for _, m := range matches {
+			if m[1] == "IFS" && len(m[2]) == 1 {
+				ifsChar = m[2]
+			}
+		}
+
+		for _, m := range matches {
+			value := m[2]
+			// Apply IFS-aware concatenation: remove the IFS char from
+			// expanded values so "CMD=r,m" with IFS="," expands $CMD
+			// to "rm". In bash, unquoted $CMD would word-split into
+			// separate tokens, but the attacker's intent is command
+			// construction. Concatenation is the safe over-approximation
+			// for detection (reveals the assembled command name).
+			if ifsChar != "" && m[1] != "IFS" {
+				value = strings.ReplaceAll(value, ifsChar, "")
+			}
+			// Direct expansion: ${var} and $var → value.
+			s = strings.ReplaceAll(s, "${"+m[1]+"}", value)
+			s = strings.ReplaceAll(s, "$"+m[1], value)
+			// Indirect expansion: ${!var...} → ${value...}.
+			// In bash, ${!v} expands the variable whose name is v's value.
+			// Replacing the prefix ${!varname with ${value converts e.g.
+			// v=IFS;${!v:0:1} → v=IFS;${IFS:0:1}, which shellExpansionRe catches.
+			s = strings.ReplaceAll(s, "${!"+m[1], "${"+m[2])
+		}
+		if s == prev {
+			break
+		}
+	}
+	return s
+}
+
+// expandBraces resolves bash brace expansion patterns. {rm,-rf,/tmp} becomes
+// "rm -rf /tmp" - commas become spaces. Only expands patterns with at least two
+// items containing shell-safe characters to avoid false positives.
+func expandBraces(s string) string {
+	return braceExpansionRe.ReplaceAllStringFunc(s, func(m string) string {
+		inner := m[1 : len(m)-1] // strip { and }
+		return strings.ReplaceAll(inner, ",", " ")
+	})
+}
+
+// DefaultToolPolicyRules returns the built-in set of tool call policy rules
+// covering common dangerous operations that agents might attempt.
+const (
+	fileReadToolPattern     = `read_file|file_read|read_text_file|read_media_file|read_multiple_files|head_file|tail_file|batch_read`
+	fileWriteToolPattern    = `write_file|file_write|edit_file|create_file|modify_file|append_file|write_file_binary|find_replace|replace_content|replace_in_file|insert_lines|delete_lines|file_write_chunked`
+	filePatchToolPattern    = `apply_patch`
+	fileMoveToolPattern     = `move_file|file_move|rename_file|move-file`
+	fileCopyToolPattern     = `copy_file|file_copy`
+	fileDeleteToolPattern   = `delete_file|file_delete`
+	fileMetadataToolPattern = `chmod_file|chown_file`
+	fileLinkToolPattern     = `create_symlink|create_hardlink`
+
+	persistencePathPattern  = `/etc/crontab\b|/etc/cron\.(?:d|daily|hourly|weekly|monthly)/|/var/spool/cron/|/etc/init\.d/|/etc/systemd/|/lib/systemd/|/usr/lib/systemd/|\.config/systemd/user/|/Library/Launch(?:Daemons|Agents)/`
+	shellProfilePathPattern = `(?:^|[\\/])\.(?:bashrc|bash_profile|profile|zshrc|zprofile|zshenv|bash_logout)\b|/etc/profile\b`
+	// The audit namespaces are matched as path segments anywhere in the value,
+	// not only at an absolute-path start. A start anchor treated `//var/log/x`,
+	// `/./var/log/x`, and `/tmp/../var/log/x` as unprotected even though the
+	// server resolves all three to the protected file. A relative patch target
+	// such as `var/log/x` is the same file after the applier strips its prefix.
+	auditLogPathPattern = `(?:^|[\s/])(?:var/log|var/lib/pipelock)(?:/|$)`
+	// Pipelock's own state directory, the narrower namespace the write rule
+	// guards on its own.
+	pipelockStatePathPattern = `(?:^|[\s/])var/lib/pipelock(?:/|$)`
+	// The system's own security and login records under /var/log: the syslog
+	// family, auditd's default log directory and file name, and the login
+	// accounting files. An application's log next to them stays ordinary.
+	systemLogPathPattern = `(?:^|[\s/])var/log/(?:auth\.log|secure|syslog|messages|kern\.log|audit\.log|audit/|wtmp|btmp|lastlog|faillog|journal/)`
+	// Shell-context form of the audit namespaces, for command text where the
+	// path follows a redirect or a command word rather than standing alone.
+	auditLogShellPathPattern = `/(?:var/log|var/lib/pipelock)/`
+	// Credential locations accept both separators. A Windows spelling such as
+	// `C:\\Users\\v\\.ssh\\id_rsa` is the same secret as its POSIX form, and a
+	// slash-only pattern matched neither the read nor the relocate route. The
+	// separator is OPTIONAL because policy normalization strips a backslash that
+	// precedes a word character, so a Windows spelling reaches the matcher with
+	// no separator left between the directory and the file name.
+	//
+	// An `id_` name whose extension is exactly `.pub` is the public half of a
+	// key pair, which setup and publishing workflows read routinely, so it does
+	// not match when NOTHING follows `.pub`: not a character, not whitespace,
+	// not another argument. That is the shape a file read tool sends, one
+	// argument holding the whole path. Any filename byte can follow `.pub` and
+	// arguments are split on whitespace and paired before matching, so the end
+	// of the match text is the only boundary that cannot be a longer name, a
+	// traversal (`id_rsa.pub/../id_rsa`) or a second path. Command text always
+	// has more after the name once split, so shell reads of any key stay
+	// matched, as they were before the exception. RE2 has no lookahead, so the
+	// `.pub` exception is spelled out one character at a time.
+	sshKeyNamePattern        = `(?:id_[a-z0-9_-]*(?:$|[^a-z0-9_.-]|\.(?:$|[^p]|p(?:$|[^u]|u(?:$|[^b]|b[\s\S]))))|authorized)`
+	sensitiveFilePathPattern = `\.ssh[\\/]?` + sshKeyNamePattern + `|\.aws[\\/]?credentials|\.env\b|\.netrc|/etc/shadow`
+)
+
+func DefaultToolPolicyRules() []config.ToolPolicyRule {
+	rules := []config.ToolPolicyRule{
+		{
+			Name:        "Destructive File Delete",
+			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$`,
+			ArgPattern:  `(?i)\brm\s+(--\s+)?(-[a-z]*[rf]\b|--(?:recursive|force)\b)`,
+			Action:      config.ActionBlock,
+		},
+		{
+			Name:        "Recursive Permission Change",
+			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$`,
+			ArgPattern:  `(?i)\b(chmod\s+(-R|--recursive)\s+(777|666)|chmod\s+(777|666)\s+(-R|--recursive)|chown\s+(-R|--recursive))\b`,
+		},
+		{
+			// Move and copy are matched unscoped, so the credential matches on the
+			// SOURCE side. This is the mirror of the destination-protection rules:
+			// for a secret the danger is relocating it somewhere unguarded and
+			// reading it there, so copying a credential OUT is itself the finding.
+			Name:        "Credential File Access",
+			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec|` + fileReadToolPattern + `|` + fileLinkToolPattern + `|` + fileMoveToolPattern + `|` + fileCopyToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + sensitiveFilePathPattern + `)`,
+			Action:      config.ActionBlock,
+		},
+		{
+			Name:        "Network Exfiltration",
+			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$`,
+			// Match every curl/wget flag that uploads a payload: short/long
+			// forms of --data, --data-binary, --data-raw, --data-urlencode,
+			// --form (-F, multipart), --upload-file (-T), explicit POST,
+			// wget's --post-data / --post-file / --body-data / --body-file.
+			// round-4 of the pre-tag gate found `curl --form` bypassed the earlier pattern.
+			ArgPattern: `(?i)\b(curl|wget)\b.*(-d\s|-F\s|-T\s|--data(?:-binary|-raw|-urlencode)?\b|--form\b|--upload-file\b|--post-data\b|--post-file\b|--body-data\b|--body-file\b|-X\s+POST)`,
+		},
+		{
+			Name:        "Reverse Shell",
+			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$`,
+			ArgPattern:  `(?i)(bash\s+-i\s+>&|/dev/tcp/|mkfifo\s+|nc\s+-e|ncat\s+-e)`,
+			Action:      config.ActionBlock,
+		},
+		{
+			Name:        "Protected Path Delete",
+			ToolPattern: `(?i)^(` + fileDeleteToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + persistencePathPattern + `|` + shellProfilePathPattern + `)`,
+			Action:      config.ActionBlock,
+		},
+		{
+			Name:        "Protected Path Metadata Change",
+			ToolPattern: `(?i)^(` + fileMetadataToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + persistencePathPattern + `|` + shellProfilePathPattern + `)`,
+			Action:      config.ActionBlock,
+		},
+		{
+			// Both link arguments are security-sensitive. A protected link path is
+			// replaced directly; a protected target gains an alias that can be used
+			// for later reads or writes outside the visible protected namespace.
+			Name:        "Protected Path Link Creation",
+			ToolPattern: `(?i)^(` + fileLinkToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + persistencePathPattern + `|` + shellProfilePathPattern + `)`,
+			Action:      config.ActionBlock,
+		},
+		{
+			Name:        "Disk Wipe Command",
+			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$`,
+			ArgPattern:  `(?i)\b(dd\s+if=.*of=/dev/|mkfs\.|fdisk)\b`,
+			Action:      config.ActionBlock,
+		},
+		{
+			Name:        "Package Install",
+			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$`,
+			ArgPattern:  `(?i)\b(pip|npm|gem|cargo|go)\s+install\b`,
+		},
+		{
+			Name:        "Destructive Git Operation",
+			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec|git)$`,
+			ArgPattern:  `(?i)(\bgit\s+)?(push\s+(--force(\s|$)|-f\b)|reset\s+--hard\b|clean\s+-fd\b)`,
+			Action:      config.ActionBlock,
+		},
+		{
+			Name:        "Encoded Command Execution",
+			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$`,
+			ArgPattern:  `(?i)(\beval\b.*\bbase64\b|\bbase64\s+(-d|--decode)\b.*\|\s*(ba)?sh\b)`,
+			Action:      config.ActionBlock,
+		},
+		{
+			Name:        "Cron Job Persistence",
+			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$`,
+			ArgPattern:  `(?i)(\bcrontab\s+(-\w+\s+\S+\s+)*-e\b|\bcrontab\s+(-\w+\s+\S+\s+)*[^-\s]|>{1,2}\s*/(?:var/spool/cron|etc/cron)|\|\s*crontab\b)`,
+			Action:      config.ActionBlock,
+		},
+		{
+			Name:        "Systemd Service Persistence",
+			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$`,
+			ArgPattern:  `(?i)\bsystemctl\s+(-{1,2}\w+\s+)*(enable|daemon-reload)\b`,
+			Action:      config.ActionBlock,
+		},
+		{
+			// File write tools targeting cron/systemd/init/launchd persistence paths.
+			// Covers system-wide (/etc/systemd, /lib/systemd) and user-scoped
+			// (~/.config/systemd/user/) systemd paths, plus macOS LaunchAgents/Daemons.
+			Name:        "Persistence Path Write",
+			ToolPattern: `(?i)^(` + fileWriteToolPattern + `|` + fileMoveToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + persistencePathPattern + `)`,
+			Action:      config.ActionBlock,
+		},
+		{
+			Name:        "Persistence Path Write",
+			ToolPattern: `(?i)^(` + filePatchToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + persistencePathPattern + `)`,
+			ArgSource:   config.ToolPolicyArgSourcePatchTargets,
+			Action:      config.ActionBlock,
+		},
+		{
+			// Copy is destination-scoped: reading a protected source into a safe
+			// backup path remains allowed. The named schema is the one published by
+			// copy_file servers covered by this built-in rule.
+			Name:        "Protected Path Copy",
+			ToolPattern: `(?i)^(` + fileCopyToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + persistencePathPattern + `|` + shellProfilePathPattern + `)`,
+			ArgKey:      `(?i)^destination$`,
+			Action:      config.ActionBlock,
+		},
+		{
+			// Shell commands writing into cron/systemd/init/launchd persistence paths.
+			// Covers cp, mv, install, ln (destination-aware via (\S+\s+)+ prefix),
+			// tee, sed -i, and shell redirects. Read operations pass through.
+			Name:        "Persistence Path Write via Command",
+			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$`,
+			ArgPattern:  `(?i)(>{1,2}\s*[^;|&]*(/etc/crontab\b|/etc/cron\.(d|daily|hourly|weekly|monthly)/|/var/spool/cron/|/etc/init\.d/|/etc/systemd/|/lib/systemd/|/usr/lib/systemd/|\.config/systemd/user/|/Library/Launch(Daemons|Agents)/)|\b(tee|sed\s+-i)\s+[^;|&]*(/etc/crontab\b|/etc/cron\.(d|daily|hourly|weekly|monthly)/|/var/spool/cron/|/etc/init\.d/|/etc/systemd/|/lib/systemd/|/usr/lib/systemd/|\.config/systemd/user/|/Library/Launch(Daemons|Agents)/)|\b(cp|mv|install|ln)\b\s+(\S+\s+)+\S*(/etc/crontab\b|/etc/cron\.(d|daily|hourly|weekly|monthly)/|/var/spool/cron/|/etc/init\.d/|/etc/systemd/|/lib/systemd/|/usr/lib/systemd/|\.config/systemd/user/|/Library/Launch(Daemons|Agents)/))`,
+			Action:      config.ActionBlock,
+		},
+		{
+			// File write tools directly name the file they modify.
+			Name:        "Shell Profile Modification",
+			ToolPattern: `(?i)^(` + fileWriteToolPattern + `|` + fileMoveToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + shellProfilePathPattern + `)`,
+			Action:      config.ActionBlock,
+		},
+		{
+			Name:        "Shell Profile Modification",
+			ToolPattern: `(?i)^(` + filePatchToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + shellProfilePathPattern + `)`,
+			ArgSource:   config.ToolPolicyArgSourcePatchTargets,
+			Action:      config.ActionBlock,
+		},
+		{
+			// Exec tools: require a write indicator near a profile file, or an
+			// alias definition. Reads like cat/grep pass through.
+			// Redirect/tee branches use [^;|&]*(?:^|[/\s]) so the engine can
+			// backtrack and consume a slash (full path) or space (bare dotfile).
+			// The cp/mv branch keeps (\S+\s+)+ to require at least one arg
+			// before the dotfile, defeating pairwise token false positives.
+			// (?:\S*/)? matches an optional path prefix before the dotfile.
+			// The ln branches match a profile in any argument position: linking
+			// FROM a profile creates an alias a later file write can go through.
+			// Each needs an argument on the other side of the profile, so the
+			// two-token pairwise view cannot join "ln" from one command with a
+			// profile named by another.
+			Name:        "Shell Profile Write via Command",
+			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$`,
+			ArgPattern:  `(?i)(>{1,2}[^;|&]*(?:^|[/\s])\.(bashrc|bash_profile|profile|zshrc|zprofile|zshenv|bash_logout)\b|\b(tee|sed\s+-i)[^;|&]*(?:^|[/\s])\.(bashrc|bash_profile|profile|zshrc|zprofile|zshenv|bash_logout)\b|\b(cp|mv|install|ln)\b\s+(\S+\s+)+(?:\S*/)?\.(bashrc|bash_profile|profile|zshrc|zprofile|zshenv|bash_logout)\s*$|\balias\s+\w+=|>{1,2}[^;|&]*/etc/profile\b|\b(tee|sed\s+-i)[^;|&]*/etc/profile\b|\b(cp|mv|install|ln)\b\s+(\S+\s+)+\S*/etc/profile\s*$|\b(?:ln|link)\b(?:\s+[^\s;|&]+)+\s+(?:[^\s;|&]*/)?\.(bashrc|bash_profile|profile|zshrc|zprofile|zshenv|bash_logout)\b|\b(?:ln|link)\b(?:\s+[^\s;|&]+)*\s+(?:[^\s;|&]*/)?\.(bashrc|bash_profile|profile|zshrc|zprofile|zshenv|bash_logout)\b[^\s;|&]*(?:\s+[^\s;|&]+)+|\bcp(?:\s+[^\s;|&]+)*?\s+-(?:-(?:symbolic-)?link|(?-i:[A-Za-z]*[sl][A-Za-z]*))\b(?:\s+[^\s;|&]+)*\s+(?:[^\s;|&]*/)?\.(bashrc|bash_profile|profile|zshrc|zprofile|zshenv|bash_logout)\b|\bcp(?:\s+[^\s;|&]+)+?\s+(?:[^\s;|&]*/)?\.(bashrc|bash_profile|profile|zshrc|zprofile|zshenv|bash_logout)\b[^\s;|&]*(?:\s+[^\s;|&]+)*?\s+-(?:-(?:symbolic-)?link|(?-i:[A-Za-z]*[sl][A-Za-z]*))\b|\b(?:ln|link)\b(?:\s+[^\s;|&]+)+\s+[^\s;|&]*/etc/profile\b|\b(?:ln|link)\b(?:\s+[^\s;|&]+)*\s+[^\s;|&]*/etc/profile\b[^\s;|&]*(?:\s+[^\s;|&]+)+|\bcp(?:\s+[^\s;|&]+)*?\s+-(?:-(?:symbolic-)?link|(?-i:[A-Za-z]*[sl][A-Za-z]*))\b(?:\s+[^\s;|&]+)*\s+[^\s;|&]*/etc/profile\b|\bcp(?:\s+[^\s;|&]+)+?\s+[^\s;|&]*/etc/profile\b[^\s;|&]*(?:\s+[^\s;|&]+)*?\s+-(?:-(?:symbolic-)?link|(?-i:[A-Za-z]*[sl][A-Za-z]*))\b)`,
+			Action:      config.ActionBlock,
+		},
+		{
+			Name:        "Detached Process Spawning",
+			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$`,
+			ArgPattern:  `(?i)(\bnohup\s+|\bdisown\b|\bsetsid\s+|\bscreen\s+(-\S+\s+)*-[dDm]|\btmux\s+(new-session|new)\s+-d)`,
+		},
+		{
+			// Move tools are deliberately unscoped and therefore protect both source
+			// and destination paths.
+			Name:        "Audit Log Move",
+			ToolPattern: `(?i)^(` + fileMoveToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + auditLogPathPattern + `)`,
+		},
+		{
+			Name:        "Audit Log Copy",
+			ToolPattern: `(?i)^(` + fileCopyToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + auditLogPathPattern + `)`,
+			ArgKey:      `(?i)^destination$`,
+		},
+		{
+			Name:        "Audit Log Delete",
+			ToolPattern: `(?i)^(` + fileDeleteToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + auditLogPathPattern + `)`,
+		},
+		{
+			Name:        "Audit Log Metadata Change",
+			ToolPattern: `(?i)^(` + fileMetadataToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + auditLogPathPattern + `)`,
+		},
+		{
+			Name:        "Audit Log Link Creation",
+			ToolPattern: `(?i)^(` + fileLinkToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + auditLogPathPattern + `)`,
+		},
+		{
+			// Ordinary writes under /var/log stay allowed: an application appending
+			// to its own log is the normal case there. Nothing an agent runs has
+			// a reason to write into Pipelock's own state directory, where the
+			// receipt chain and the containment egress log live, or into the
+			// system's security and login records.
+			Name:        "Audit Log Write",
+			ToolPattern: `(?i)^(` + fileWriteToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + pipelockStatePathPattern + `|` + systemLogPathPattern + `)`,
+		},
+		{
+			// A patch edits its target in place, so a patch naming the receipt
+			// chain or an audit log is the same mutation as a direct write.
+			Name:        "Audit Log Patch",
+			ToolPattern: `(?i)^(` + filePatchToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + auditLogPathPattern + `)`,
+			ArgSource:   config.ToolPolicyArgSourcePatchTargets,
+		},
+		{
+			Name:        "Audit Log Tampering",
+			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec|` + fileWriteToolPattern + `)$`,
+			ArgPattern:  `(?i)(\b(rm|truncate|shred)\b[^;|&]*(` + auditLogShellPathPattern + `|\.(log|audit|jsonl)\b)|>{1,2}\s*[^;|&]*(` + auditLogShellPathPattern + `|\.(log|audit|jsonl)\b)|\b(?:ln|link)\b(?:\s+[^\s;|&]+)+\s+(?:[^\s;|&]*/)?(?:var/log|var/lib/pipelock)\b|\b(?:ln|link)\b(?:\s+[^\s;|&]+)*\s+(?:[^\s;|&]*/)?(?:var/log|var/lib/pipelock)\b[^\s;|&]*(?:\s+[^\s;|&]+)+|\bcp(?:\s+[^\s;|&]+)*?\s+-(?:-(?:symbolic-)?link|(?-i:[A-Za-z]*[sl][A-Za-z]*))\b(?:\s+[^\s;|&]+)*\s+(?:[^\s;|&]*/)?(?:var/log|var/lib/pipelock)\b|\bcp(?:\s+[^\s;|&]+)+?\s+(?:[^\s;|&]*/)?(?:var/log|var/lib/pipelock)\b[^\s;|&]*(?:\s+[^\s;|&]+)*?\s+-(?:-(?:symbolic-)?link|(?-i:[A-Za-z]*[sl][A-Za-z]*))\b|\bhistory\s+-c\b|\bunset\s+HISTFILE\b|\bexport\s+HISTFILE=/dev/null\b)`,
+		},
+	}
+	return withBuiltinToolNameAliases(rules)
+}
+
+const builtinToolNameAliasPrefix = `(?:mcp__[a-z0-9_-]+__|[a-z0-9_-]+[.:])`
+
+// withBuiltinToolNameAliases adds bounded presentation aliases to Pipelock's
+// own anchored tool patterns. Operator-supplied patterns stay verbatim: a tool
+// name is still passed raw to CheckToolCallWithArgs, and only shipped rules opt
+// into the heuristic aliases.
+func withBuiltinToolNameAliases(rules []config.ToolPolicyRule) []config.ToolPolicyRule {
+	const prefix = `(?i)^`
+	for index := range rules {
+		pattern := rules[index].ToolPattern
+		body := strings.TrimSuffix(strings.TrimPrefix(pattern, prefix), `$`)
+		rules[index].ToolPattern = prefix + `(?:` + builtinToolNameAliasPrefix + `)?` + body + `$`
+	}
+	return rules
+}

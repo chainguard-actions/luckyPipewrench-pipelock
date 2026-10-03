@@ -1,0 +1,1372 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+// Package mcp provides scanning of MCP (Model Context Protocol) JSON-RPC 2.0
+// responses for prompt injection and inbound generic credentials. It extracts
+// text content from tool result blocks and runs the response and inbound-DLP
+// scanners for pattern matching.
+package mcp
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"sort"
+	"strings"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/jsonrpc"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/provenance"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/tools"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/transport"
+	"github.com/luckyPipewrench/pipelock/internal/redact"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+)
+
+// ResponseScanOptions carries per-server suppression context for stdio MCP
+// response scanning. It mirrors GenericSSEScanOptions (the SSE transport) so
+// the stdio transport reaches suppression parity: an operator can suppress a
+// named response-scan pattern for a specific MCP server's responses without
+// weakening scanning for any other server. The zero value preserves prior
+// (no-suppression) behavior, so existing callers are unaffected.
+type ResponseScanOptions struct {
+	// Target identifies the MCP server's response surface for suppress-rule
+	// matching, e.g. "mcp://code-assistant/response". Empty disables target-scoped
+	// suppression (an empty target matches no path-scoped suppress entry).
+	Target string
+	// Suppress holds the operator's suppress rules (config Suppress list).
+	Suppress []config.SuppressEntry
+	// ActionOverride is the effective MCP response-scan action for this server.
+	// Empty preserves scanner.ResponseAction() for diagnostic callers; the
+	// runtime proxy sets this from the fail-closed trust class decision.
+	ActionOverride string
+	// TrustClass is the effective response trust class used for operator logs.
+	// Empty is treated as untrusted.
+	TrustClass string
+	// OnDroppedDLP receives a deliberately non-enforced inbound DLP match.
+	// Runtime callers connect it to audit and metrics; nil preserves diagnostic
+	// scan behavior and can never affect the verdict.
+	OnDroppedDLP func(scanner.TextDLPMatch, string)
+	// OnSuppressedResponse receives a response-scanning match removed by a
+	// destination-scoped suppression. It is observational only.
+	OnSuppressedResponse func(scanner.ResponseMatch)
+
+	// OnObservedCoreResponse receives a core-floor finding that a declared
+	// operator exception downgraded from block to observe. It is separate from
+	// OnSuppressedResponse because ordinary suppression cannot reach the
+	// immutable floor, so the two must stay distinguishable in evidence.
+	OnObservedCoreResponse func(scanner.ObservedCoreMatch)
+}
+
+// ScanResponse parses a single JSON-RPC 2.0 response and scans its text
+// content for prompt injection and enforceable inbound DLP. Parse errors produce
+// a verdict with Clean=false and the Error field set. Both result content and
+// error messages are scanned. Server notifications (method+params, no id) are
+// also scanned. Batch responses (JSON arrays) are detected and each element
+// scanned individually.
+func ScanResponse(line []byte, sc *scanner.Scanner) jsonrpc.ScanVerdict {
+	return ScanResponseOpts(line, sc, ResponseScanOptions{})
+}
+
+// ScanResponseInjection parses an MCP response and scans only for prompt
+// injection. Callers that separately scan outbound DLP with a contextual warn
+// hook use this to avoid emitting an unscoped duplicate DLP warning.
+func ScanResponseInjection(line []byte, sc *scanner.Scanner) jsonrpc.ScanVerdict {
+	return scanResponseOpts(line, sc, ResponseScanOptions{}, false)
+}
+
+// ScanResponseOpts is ScanResponse with per-server suppression context. The
+// stdio MCP forwarding path passes the server's Target and the operator's
+// Suppress rules so a response-scan false positive can be remediated for one
+// server without a global config change. ScanResponse delegates here with an
+// empty options value (no suppression).
+func ScanResponseOpts(line []byte, sc *scanner.Scanner, opts ResponseScanOptions) jsonrpc.ScanVerdict {
+	return scanResponseOpts(line, sc, opts, true)
+}
+
+func scanResponseOpts(line []byte, sc *scanner.Scanner, opts ResponseScanOptions, includeDLP bool) jsonrpc.ScanVerdict {
+	trimmed := bytes.TrimSpace(line)
+	// Detect batch response (JSON-RPC 2.0 batch = JSON array).
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		verdict, _ := scanBatch(trimmed, sc, opts, includeDLP)
+		return verdict
+	}
+	if err := redact.NoDuplicateJSONKeys(trimmed); err != nil && redact.IsDuplicateKeyBlock(err) {
+		return jsonrpc.ScanVerdict{
+			ID:    recoverTopLevelJSONRPCID(trimmed),
+			Clean: false,
+			Error: fmt.Sprintf("duplicate JSON object key: %v", err),
+		}
+	}
+
+	var rpc jsonrpc.RPCResponse
+	if err := json.Unmarshal(trimmed, &rpc); err != nil {
+		return jsonrpc.ScanVerdict{Clean: false, Error: fmt.Sprintf("invalid JSON: %v", err)}
+	}
+
+	if rpc.JSONRPC != jsonrpc.Version {
+		return jsonrpc.ScanVerdict{
+			ID:    rpc.ID,
+			Clean: false,
+			Error: fmt.Sprintf("not a JSON-RPC 2.0 response: jsonrpc=%q", rpc.JSONRPC),
+		}
+	}
+
+	// Extract text from result (handles standard ToolResult and arbitrary shapes).
+	// An injection-only scan never consults the numeric channel, so it also
+	// skips building one: a message can be megabytes, and walking it a second
+	// time for a channel nobody reads is pure cost.
+	extract := jsonrpc.ExtractTextResult
+	if !includeDLP {
+		extract = jsonrpc.ExtractTextOnlyResult
+	}
+	textResult := extract(rpc.Result)
+	if textResult.Truncated {
+		return jsonrpc.ScanVerdict{ID: rpc.ID, Clean: false, Error: uninspectableJSONDepthReason}
+	}
+	text := textResult.Text
+	// Numeric leaves travel on their own channel and are only ever compared
+	// against known values (canaries, configured secrets); they never join
+	// text, which feeds the injection cascade and pattern DLP.
+	numeric := textResult.Numeric
+
+	// Also scan error messages for prompt injection.
+	// Attackers can inject via error.message and error.data returned by malicious
+	// tool servers. Falls back to recursive string extraction for non-standard
+	// error shapes (e.g., plain string error), matching the Result field pattern.
+	if len(rpc.Error) > 0 && string(rpc.Error) != jsonrpc.Null {
+		var rpcErr jsonrpc.RPCError
+		if err := json.Unmarshal(rpc.Error, &rpcErr); err == nil && rpcErr.Message != "" {
+			if text != "" {
+				text += "\n"
+			}
+			text += rpcErr.Message
+			// Also scan error.data if present.
+			errData := extract(rpcErr.Data)
+			if errData.Truncated {
+				return jsonrpc.ScanVerdict{ID: rpc.ID, Clean: false, Error: uninspectableJSONDepthReason}
+			}
+			if errData.Text != "" {
+				text += "\n" + errData.Text
+			}
+			numeric = joinNumericChannel(numeric, errData.Numeric)
+		} else {
+			// Fallback: extract all strings from non-standard error shapes.
+			errText := extract(rpc.Error)
+			if errText.Truncated {
+				return jsonrpc.ScanVerdict{ID: rpc.ID, Clean: false, Error: uninspectableJSONDepthReason}
+			}
+			if errText.Text != "" {
+				if text != "" {
+					text += "\n"
+				}
+				text += errText.Text
+			}
+			numeric = joinNumericChannel(numeric, errText.Numeric)
+		}
+	}
+
+	// Scan notification params for injection content.
+	// MCP server notifications (method+params, no id) can carry payloads.
+	if len(rpc.Params) > 0 && string(rpc.Params) != jsonrpc.Null {
+		paramsText := extract(rpc.Params)
+		if paramsText.Truncated {
+			return jsonrpc.ScanVerdict{ID: rpc.ID, Clean: false, Error: uninspectableJSONDepthReason}
+		}
+		if paramsText.Text != "" {
+			if text != "" {
+				text += "\n"
+			}
+			text += paramsText.Text
+		}
+		numeric = joinNumericChannel(numeric, paramsText.Numeric)
+	}
+
+	if text == "" && (!includeDLP || numeric == "") {
+		return jsonrpc.ScanVerdict{ID: rpc.ID, Clean: true}
+	}
+
+	// An all-numeric response has nothing for the injection scanner; it is
+	// treated as a clean response scan and only the numeric channel runs.
+	result := scanner.ResponseScanResult{Clean: true}
+	if text != "" {
+		result = sc.ScanResponseWithSuppress(context.Background(), text, opts.Target, opts.Suppress)
+	}
+	for _, match := range result.SuppressedMatches {
+		if opts.OnSuppressedResponse != nil {
+			opts.OnSuppressedResponse(match)
+		}
+	}
+	for _, observed := range result.ObservedCoreMatches {
+		if opts.OnObservedCoreResponse != nil {
+			opts.OnObservedCoreResponse(observed)
+		}
+	}
+	var dlpMatches []scanner.TextDLPMatch
+	if includeDLP {
+		if text != "" {
+			var lowConfidence []scanner.TextDLPMatch
+			dlpMatches, lowConfidence = scanner.PartitionInboundTextDLPMatches(text, sc.ScanTextForDLPInbound(context.Background(), text).Matches)
+			for _, match := range lowConfidence {
+				if opts.OnDroppedDLP != nil {
+					opts.OnDroppedDLP(match, "low_confidence")
+				}
+			}
+		}
+		dlpMatches = append(dlpMatches, sc.ScanNumericChannelForKnownValues(numeric)...)
+	}
+	if result.Failed() {
+		return jsonrpc.ScanVerdict{ID: rpc.ID, Action: config.ActionBlock, Error: "response scan failed: " + result.ScanError}
+	}
+	if result.Clean && len(dlpMatches) == 0 {
+		return jsonrpc.ScanVerdict{ID: rpc.ID, Clean: true}
+	}
+
+	return jsonrpc.ScanVerdict{
+		ID:         rpc.ID,
+		Clean:      false,
+		Action:     responseScanAction(sc, opts),
+		Matches:    result.Matches,
+		DLPMatches: dlpMatches,
+	}
+}
+
+// responseScanAction resolves the effective response-scan action. A per-server
+// trust override may only make scanning stricter than the section action, never
+// weaker, so the override is clamped against it rather than replacing it. The
+// callers that build the override clamp it too; this is the enforcement-side
+// backstop, and clamping twice is idempotent.
+func responseScanAction(sc *scanner.Scanner, opts ResponseScanOptions) string {
+	sectionAction := sc.ResponseAction()
+	if opts.ActionOverride == "" {
+		return sectionAction
+	}
+	return config.StricterAction(opts.ActionOverride, sectionAction)
+}
+
+func responseScanTrustClass(opts ResponseScanOptions) string {
+	if opts.TrustClass != "" {
+		return opts.TrustClass
+	}
+	return config.ResponseTrustUntrusted
+}
+
+// ScanResponseDispatch scans an MCP response the way ForwardScanned does, so a
+// diagnostic caller (pipelock explain mcp-response) reports the same verdict the
+// runtime proxy would. When tool scanning is enabled and the response is a
+// tools/list payload, the tool-description fields are scanned by the dedicated
+// tool scanner (not the injection scanner), so only the non-tool sibling fields
+// go through response scanning here; otherwise the full response is scanned.
+// Per-server suppression applies in both paths. ForwardScanned implements the
+// equivalent dispatch inline (it computes isToolsList via tools.ScanTools, which
+// also drives provenance/baseline side effects this read-only path omits).
+func ScanResponseDispatch(line []byte, sc *scanner.Scanner, toolScanning bool, opts ResponseScanOptions) jsonrpc.ScanVerdict {
+	if !toolScanning {
+		return ScanResponseOpts(line, sc, opts)
+	}
+	switch shape, _ := toolsListShape(line); shape {
+	case toolsListScannable:
+		return scanToolsListNonToolFields(line, sc, opts)
+	case toolsListUninspectable:
+		// This path excludes tool text from injection scanning because the tool
+		// scanner is expected to read it. When the array cannot be read, saying
+		// nothing would report a diagnostic clean over definitions no scanner
+		// looked at, which is the same gap the stream path fails closed on.
+		verdict := scanToolsListNonToolFields(line, sc, opts)
+		if verdict.Error != "" {
+			return verdict
+		}
+		verdict.Clean = false
+		verdict.Unscanned = appendUniqueScanScopes(verdict.Unscanned, []string{jsonrpc.ScanScopeToolScanning})
+		return verdict
+	}
+	return ScanResponseOpts(line, sc, opts)
+}
+
+// scanToolsListCertified scans a tools/list response the way the runtime
+// proxy's full pipeline does: sibling fields (error, params, non-tools result
+// keys) go through response scanning, and tool definitions go through the
+// dedicated tool-definition scanner (poisoning + drift), which is the only
+// scanner precise enough to catch instruction-tag and file-exfiltration
+// wording in a tool description without false-positiving on ordinary
+// capability text.
+//
+// toolCfg == nil means tool scanning is unavailable (operator explicitly
+// disabled mcp_tool_scanning). The verdict then reports Unscanned instead of
+// silently certifying the tool-definition text clean: a diagnostic caller
+// that never ran the tool scanner must not claim it did.
+func scanToolsListCertified(line []byte, sc *scanner.Scanner, toolCfg *tools.ToolScanConfig, opts ResponseScanOptions) jsonrpc.ScanVerdict {
+	if toolCfg == nil {
+		// No dedicated tool scanner available (operator explicitly disabled
+		// mcp_tool_scanning). Fall back to the pre-tool-scanning behavior -
+		// full-text response scanning that still covers the tool description
+		// text with the generic injection/DLP patterns - so this path is
+		// strictly additive to prior detection, never a regression. The
+		// verdict still reports Unscanned: the generic scanner is not the
+		// dedicated tool-poisoning/drift scanner and must not be credited as
+		// having run it.
+		verdict := ScanResponseOpts(line, sc, opts)
+		if verdict.Error != "" {
+			return verdict
+		}
+		verdict.Clean = false
+		verdict.Unscanned = append(verdict.Unscanned, jsonrpc.ScanScopeToolScanning)
+		return verdict
+	}
+
+	verdict := scanToolsListNonToolFields(line, sc, opts)
+	if verdict.Error != "" {
+		return verdict
+	}
+
+	result := tools.ScanTools(line, sc, toolCfg)
+	if result.ResourceLimit != "" {
+		// A tool-definition scan that cannot complete (uninspectable text,
+		// baseline capacity, epoch reset) is a failure to inspect, not a
+		// verified-clean result. Fail closed the same way the uninspectable-
+		// depth path above does: Error set, Clean false, no finding claimed.
+		// Keep what the sibling-field scan already found. A hostile response can
+		// carry an injection in result._meta and an oversized tool definition at
+		// once; reporting only the tool-scan error loses the finding, and a
+		// finding outranks an inspection failure.
+		return jsonrpc.ScanVerdict{
+			ID:         verdict.ID,
+			Clean:      false,
+			Action:     verdict.Action,
+			Matches:    verdict.Matches,
+			DLPMatches: verdict.DLPMatches,
+			Error:      "tool definition scan: " + result.ResourceLimit,
+		}
+	}
+
+	if len(result.Matches) == 0 {
+		return verdict
+	}
+
+	verdict.Clean = false
+	for _, m := range result.Matches {
+		verdict.ToolFindings = append(verdict.ToolFindings, jsonrpc.ToolFinding{
+			ToolName:   m.ToolName,
+			Matches:    m.Injection,
+			ToolPoison: m.ToolPoison,
+		})
+	}
+	if verdict.Action == "" {
+		verdict.Action = toolCfg.Action
+	} else {
+		verdict.Action = config.StricterAction(verdict.Action, toolCfg.Action)
+	}
+	return verdict
+}
+
+// isToolsListResponse reports whether line is a JSON-RPC response whose result
+// carries a valid "tools" array (the tools/list shape). It mirrors the
+// shape detection in internal/mcp/tools (isToolsListResult); kept here as a
+// lightweight check so the explain path need not run the full tool scanner.
+func isToolsListResponse(line []byte) bool {
+	shape, _ := toolsListShape(line)
+	return shape != toolsListNone
+}
+
+// toolsListShape classifies a line by its "tools" array. The distinction is
+// security-relevant: a response CARRYING a tools array is a tools/list response
+// whatever its elements look like, and one whose elements are not all objects
+// cannot be handed to the tool-definition scanner. Collapsing those two into a
+// single false made a mixed-type array fall through to the generic scanner,
+// which returned clean:true over a poisoned tool description because the
+// poisoning patterns live only in the tool scanner.
+type toolsListKind int
+
+const (
+	// toolsListNone: no tools array, so this is not a tools/list response.
+	toolsListNone toolsListKind = iota
+	// toolsListScannable: every element is an object; the tool scanner can run.
+	toolsListScannable
+	// toolsListUninspectable: a tools array the tool scanner cannot read.
+	toolsListUninspectable
+)
+
+func toolsListShape(line []byte) (toolsListKind, json.RawMessage) {
+	var rpc jsonrpc.RPCResponse
+	if json.Unmarshal(line, &rpc) != nil || len(rpc.Result) == 0 || string(rpc.Result) == jsonrpc.Null {
+		return toolsListNone, nil
+	}
+	var probe struct {
+		Tools json.RawMessage `json:"tools"`
+	}
+	if json.Unmarshal(rpc.Result, &probe) != nil {
+		return toolsListNone, nil
+	}
+	toolsRaw := bytes.TrimSpace(probe.Tools)
+	if len(toolsRaw) == 0 || toolsRaw[0] != '[' {
+		return toolsListNone, rpc.ID
+	}
+	var elements []json.RawMessage
+	if json.Unmarshal(toolsRaw, &elements) != nil {
+		return toolsListUninspectable, rpc.ID
+	}
+	for _, element := range elements {
+		element = bytes.TrimSpace(element)
+		if len(element) == 0 || element[0] != '{' {
+			return toolsListUninspectable, rpc.ID
+		}
+	}
+	return toolsListScannable, rpc.ID
+}
+
+// scanToolsListNonToolFields scans a tools/list response for injection in
+// non-tool fields (error, params, and any sibling keys in result besides "tools").
+// Tool descriptions are scanned separately by the dedicated tool scanning
+// subsystem (internal/mcp/tools), so injection scanning skips result.tools to
+// avoid FPs from instructional text. Inbound DLP still scans result.tools:
+// credential patterns do not share that instructional-text false-positive class.
+// A malicious server can also inject into sibling fields like result.note or
+// result.cursor, so those remain in both scan inputs.
+func scanToolsListNonToolFields(line []byte, sc *scanner.Scanner, opts ResponseScanOptions) jsonrpc.ScanVerdict {
+	return scanToolsListNonToolFieldsContext(context.Background(), line, sc, opts)
+}
+
+func scanToolsListNonToolFieldsContext(ctx context.Context, line []byte, sc *scanner.Scanner, opts ResponseScanOptions) jsonrpc.ScanVerdict {
+	trimmed := bytes.TrimSpace(line)
+	if err := redact.NoDuplicateJSONKeys(trimmed); err != nil && redact.IsDuplicateKeyBlock(err) {
+		return jsonrpc.ScanVerdict{
+			ID:    recoverTopLevelJSONRPCID(trimmed),
+			Clean: false,
+			Error: fmt.Sprintf("duplicate JSON object key: %v", err),
+		}
+	}
+
+	var rpc jsonrpc.RPCResponse
+	if err := json.Unmarshal(trimmed, &rpc); err != nil {
+		return jsonrpc.ScanVerdict{Clean: false, Error: fmt.Sprintf("invalid JSON: %v", err)}
+	}
+
+	if rpc.JSONRPC != jsonrpc.Version {
+		return jsonrpc.ScanVerdict{
+			ID:    rpc.ID,
+			Clean: false,
+			Error: fmt.Sprintf("not a JSON-RPC 2.0 response: jsonrpc=%q", rpc.JSONRPC),
+		}
+	}
+
+	var text, toolText, numeric string
+
+	// Scan non-"tools" sibling fields in the result object.
+	// A malicious server can include extra fields alongside tools[].
+	// Keys are sorted for deterministic concatenation order.
+	if len(rpc.Result) > 0 && string(rpc.Result) != jsonrpc.Null {
+		var resultMap map[string]json.RawMessage
+		if json.Unmarshal(rpc.Result, &resultMap) == nil {
+			keys := make([]string, 0, len(resultMap))
+			for k := range resultMap {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, key := range keys {
+				if key == "tools" {
+					extracted := jsonrpc.ExtractTextResult(resultMap[key])
+					if extracted.Truncated {
+						return jsonrpc.ScanVerdict{ID: rpc.ID, Clean: false, Error: uninspectableJSONDepthReason}
+					}
+					toolText = extracted.Text
+					numeric = joinNumericChannel(numeric, extracted.Numeric)
+					continue
+				}
+				siblingText := jsonrpc.ExtractTextResult(resultMap[key])
+				if siblingText.Truncated {
+					return jsonrpc.ScanVerdict{ID: rpc.ID, Clean: false, Error: uninspectableJSONDepthReason}
+				}
+				if siblingText.Text != "" {
+					if text != "" {
+						text += "\n"
+					}
+					text += siblingText.Text
+				}
+				numeric = joinNumericChannel(numeric, siblingText.Numeric)
+			}
+		}
+	}
+
+	// Scan error field (injection can hide in error messages).
+	if len(rpc.Error) > 0 && string(rpc.Error) != jsonrpc.Null {
+		var rpcErr jsonrpc.RPCError
+		if err := json.Unmarshal(rpc.Error, &rpcErr); err == nil && rpcErr.Message != "" {
+			if text != "" {
+				text += "\n"
+			}
+			text += rpcErr.Message
+			errData := jsonrpc.ExtractTextResult(rpcErr.Data)
+			if errData.Truncated {
+				return jsonrpc.ScanVerdict{ID: rpc.ID, Clean: false, Error: uninspectableJSONDepthReason}
+			}
+			if errData.Text != "" {
+				text += "\n" + errData.Text
+			}
+			numeric = joinNumericChannel(numeric, errData.Numeric)
+		} else {
+			errText := jsonrpc.ExtractTextResult(rpc.Error)
+			if errText.Truncated {
+				return jsonrpc.ScanVerdict{ID: rpc.ID, Clean: false, Error: uninspectableJSONDepthReason}
+			}
+			if errText.Text != "" {
+				if text != "" {
+					text += "\n"
+				}
+				text += errText.Text
+			}
+			numeric = joinNumericChannel(numeric, errText.Numeric)
+		}
+	}
+
+	// Scan params (server notifications can carry payloads).
+	if len(rpc.Params) > 0 && string(rpc.Params) != jsonrpc.Null {
+		paramsText := jsonrpc.ExtractTextResult(rpc.Params)
+		if paramsText.Truncated {
+			return jsonrpc.ScanVerdict{ID: rpc.ID, Clean: false, Error: uninspectableJSONDepthReason}
+		}
+		if paramsText.Text != "" {
+			if text != "" {
+				text += "\n"
+			}
+			text += paramsText.Text
+		}
+		numeric = joinNumericChannel(numeric, paramsText.Numeric)
+	}
+
+	dlpText := text
+	if toolText != "" {
+		if dlpText != "" {
+			dlpText += "\n"
+		}
+		dlpText += toolText
+	}
+
+	if text == "" && dlpText == "" && numeric == "" {
+		return jsonrpc.ScanVerdict{ID: rpc.ID, Clean: true}
+	}
+
+	result := scanner.ResponseScanResult{Clean: true}
+	if text != "" {
+		result = sc.ScanResponseWithSuppress(ctx, text, opts.Target, opts.Suppress)
+	}
+	if result.Failed() {
+		return jsonrpc.ScanVerdict{ID: rpc.ID, Action: config.ActionBlock, Error: "response scan failed: " + result.ScanError}
+	}
+	for _, match := range result.SuppressedMatches {
+		if opts.OnSuppressedResponse != nil {
+			opts.OnSuppressedResponse(match)
+		}
+	}
+	for _, observed := range result.ObservedCoreMatches {
+		if opts.OnObservedCoreResponse != nil {
+			opts.OnObservedCoreResponse(observed)
+		}
+	}
+	var dlpMatches []scanner.TextDLPMatch
+	if dlpText != "" {
+		var lowConfidence []scanner.TextDLPMatch
+		dlpMatches, lowConfidence = scanner.PartitionInboundTextDLPMatches(dlpText, sc.ScanTextForDLPInbound(context.Background(), dlpText).Matches)
+		for _, match := range lowConfidence {
+			if opts.OnDroppedDLP != nil {
+				opts.OnDroppedDLP(match, "low_confidence")
+			}
+		}
+	}
+	dlpMatches = append(dlpMatches, sc.ScanNumericChannelForKnownValues(numeric)...)
+	if result.Clean && len(dlpMatches) == 0 {
+		return jsonrpc.ScanVerdict{ID: rpc.ID, Clean: true}
+	}
+
+	return jsonrpc.ScanVerdict{
+		ID:         rpc.ID,
+		Clean:      false,
+		Action:     responseScanAction(sc, opts),
+		Matches:    result.Matches,
+		DLPMatches: dlpMatches,
+	}
+}
+
+// scanBatch scans a JSON-RPC 2.0 batch response (array of responses).
+// Returns a combined verdict aggregating matches from all elements. The
+// suppression options apply to every element so a per-server suppress rule
+// covers batched responses too.
+func scanBatch(line []byte, sc *scanner.Scanner, opts ResponseScanOptions, includeDLP bool) (jsonrpc.ScanVerdict, bool) {
+	var batch []json.RawMessage
+	if err := json.Unmarshal(line, &batch); err != nil {
+		return jsonrpc.ScanVerdict{Clean: false, Error: fmt.Sprintf("invalid JSON batch: %v", err)}, false
+	}
+
+	return scanBatchElements(batch, func(elem []byte) jsonrpc.ScanVerdict {
+		return scanResponseOpts(elem, sc, opts, includeDLP)
+	})
+}
+
+// scanBatchElements preserves element scan outcomes while aggregating a batch.
+func scanBatchElements(batch []json.RawMessage, scan func([]byte) jsonrpc.ScanVerdict) (jsonrpc.ScanVerdict, bool) {
+	if len(batch) == 0 {
+		return jsonrpc.ScanVerdict{Clean: true}, false
+	}
+
+	var allMatches []scanner.ResponseMatch
+	var allDLPMatches []scanner.TextDLPMatch
+	var allToolFindings []jsonrpc.ToolFinding
+	var allUnscanned []string
+	var firstID json.RawMessage
+	var action string
+	var hasError bool
+	var firstError string
+	var errorAction string
+
+	for _, elem := range batch {
+		v := scan(elem)
+		if firstID == nil && len(v.ID) > 0 {
+			firstID = v.ID
+		}
+		if v.Error != "" {
+			hasError = true
+			if v.Action == config.ActionBlock {
+				errorAction = config.ActionBlock
+			}
+			if firstError == "" {
+				firstError = v.Error
+			}
+		}
+		if !v.Clean && v.Error == "" {
+			allMatches = append(allMatches, v.Matches...)
+			allDLPMatches = append(allDLPMatches, v.DLPMatches...)
+			allToolFindings = append(allToolFindings, v.ToolFindings...)
+			allUnscanned = appendUniqueScanScopes(allUnscanned, v.Unscanned)
+			if v.Action != "" {
+				if action == "" {
+					action = v.Action
+				} else {
+					action = config.StricterAction(action, v.Action)
+				}
+			}
+		}
+	}
+
+	if hasError {
+		return jsonrpc.ScanVerdict{ID: firstID, Clean: false, Action: errorAction, Error: firstError}, len(allMatches) > 0 || len(allDLPMatches) > 0 || len(allToolFindings) > 0
+	}
+	if len(allMatches) == 0 && len(allDLPMatches) == 0 && len(allToolFindings) == 0 && len(allUnscanned) == 0 {
+		return jsonrpc.ScanVerdict{ID: firstID, Clean: true}, false
+	}
+	return jsonrpc.ScanVerdict{
+		ID: firstID, Clean: false, Action: action, Matches: allMatches, DLPMatches: allDLPMatches,
+		ToolFindings: allToolFindings, Unscanned: allUnscanned,
+	}, len(allMatches) > 0 || len(allDLPMatches) > 0 || len(allToolFindings) > 0
+}
+
+func appendUniqueScanScopes(scopes, additions []string) []string {
+	for _, addition := range additions {
+		found := false
+		for _, scope := range scopes {
+			if scope == addition {
+				found = true
+				break
+			}
+		}
+		if !found {
+			scopes = append(scopes, addition)
+		}
+	}
+	return scopes
+}
+
+// ScanStreamResult scans a stream and reports security findings and malformed
+// input separately.
+//
+// The two are different answers and must not share one. A line this command
+// could not fully inspect was not verified clean, so reporting it alongside
+// verified-clean input tells a caller the opposite of the truth. Callers that
+// gate on process status need to distinguish "nothing was found" from
+// "something could not be looked at".
+//
+// toolCfg, when non-nil, routes tools/list responses through the dedicated
+// tool-definition scanner (poisoning + drift) in addition to response
+// scanning, matching the runtime proxy's pipeline. A nil toolCfg means tool
+// scanning is unavailable; a tools/list response then reports Unscanned
+// instead of a false Clean=true.
+func ScanStreamResult(r io.Reader, w io.Writer, sc *scanner.Scanner, jsonOutput bool, toolCfg *tools.ToolScanConfig) (found, malformed bool, err error) {
+	reader := bufio.NewReaderSize(r, 64*1024)
+
+	foundFinding := false
+	sawMalformed := false
+	lineNum := 0
+
+	for {
+		raw, overLimit, readErr := readBoundedLine(reader, transport.MaxLineSize)
+		if len(raw) == 0 && !overLimit && readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return foundFinding, sawMalformed, fmt.Errorf("reading input: %w", readErr)
+		}
+		lineNum++
+
+		// An over-limit record was drained rather than ending the stream. Ending
+		// it would let an upstream prepend one oversized record to stop every
+		// later line from being inspected, which downgrades a real finding after
+		// it into a bad-input result and destroys the exit-status distinction
+		// this function exists to provide.
+		if overLimit {
+			sawMalformed = true
+			verdict := jsonrpc.ScanVerdict{
+				Line:  lineNum,
+				Clean: false,
+				Error: fmt.Sprintf("line exceeds the %d byte scan limit and was not inspected", transport.MaxLineSize),
+			}
+			if writeErr := emitVerdict(w, verdict, jsonOutput); writeErr != nil {
+				return foundFinding, sawMalformed, writeErr
+			}
+			if readErr != nil && !errors.Is(readErr, io.EOF) {
+				return foundFinding, sawMalformed, fmt.Errorf("reading input: %w", readErr)
+			}
+			continue
+		}
+
+		line := strings.TrimSpace(string(raw))
+		if line == "" {
+			if readErr != nil && !errors.Is(readErr, io.EOF) {
+				return foundFinding, sawMalformed, fmt.Errorf("reading input: %w", readErr)
+			}
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			continue
+		}
+
+		verdict, lineFound := scanStreamResponse([]byte(line), sc, toolCfg)
+		verdict.Line = lineNum
+		verdict.Scanned = scanVerdictScopes([]byte(line), toolCfg, verdict)
+
+		// An Unscanned field family (e.g. tool scanning explicitly disabled)
+		// is not a protocol error, but the line still was not fully
+		// inspected, so it must share the malformed exit path rather than
+		// the clean one - unless it also carries a real finding, which
+		// lineFound already reports and which must win (a finding outranks
+		// an inspection gap, matching the Error case immediately above).
+		if verdict.Error != "" || (len(verdict.Unscanned) > 0 && !lineFound) {
+			sawMalformed = true
+		}
+		if lineFound {
+			foundFinding = true
+		}
+
+		if writeErr := emitVerdict(w, verdict, jsonOutput); writeErr != nil {
+			return foundFinding, sawMalformed, writeErr
+		}
+
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return foundFinding, sawMalformed, fmt.Errorf("reading input: %w", readErr)
+		}
+	}
+
+	return foundFinding, sawMalformed, nil
+}
+
+// readBoundedLine reads one newline-terminated record, capped at limit bytes.
+//
+// A record longer than the cap is DRAINED to its newline and reported as
+// over-limit, so the stream continues. bufio.Scanner cannot do this: it fails
+// permanently on an over-long token, which would let one oversized record
+// suppress inspection of everything after it.
+//
+// Returns the record without its newline, whether it exceeded the cap, and any
+// read error. A final record without a trailing newline is returned with io.EOF.
+func readBoundedLine(r *bufio.Reader, limit int) (line []byte, overLimit bool, err error) {
+	var buf []byte
+	// During accumulation the terminator has not necessarily arrived yet:
+	// ReadSlice can hand back "\r" at the end of one fragment and "\n" at the
+	// start of the next, so a per-fragment terminator test misclassifies a legal
+	// CRLF record sitting exactly on the boundary. Accumulate against a two-byte
+	// grace, which is the longest terminator, and make the exact decision once the
+	// whole record is in hand. The grace bounds memory; the final check bounds the
+	// record.
+	const maxTerminator = 2
+	for {
+		chunk, readErr := r.ReadSlice('\n')
+		if len(buf)+len(chunk) > limit+maxTerminator {
+			overLimit = true
+			// Keep draining to the newline so the next read starts at a record
+			// boundary rather than mid-record.
+			buf = nil
+		} else if !overLimit {
+			buf = append(buf, chunk...)
+		}
+		if errors.Is(readErr, bufio.ErrBufferFull) {
+			continue
+		}
+		// The record is complete. Decide against its content length, with the
+		// terminator removed, so LF and CRLF senders get the same maximum.
+		record := trimTrailingNewline(buf)
+		if !overLimit && len(record) > limit {
+			overLimit = true
+			record = nil
+		}
+		if readErr != nil {
+			return record, overLimit, readErr
+		}
+		return record, overLimit, nil
+	}
+}
+
+func trimTrailingNewline(b []byte) []byte {
+	b = bytes.TrimSuffix(b, []byte("\n"))
+	return bytes.TrimSuffix(b, []byte("\r"))
+}
+
+func emitVerdict(w io.Writer, verdict jsonrpc.ScanVerdict, jsonOutput bool) error {
+	if !jsonOutput {
+		return writeTextVerdict(w, verdict)
+	}
+	data, err := json.Marshal(verdict)
+	if err != nil {
+		return fmt.Errorf("marshaling verdict: %w", err)
+	}
+	data = append(data, '\n')
+	if _, err := w.Write(data); err != nil {
+		return fmt.Errorf("writing verdict: %w", err)
+	}
+	return nil
+}
+
+// scanStreamResponse returns the regular stream verdict and whether any
+// successfully inspected batch element contained a security finding. A batch
+// parse error still owns the public verdict so callers retain the existing
+// fail-closed parse semantics, while the stream result preserves a sibling
+// finding for its exit-status contract.
+func scanStreamResponse(line []byte, sc *scanner.Scanner, toolCfg *tools.ToolScanConfig) (jsonrpc.ScanVerdict, bool) {
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var batch []json.RawMessage
+		if err := json.Unmarshal(trimmed, &batch); err != nil {
+			return jsonrpc.ScanVerdict{Clean: false, Error: fmt.Sprintf("invalid JSON batch: %v", err)}, false
+		}
+		return scanBatchElements(batch, func(elem []byte) jsonrpc.ScanVerdict {
+			verdict, _ := scanStreamResponse(elem, sc, toolCfg)
+			return verdict
+		})
+	}
+
+	switch shape, id := toolsListShape(line); shape {
+	case toolsListScannable:
+		verdict := scanToolsListCertified(line, sc, toolCfg, ResponseScanOptions{})
+		found := !verdict.Clean && verdict.Error == "" && (len(verdict.Matches) > 0 || len(verdict.DLPMatches) > 0 || len(verdict.ToolFindings) > 0)
+		return verdict, found
+	case toolsListUninspectable:
+		// A tools array the tool scanner cannot read. Scan the sibling fields
+		// and the text as usual, then report the tool definitions as
+		// uninspected. Falling through to the generic scanner instead reported
+		// clean:true over a poisoned tool description, because the poisoning
+		// patterns live only in the tool scanner.
+		verdict := ScanResponse(line, sc)
+		if verdict.Error != "" {
+			return verdict, false
+		}
+		if len(verdict.ID) == 0 {
+			verdict.ID = id
+		}
+		verdict.Clean = false
+		verdict.Unscanned = appendUniqueScanScopes(verdict.Unscanned, []string{jsonrpc.ScanScopeToolScanning})
+		return verdict, len(verdict.Matches) > 0 || len(verdict.DLPMatches) > 0
+	}
+
+	verdict := ScanResponse(line, sc)
+	return verdict, !verdict.Clean && verdict.Error == ""
+}
+
+func scanVerdictScopes(line []byte, toolCfg *tools.ToolScanConfig, verdict jsonrpc.ScanVerdict) []string {
+	// An incomplete scan completed no scope. Listing response injection and DLP
+	// on an error verdict claims two checks finished when the line was never
+	// fully inspected.
+	if verdict.Error != "" {
+		return nil
+	}
+	scopes := []string{jsonrpc.ScanScopeResponseInjection, jsonrpc.ScanScopeResponseDLP}
+	if toolCfg != nil && hasScannableToolsList(line) {
+		scopes = append(scopes, jsonrpc.ScanScopeToolScanning)
+	}
+	return scopes
+}
+
+// hasScannableToolsList reports whether the line carries a tools/list the tool
+// scanner could actually read. It gates the tool_scanning SCOPE, which claims a
+// completed check, so an array the scanner cannot read must not satisfy it.
+func hasScannableToolsList(line []byte) bool {
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var batch []json.RawMessage
+		if json.Unmarshal(trimmed, &batch) != nil {
+			return false
+		}
+		for _, elem := range batch {
+			if shape, _ := toolsListShape(elem); shape == toolsListScannable {
+				return true
+			}
+		}
+		return false
+	}
+	shape, _ := toolsListShape(trimmed)
+	return shape == toolsListScannable
+}
+
+// A2AResponseOpts groups A2A-specific dependencies for response scanning.
+// All fields are nil-safe: when nil, A2A response scanning is skipped.
+type A2AResponseOpts struct {
+	Cfg      *config.A2AScanning
+	Baseline *CardBaseline
+	// OnCardDriftAdopted observes a benign descriptive Agent Card change that
+	// was accepted as the new baseline. It must not change the scan verdict:
+	// adoption remains clean, while the transport records the audit event.
+	OnCardDriftAdopted func()
+	// CardKey identifies the Agent Card origin for drift detection.
+	// Used for GetExtendedAgentCard / agent/getAuthenticatedExtendedCard
+	// responses and for card-shaped results when the method is unknown.
+	CardKey cardCacheKey
+	// Method is the JSON-RPC method from the corresponding request.
+	// When non-empty, allows precise A2A response routing without
+	// relying on response shape heuristics.
+	Method string
+	// ScanOpts is the per-server suppression context used when A2A
+	// scanning is disabled or the response is ordinary MCP traffic.
+	// The zero value preserves ScanResponse (no suppression) behavior.
+	ScanOpts ResponseScanOptions
+}
+
+// ScanResponseA2A scans a JSON-RPC 2.0 response with optional A2A-aware
+// routing. When a2aOpts is non-nil and the response matches an A2A method
+// (by tracked method name or response shape), field-aware A2A scanning runs
+// instead of generic text extraction. Falls back to ScanResponseOpts for
+// non-A2A traffic or when A2A scanning is disabled so per-server suppression
+// stays in effect on the generic path.
+func ScanResponseA2A(line []byte, sc *scanner.Scanner, a2aOpts *A2AResponseOpts) jsonrpc.ScanVerdict {
+	// Nil-safe: no A2A config means standard MCP scanning.
+	if a2aOpts == nil || a2aOpts.Cfg == nil || !a2aOpts.Cfg.Enabled {
+		return a2aFallbackScan(line, sc, a2aOpts)
+	}
+
+	// Route by tracked method name when available (most precise). Without
+	// request correlation, only a complete Agent Card shape is specific enough
+	// to use A2A scanning: ordinary MCP responses can also carry task-like
+	// status and history fields, and must retain their response policy.
+	isA2A := a2aOpts.Method != "" && IsA2AMethod(a2aOpts.Method)
+	if !isA2A {
+		isA2A = isAgentCardResultShape(line)
+	}
+	if isA2A {
+		if verdict, batch := validateA2AResponseEnvelope(line); batch {
+			return a2aFallbackScan(line, sc, a2aOpts)
+		} else if !verdict.Clean {
+			return verdict
+		}
+		return scanA2AResponseDispatch(line, sc, a2aOpts)
+	}
+
+	return a2aFallbackScan(line, sc, a2aOpts)
+}
+
+// validateA2AResponseEnvelope preserves the JSON-RPC gate shared by generic
+// MCP response scanning before a field-aware A2A scanner handles the result.
+// It reports a batch separately because ScanResponseOpts owns element-wise
+// batch validation and routing.
+func validateA2AResponseEnvelope(line []byte) (jsonrpc.ScanVerdict, bool) {
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		return jsonrpc.ScanVerdict{}, true
+	}
+	if err := redact.NoDuplicateJSONKeys(trimmed); err != nil && redact.IsDuplicateKeyBlock(err) {
+		return jsonrpc.ScanVerdict{
+			ID:    recoverTopLevelJSONRPCID(trimmed),
+			Clean: false,
+			Error: fmt.Sprintf("duplicate JSON object key: %v", err),
+		}, false
+	}
+	var rpc jsonrpc.RPCResponse
+	if err := json.Unmarshal(trimmed, &rpc); err != nil {
+		return jsonrpc.ScanVerdict{Clean: false, Error: fmt.Sprintf("invalid JSON: %v", err)}, false
+	}
+	if rpc.JSONRPC != jsonrpc.Version {
+		return jsonrpc.ScanVerdict{
+			ID:    rpc.ID,
+			Clean: false,
+			Error: fmt.Sprintf("not a JSON-RPC 2.0 response: jsonrpc=%q", rpc.JSONRPC),
+		}, false
+	}
+	return jsonrpc.ScanVerdict{ID: rpc.ID, Clean: true}, false
+}
+
+func a2aFallbackScan(line []byte, sc *scanner.Scanner, a2aOpts *A2AResponseOpts) jsonrpc.ScanVerdict {
+	if a2aOpts == nil {
+		return ScanResponseOpts(line, sc, ResponseScanOptions{})
+	}
+	return ScanResponseOpts(line, sc, a2aOpts.ScanOpts)
+}
+
+// scanA2AResponseDispatch routes an A2A response through the appropriate
+// scanner based on method type and result shape. Card methods and card-shaped
+// results always take the Agent Card path so signature and drift checks cannot
+// be skipped by omitting a tracked method or by a case-folded method name.
+func scanA2AResponseDispatch(line []byte, sc *scanner.Scanner, a2aOpts *A2AResponseOpts) jsonrpc.ScanVerdict {
+	rpcID := extractRPCID(line)
+
+	if isAgentCardMethod(a2aOpts.Method) || isAgentCardResultShape(line) {
+		return scanAgentCardRPCResponse(line, sc, a2aOpts, rpcID)
+	}
+
+	// All other A2A methods: field-aware body scanning.
+	result := ScanA2AResponseBody(context.Background(), line, sc, a2aOpts.Cfg)
+	return a2aScanToVerdict(rpcID, result)
+}
+
+func scanAgentCardRPCResponse(line []byte, sc *scanner.Scanner, a2aOpts *A2AResponseOpts, rpcID json.RawMessage) jsonrpc.ScanVerdict {
+	var rpc jsonrpc.RPCResponse
+	if err := json.Unmarshal(line, &rpc); err != nil {
+		return jsonrpc.ScanVerdict{Clean: false, Error: fmt.Sprintf("invalid JSON: %v", err)}
+	}
+	// Scan error payloads: a malicious server can inject content via
+	// error.message and error.data. Don't skip scanning just because
+	// the response is an error instead of a result.
+	if len(rpc.Error) > 0 && string(rpc.Error) != jsonrpc.Null {
+		errResult := ScanA2AResponseBody(context.Background(), line, sc, a2aOpts.Cfg)
+		return a2aScanToVerdict(rpcID, errResult)
+	}
+	if len(rpc.Result) == 0 || string(rpc.Result) == jsonrpc.Null {
+		return jsonrpc.ScanVerdict{ID: rpcID, Clean: true}
+	}
+	cardResult := ScanAgentCard(
+		context.Background(), rpc.Result, sc,
+		a2aOpts.Baseline, a2aOpts.CardKey, a2aOpts.Cfg,
+	)
+	if cardResult.DriftAdopted && a2aOpts.OnCardDriftAdopted != nil {
+		a2aOpts.OnCardDriftAdopted()
+	}
+	return agentCardToVerdict(rpcID, cardResult, a2aOpts.Cfg)
+}
+
+// isA2AResponseShape returns true if the JSON-RPC result object has fields
+// characteristic of A2A protocol responses (task with status/artifacts/history,
+// or an Agent Card shape with skills/supportedInterfaces).
+func isA2AResponseShape(line []byte) bool {
+	fields, ok := a2aResultObjectFields(line)
+	if !ok {
+		return false
+	}
+	return isA2ATaskFields(fields) || isAgentCardFields(fields)
+}
+
+func isAgentCardResultShape(line []byte) bool {
+	fields, ok := a2aResultObjectFields(line)
+	return ok && isAgentCardFields(fields)
+}
+
+func a2aResultObjectFields(line []byte) (map[string]json.RawMessage, bool) {
+	var probe struct {
+		Result json.RawMessage `json:"result"`
+	}
+	if json.Unmarshal(line, &probe) != nil || len(probe.Result) == 0 {
+		return nil, false
+	}
+	var resultFields map[string]json.RawMessage
+	if json.Unmarshal(probe.Result, &resultFields) != nil {
+		return nil, false
+	}
+	return resultFields, true
+}
+
+func isA2ATaskFields(resultFields map[string]json.RawMessage) bool {
+	_, hasStatus := resultFields["status"]
+	_, hasArtifacts := resultFields["artifacts"]
+	_, hasHistory := resultFields["history"]
+	return hasStatus && (hasArtifacts || hasHistory)
+}
+
+func isAgentCardFields(resultFields map[string]json.RawMessage) bool {
+	_, hasSkills := resultFields["skills"]
+	_, hasInterfaces := resultFields["supportedInterfaces"]
+	return hasSkills && hasInterfaces
+}
+
+// a2aScanToVerdict converts an A2AScanResult into a jsonrpc.ScanVerdict
+// for use in the standard response forwarding pipeline.
+func a2aScanToVerdict(rpcID json.RawMessage, result A2AScanResult) jsonrpc.ScanVerdict {
+	if result.ScanError != "" {
+		return jsonrpc.ScanVerdict{ID: rpcID, Action: config.ActionBlock, Error: "response scan failed: " + result.ScanError}
+	}
+	if result.Clean {
+		return jsonrpc.ScanVerdict{ID: rpcID, Clean: true}
+	}
+
+	var matches []scanner.ResponseMatch
+	// Promote injection findings directly.
+	matches = append(matches, result.InjectFindings...)
+	// Wrap URL findings as ResponseMatch for the verdict.
+	for _, u := range result.URLFindings {
+		matches = append(matches, scanner.ResponseMatch{
+			PatternName: u.Reason,
+		})
+	}
+	// Wrap DLP findings as ResponseMatch for the verdict.
+	for _, d := range result.DLPFindings {
+		matches = append(matches, scanner.ResponseMatch{
+			PatternName: d.PatternName,
+		})
+	}
+	if result.EntropyFinding != nil {
+		matches = append(matches, scanner.ResponseMatch{
+			PatternName: scanner.AuditBodyEntropy,
+		})
+	}
+
+	return jsonrpc.ScanVerdict{
+		ID:      rpcID,
+		Clean:   false,
+		Action:  result.Action,
+		Matches: matches,
+	}
+}
+
+// agentCardToVerdict converts an AgentCardScanResult into a jsonrpc.ScanVerdict.
+func agentCardToVerdict(rpcID json.RawMessage, result AgentCardScanResult, cfg *config.A2AScanning) jsonrpc.ScanVerdict {
+	verdict := a2aScanToVerdict(rpcID, result.Findings)
+	if verdict.Error != "" {
+		return verdict
+	}
+	if result.Clean {
+		return jsonrpc.ScanVerdict{ID: rpcID, Clean: true}
+	}
+
+	action := result.Action
+	if action == "" && cfg != nil {
+		action = cfg.Action
+	}
+
+	var matches []scanner.ResponseMatch
+	if result.BaselineCapacityExceeded {
+		matches = append(matches, scanner.ResponseMatch{
+			PatternName: "a2a_card_baseline_capacity",
+		})
+	}
+	if result.DriftDetected {
+		matches = append(matches, scanner.ResponseMatch{
+			PatternName: "a2a_card_drift",
+		})
+	}
+	// Include field-level findings from the card scan.
+	matches = append(matches, verdict.Matches...)
+
+	return jsonrpc.ScanVerdict{
+		ID:      rpcID,
+		Clean:   false,
+		Action:  action,
+		Matches: matches,
+	}
+}
+
+// writeTextVerdict writes a human-readable verdict to w.
+// Clean lines produce no output; only findings are reported.
+func writeTextVerdict(w io.Writer, v jsonrpc.ScanVerdict) error {
+	if v.Clean {
+		return nil
+	}
+
+	if v.Error != "" {
+		_, err := fmt.Fprintf(w, "line %d: [ERROR] %s\n", v.Line, v.Error) //nolint:gosec // G705: CLI output, not web
+		return err
+	}
+
+	names := make([]string, 0, len(v.Matches)+len(v.DLPMatches)+len(v.ToolFindings))
+	for _, m := range v.Matches {
+		names = append(names, m.PatternName)
+	}
+	for _, m := range v.DLPMatches {
+		names = append(names, m.PatternName)
+	}
+	for _, tf := range v.ToolFindings {
+		for _, m := range tf.Matches {
+			names = append(names, tf.ToolName+":"+m.PatternName)
+		}
+		for _, p := range tf.ToolPoison {
+			names = append(names, tf.ToolName+":"+p)
+		}
+		// A drift-only finding carries neither, and the scan still reports the
+		// line as not clean. Naming the tool keeps text mode from printing
+		// nothing for a line the JSON verdict flags.
+		if len(tf.Matches) == 0 && len(tf.ToolPoison) == 0 && tf.ToolName != "" {
+			names = append(names, tf.ToolName+":definition changed")
+		}
+	}
+
+	if len(names) == 0 {
+		// No matches: this is not a finding, either an uninspected-field
+		// notice or an inert verdict this branch does not otherwise print.
+		if len(v.Unscanned) > 0 {
+			_, err := io.WriteString(w, fmt.Sprintf("line %d: [UNSCANNED] %s not inspected\n", v.Line, strings.Join(v.Unscanned, ", ")))
+			return err
+		}
+		return nil
+	}
+
+	kind := "INJECTION"
+	if len(v.DLPMatches) > 0 {
+		kind = "DLP"
+		if len(v.Matches) > 0 {
+			kind = "SECURITY FINDING"
+		}
+	}
+	if len(v.ToolFindings) > 0 {
+		kind = "TOOL POISON"
+		if len(v.Matches) > 0 || len(v.DLPMatches) > 0 {
+			kind = "SECURITY FINDING"
+		}
+	}
+	_, err := io.WriteString(w, fmt.Sprintf("line %d: [%s] %s (action: %s)\n", v.Line, kind, strings.Join(names, ", "), v.Action))
+	return err
+}
+
+// ProvenanceVerdict holds the outcome of provenance verification on a
+// tools/list response, including per-tool results for logging in warn mode.
+type ProvenanceVerdict struct {
+	// Block is true when the response should be blocked.
+	Block bool
+	// Action is the configured provenance action ("block" or "warn").
+	Action string
+	// Results contains per-tool verification outcomes.
+	Results []provenance.VerificationResult
+	// Error describes why blocking was triggered (empty when clean or warn-only).
+	Error string
+}
+
+// VerifyToolsListProvenance runs cryptographic provenance verification on a
+// tools/list response. It maps config.MCPToolProvenance to provenance.VerifyConfig,
+// calls provenance.VerifyToolsList, and returns a ProvenanceVerdict.
+//
+// Returns a clean verdict (Block=false, nil Results) when cfg is nil or disabled.
+// Parse errors and verification failures follow fail-closed semantics.
+func VerifyToolsListProvenance(response []byte, cfg *config.MCPToolProvenance) ProvenanceVerdict {
+	if cfg == nil || !cfg.Enabled {
+		return ProvenanceVerdict{}
+	}
+
+	vcfg, err := mapProvenanceConfig(cfg)
+	if err != nil {
+		return ProvenanceVerdict{
+			Block:  true,
+			Action: cfg.Action,
+			Error:  fmt.Sprintf("provenance config error: %v", err),
+		}
+	}
+
+	results, err := provenance.VerifyToolsList(response, vcfg)
+	if err != nil {
+		// Fail closed: unparseable tools/list response blocks.
+		return ProvenanceVerdict{
+			Block:  true,
+			Action: cfg.Action,
+			Error:  fmt.Sprintf("provenance verification error: %v", err),
+		}
+	}
+
+	if len(results) == 0 {
+		// No tools in response - nothing to verify.
+		return ProvenanceVerdict{
+			Action:  cfg.Action,
+			Results: results,
+		}
+	}
+
+	shouldBlock, blockErr := provenance.ShouldBlock(results, cfg.Action)
+	verdict := ProvenanceVerdict{
+		Block:   shouldBlock,
+		Action:  cfg.Action,
+		Results: results,
+	}
+	if blockErr != nil {
+		verdict.Error = blockErr.Error()
+	}
+	return verdict
+}
+
+// provenancePatternName is the pattern name used in ScanVerdict matches
+// for provenance verification failures.
+const provenancePatternName = "mcp_tool_provenance"
+
+// ProvenanceVerdictToScanVerdict converts a ProvenanceVerdict into a
+// jsonrpc.ScanVerdict for use in the standard response forwarding pipeline.
+// The rpcID is extracted from the original response for correlation.
+func ProvenanceVerdictToScanVerdict(pv ProvenanceVerdict, rpcID json.RawMessage) jsonrpc.ScanVerdict {
+	if !pv.Block {
+		return jsonrpc.ScanVerdict{ID: rpcID, Clean: true}
+	}
+
+	var matches []scanner.ResponseMatch
+	for _, r := range pv.Results {
+		if r.Status == provenance.StatusFailed || r.Status == provenance.StatusError ||
+			(r.Status == provenance.StatusUnsigned && pv.Action == config.ActionBlock) {
+			matches = append(matches, scanner.ResponseMatch{
+				PatternName: provenancePatternName,
+				MatchText:   fmt.Sprintf("%s: %s (%s)", r.ToolName, r.Status, r.Detail),
+			})
+		}
+	}
+
+	return jsonrpc.ScanVerdict{
+		ID:      rpcID,
+		Clean:   false,
+		Action:  pv.Action,
+		Matches: matches,
+	}
+}
+
+// mapProvenanceConfig converts config.MCPToolProvenance to provenance.VerifyConfig.
+// TrustedKeys are hex-encoded Ed25519 public keys; each is used as both the
+// key ID and the decoded key value.
+func mapProvenanceConfig(cfg *config.MCPToolProvenance) (provenance.VerifyConfig, error) {
+	vcfg := provenance.VerifyConfig{
+		Mode:        cfg.Mode,
+		OfflineOnly: cfg.OfflineOnly,
+	}
+
+	if len(cfg.TrustedKeys) > 0 {
+		vcfg.TrustedKeys = make(map[string]ed25519.PublicKey, len(cfg.TrustedKeys))
+		for _, hexKey := range cfg.TrustedKeys {
+			raw, err := hex.DecodeString(hexKey)
+			if err != nil {
+				return provenance.VerifyConfig{}, fmt.Errorf("decoding trusted key %q: %w", hexKey, err)
+			}
+			if len(raw) != ed25519.PublicKeySize {
+				return provenance.VerifyConfig{}, fmt.Errorf(
+					"trusted key %q: invalid length %d, want %d",
+					hexKey, len(raw), ed25519.PublicKeySize,
+				)
+			}
+			vcfg.TrustedKeys[hexKey] = ed25519.PublicKey(raw)
+		}
+	}
+
+	return vcfg, nil
+}
+
+// joinNumericChannel concatenates two numeric channels with the same comma
+// separator the extractor uses, so a known value split by the JSON-RPC
+// envelope boundary (result versus error data) is still one contiguous run.
+func joinNumericChannel(existing, more string) string {
+	switch {
+	case more == "":
+		return existing
+	case existing == "":
+		return more
+	default:
+		return existing + "," + more
+	}
+}
