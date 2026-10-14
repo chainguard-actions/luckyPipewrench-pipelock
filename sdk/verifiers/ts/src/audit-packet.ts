@@ -1,0 +1,266 @@
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Apache-2.0
+
+import type { AuditPacket, AuditPacketReport, ChainResult, Receipt, Totals } from "./types.js";
+import { computeTotals, evidenceChainKey, verifyChain } from "./chain.js";
+import { analyzeLifecycle } from "./lifecycle.js";
+import { extractTypedReceipts, selectReceiptChain } from "./recorder.js";
+import { validateAuditPacket } from "./schema.js";
+import {
+  decodeUTF8,
+  readVerifierBytes,
+  rejectDuplicateKeys,
+  resolveArtifactPath,
+  resolvePacketPath,
+  resolveSignerKey,
+  sha256Hex,
+} from "./util.js";
+
+export interface AuditPacketOptions {
+  signerKey: string;
+  // signerKeys is the trusted key set (each a hex key or key file), used
+  // instead of signerKey when non-empty, as repeated --key flags give it.
+  signerKeys?: string[];
+  offline: boolean;
+  allowSelfConsistentOnly: boolean;
+  noTrustRequired: boolean;
+  expectSha256: string;
+}
+
+const zeroTotals: Totals = {
+  allow: 0,
+  block: 0,
+  warn: 0,
+  ask: 0,
+  strip: 0,
+  forward: 0,
+  redirect: 0,
+  other: 0,
+};
+
+function reportFromPacket(packetPath: string, packet?: AuditPacket): AuditPacketReport {
+  return {
+    path: packetPath,
+    verdict: packet?.verifier?.verdict ?? "",
+    trusted: packet?.verifier?.trusted ?? false,
+    valid: false,
+    summary: {
+      receipt_count: packet?.summary?.receipt_count ?? 0,
+      totals: { ...zeroTotals, ...(packet?.summary?.totals ?? {}) },
+    },
+    posture: {
+      enforcement_mode: packet?.posture?.enforcement_mode ?? "",
+      unsupported_paths: packet?.posture?.unsupported_paths ?? [],
+    },
+    run: {
+      provider: packet?.run?.provider ?? "",
+      repository: packet?.run?.repository,
+      sha: packet?.run?.sha,
+      agent_identity: packet?.run?.agent_identity ?? "",
+    },
+    schema_check: "skipped",
+    chain_check: "skipped",
+    cross_check: "skipped",
+    lifecycle_assessment: "not_assessed",
+    lifecycle_assessment_reason: "chain re-verification did not complete",
+  };
+}
+
+function pushError(report: AuditPacketReport, message: string): void {
+  report.errors = [...(report.errors ?? []), message];
+}
+
+function trustVerdict(packet: AuditPacket, opts: AuditPacketOptions): boolean {
+  if (opts.noTrustRequired) return true;
+  switch (packet.verifier?.verdict) {
+    case "valid":
+      return packet.verifier.trusted === true;
+    case "self_consistent_only":
+      return opts.allowSelfConsistentOnly;
+    default:
+      return false;
+  }
+}
+
+function crossCheck(packet: AuditPacket, chain: ChainResult, receipts: Receipt[]): string[] {
+  const errors: string[] = [];
+  const receiptCount = packet.summary?.receipt_count ?? -1;
+  if (chain.receipt_count !== receiptCount) {
+    errors.push(
+      `chain receipt_count ${chain.receipt_count} != packet.summary.receipt_count ${receiptCount}`,
+    );
+  }
+  const expectedTotals = computeTotals(receipts);
+  const gotTotals = { ...zeroTotals, ...(packet.summary?.totals ?? {}) };
+  for (const key of Object.keys(expectedTotals).sort() as (keyof Totals)[]) {
+    if (expectedTotals[key] !== gotTotals[key]) {
+      errors.push(`totals[${key}]: chain=${expectedTotals[key]} packet=${gotTotals[key]}`);
+    }
+  }
+  if (packet.verifier?.root_hash && packet.verifier.root_hash !== chain.root_hash) {
+    errors.push(`root_hash mismatch: chain=${chain.root_hash} packet=${packet.verifier.root_hash}`);
+  }
+  if (packet.verifier?.final_seq !== undefined && packet.verifier.final_seq !== chain.final_seq) {
+    errors.push(
+      `final_seq mismatch: chain=${chain.final_seq} packet=${String(packet.verifier?.final_seq)}`,
+    );
+  }
+  switch (packet.verifier?.verdict) {
+    case "valid":
+    case "self_consistent_only":
+      if (!chain.valid) {
+        errors.push(`verdict=${packet.verifier.verdict} but chain rejected: ${chain.error ?? ""}`);
+      }
+      break;
+    case "invalid":
+      if (chain.valid) errors.push("verdict=invalid but chain re-verified successfully");
+      break;
+  }
+  return errors;
+}
+
+// withoutClaimedTrust keeps a failed verification from repeating the
+// packet's own trust claim. The report starts with the packet's verdict and
+// trusted fields, so any failure after that point would otherwise report
+// "verdict: valid, trusted: true" beside an INVALID result. A report that is
+// not valid never claims trust, and a success verdict becomes invalid. A
+// successful report and the offline report are unchanged.
+function withoutClaimedTrust(report: AuditPacketReport): AuditPacketReport {
+  if (report.valid) return report;
+  report.trusted = false;
+  if (report.verdict === "valid" || report.verdict === "self_consistent_only") {
+    report.verdict = "invalid";
+  }
+  return report;
+}
+
+export async function verifyAuditPacket(
+  target: string,
+  opts: AuditPacketOptions,
+): Promise<AuditPacketReport> {
+  return withoutClaimedTrust(await verifyAuditPacketReport(target, opts));
+}
+
+async function verifyAuditPacketReport(
+  target: string,
+  opts: AuditPacketOptions,
+): Promise<AuditPacketReport> {
+  const { packetPath, baseDir } = resolvePacketPath(target);
+  const rawPacket = readVerifierBytes(packetPath);
+  const report = reportFromPacket(packetPath);
+
+  if (opts.expectSha256 !== "") {
+    const got = sha256Hex(rawPacket);
+    const want = opts.expectSha256.trim().toLowerCase();
+    if (got !== want) {
+      pushError(report, `packet sha256 mismatch: got ${got}, want ${want}`);
+      return report;
+    }
+  }
+
+  let packet: AuditPacket;
+  try {
+    const packetText = decodeUTF8(rawPacket, "packet json");
+    // Reject duplicate object keys before parsing, matching the Go verifier and
+    // the receipt path. Last-wins parsing would otherwise let this verifier
+    // accept a packet the Go verifier rejects, resolving the duplicate to the
+    // attacker's second value.
+    rejectDuplicateKeys(packetText);
+    packet = JSON.parse(packetText) as AuditPacket;
+  } catch (err) {
+    pushError(report, `packet json: ${(err as Error).message}`);
+    return report;
+  }
+  Object.assign(report, reportFromPacket(packetPath, packet));
+  if (opts.offline) {
+    report.verdict = "";
+    report.trusted = false;
+  }
+
+  const schemaErrors = validateAuditPacket(packet);
+  if (schemaErrors.length > 0) {
+    report.schema_check = "fail";
+    for (const err of schemaErrors) pushError(report, `schema: ${err}`);
+    return report;
+  }
+  report.schema_check = "pass";
+
+  if (opts.offline) {
+    report.lifecycle_assessment_reason = "offline mode skips chain re-verification";
+    report.verdict = "schema_checked_trust_unverified";
+    report.trusted = false;
+    report.valid = false;
+    pushError(report, "schema checked, trust unverified: chain and signer were not verified");
+    return report;
+  }
+
+  let receipts: Receipt[];
+  let chain: ChainResult;
+  let otherChainError: string | undefined;
+  try {
+    const evidencePath = resolveArtifactPath(baseDir, packet.artifacts?.evidence ?? "");
+    const typed = extractTypedReceipts(evidencePath);
+    receipts = selectReceiptChain(typed);
+    const listed = (opts.signerKeys ?? []).filter((key) => key.trim() !== "");
+    let keyInput = listed.length > 0 ? "" : opts.signerKey;
+    if (listed.length === 0 && keyInput.trim() === "") {
+      const packetKey = packet.verifier?.signer_key ?? "";
+      if (opts.expectSha256.trim() !== "" || opts.noTrustRequired) {
+        keyInput = packetKey;
+      } else if (
+        packet.verifier?.verdict === "self_consistent_only" &&
+        opts.allowSelfConsistentOnly
+      ) {
+        keyInput = packetKey;
+      } else {
+        throw new Error("trusted Audit Packet verification requires --key or --expect-sha256");
+      }
+    }
+    const keyHex =
+      listed.length > 0
+        ? listed.map((key) => resolveSignerKey(key)).join(",")
+        : resolveSignerKey(keyInput);
+    const primaryKey = typed.action.length === 0 ? evidenceChainKey(keyHex, receipts) : keyHex;
+    chain = await verifyChain(receipts, primaryKey, {
+      allowUnpinned: opts.allowSelfConsistentOnly,
+    });
+    // The evidence file of a current run holds an ActionReceipt v1 chain and
+    // an EvidenceReceipt v2 chain, each signed on its own. The packet's counts
+    // and root describe the first; the second must verify too, or a forged
+    // decision record in it would sit behind a trusted verdict.
+    if (typed.action.length > 0 && typed.evidence.length > 0) {
+      const other = await verifyChain(typed.evidence, evidenceChainKey(keyHex, typed.evidence), {
+        allowUnpinned: opts.allowSelfConsistentOnly,
+      });
+      if (!other.valid) {
+        otherChainError = `evidence receipt chain: ${other.error ?? "verification failed"}`;
+      }
+    }
+  } catch (err) {
+    report.chain_check = "fail";
+    pushError(report, `chain: ${(err as Error).message}`);
+    return report;
+  }
+  if (otherChainError !== undefined) {
+    chain = { ...chain, valid: false, error: otherChainError };
+  }
+  report.chain_check = chain.valid ? "pass" : "fail";
+  if (!chain.valid) pushError(report, `chain: ${chain.error ?? "verification failed"}`);
+  const lifecycle = analyzeLifecycle(receipts, chain);
+  report.lifecycle_status = lifecycle.status;
+  report.lifecycle_reason = lifecycle.reason;
+  report.lifecycle_assessment = "assessed";
+  delete report.lifecycle_assessment_reason;
+
+  const crossErrors = crossCheck(packet, chain, receipts);
+  if (crossErrors.length > 0) {
+    report.cross_check = "fail";
+    for (const err of crossErrors) pushError(report, `cross-check: ${err}`);
+    return report;
+  }
+  report.cross_check = "pass";
+  report.valid = chain.valid && lifecycle.status !== "BROKEN" && trustVerdict(packet, opts);
+  if (lifecycle.status === "BROKEN") pushError(report, `lifecycle: ${lifecycle.reason}`);
+  if (!report.valid) pushError(report, "packet not trusted");
+  return report;
+}

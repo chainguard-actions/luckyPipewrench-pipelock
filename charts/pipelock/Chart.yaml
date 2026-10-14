@@ -1,0 +1,54 @@
+apiVersion: v2
+name: pipelock
+description: Agent firewall for AI agents. Network scanning, process containment, and tool policy enforcement.
+type: application
+# The chart version tracks the Pipelock version it deploys, and the release
+# gate enforces that both equal the release tag. The chart publishes to an
+# OCI registry under this version as the tag, so a version that did not move
+# every release would overwrite the previously published chart in place.
+version: 3.7.0
+appVersion: "3.7.0"
+home: https://pipelab.org
+sources:
+  - https://github.com/luckyPipewrench/pipelock
+maintainers:
+  - name: Josh Waldrep
+    url: https://github.com/luckyPipewrench
+keywords:
+  - ai-security
+  - agent-firewall
+  - mcp
+  - dlp
+  - prompt-injection
+  - egress-control
+icon: https://raw.githubusercontent.com/luckyPipewrench/pipelock/main/assets/pipelock-logo.svg
+annotations:
+  # This is the license of THE CHART, not of the application it deploys, and
+  # Artifact Hub requires a single SPDX identifier here rather than an
+  # expression. These templates live outside enterprise/, so NOTICE puts them
+  # under Apache-2.0. The deployed image is dual-licensed and says so where a
+  # consumer of the image will actually look: the org.opencontainers.image
+  # labels on the image itself, and the Homebrew formula for the binary.
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/containsSecurityUpdates: "true"
+  artifacthub.io/changesURL: https://github.com/luckyPipewrench/pipelock/releases
+  artifacthub.io/links: |
+    - name: Documentation
+      url: https://pipelab.org/learn/
+    - name: Release notes
+      url: https://github.com/luckyPipewrench/pipelock/releases
+    - name: Receipt verifier (Python)
+      url: https://github.com/luckyPipewrench/pipelock-verify-python
+  artifacthub.io/changes: |
+    - kind: changed
+      description: Pipelock appVersion 3.7.0. Parallel signed receipt chains use group openings, closes and complete-history verification; exact clean-text caching reduces receipt scanning cost within its documented detection bounds.
+    - kind: added
+      description: Exact destination grants authorize host-and-port pairs while retaining content and protected-address checks.
+    - kind: added
+      description: Cooperative pipelock exec launch, filesystem grants for host containment, kernel-observed local MCP service identities and per-tool credential-request acknowledgments.
+    - kind: changed
+      description: A valid receipt prefix without a proven end exits 3; clean reports use schema version 2, and compatible verifiers are required for parallel groups and recovery seals.
+    - kind: security
+      description: Schema-bound JSON key validation, preserved replay and revocation state, runtime socket isolation and required durable receipts before covered effects.
+    - kind: fixed
+      description: Stream truncation, receipt rotation and per-chain evidence health, browser-visible media inspection, and MCP protocol negotiation and clean upstream refusals.

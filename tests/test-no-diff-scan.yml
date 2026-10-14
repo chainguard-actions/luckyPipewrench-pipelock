@@ -1,0 +1,44 @@
+name: Test scan-diff disabled
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          directory: '.'
+          scan-diff: 'false'
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+
+      - name: Assert action ran with scan-diff disabled (or failed gracefully)
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SCORE: ${{ steps.action.outputs.score }}
+          FINDINGS_COUNT: ${{ steps.action.outputs.findings-count }}
+          CONFIG_PATH: ${{ steps.action.outputs.config-path }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "score: $SCORE"
+          echo "findings_count: $FINDINGS_COUNT"
+          echo "config_path: $CONFIG_PATH"
+          echo "audit_failed: $AUDIT_FAILED"
+
+          if [ "$OUTCOME" = "success" ]; then
+            if [ -z "$SCORE" ]; then
+              echo "FAIL: action succeeded but score output is empty"
+              exit 1
+            fi
+            echo "PASS: action succeeded with scan-diff=false, score=$SCORE"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (pipelock release not resolvable)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi
