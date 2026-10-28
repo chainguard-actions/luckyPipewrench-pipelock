@@ -6,14 +6,14 @@ Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at
 
 ## Versions
 
-| Version | Tag | Upstream commit |
-|---------|-----|-----------------|
-| v3.0.0 | [`v3.0.0`](https://github.com/chainguard-actions/luckyPipewrench-pipelock/tree/v3.0.0) | [`9d2e37d`](https://github.com/luckyPipewrench/pipelock/commit/9d2e37d296359c38e599525a0424cdc189a812e1) |
-| v3.1.0 | [`v3.1.0`](https://github.com/chainguard-actions/luckyPipewrench-pipelock/tree/v3.1.0) | [`e8a396d`](https://github.com/luckyPipewrench/pipelock/commit/e8a396d244af27b1367e116fa22fc61246884ab3) |
-| v3.4.0 | [`v3.4.0`](https://github.com/chainguard-actions/luckyPipewrench-pipelock/tree/v3.4.0) | [`4c748ab`](https://github.com/luckyPipewrench/pipelock/commit/4c748ab986d611138ce202ab800b16eca6fb589f) |
-| v3.5.0 | [`v3.5.0`](https://github.com/chainguard-actions/luckyPipewrench-pipelock/tree/v3.5.0) | [`ca05ed0`](https://github.com/luckyPipewrench/pipelock/commit/ca05ed06f360f5aac5518ab6ea2b11d729b70bee) |
-| v3.6.0 | [`v3.6.0`](https://github.com/chainguard-actions/luckyPipewrench-pipelock/tree/v3.6.0) | [`3e868ac`](https://github.com/luckyPipewrench/pipelock/commit/3e868ac5d5b62d3a2790958542171143af8a0e38) |
-| v3.7.0 | [`v3.7.0`](https://github.com/chainguard-actions/luckyPipewrench-pipelock/tree/v3.7.0) | [`47c14c5`](https://github.com/luckyPipewrench/pipelock/commit/47c14c59b14f835f53971d22941b556f44f2baa0) |
+| Version | Tag | Upstream commit | Hardening report |
+|---------|-----|-----------------|------------------|
+| v3.0.0 | [`v3.0.0`](https://github.com/chainguard-actions/luckyPipewrench-pipelock/tree/v3.0.0) | [`9d2e37d`](https://github.com/luckyPipewrench/pipelock/commit/9d2e37d296359c38e599525a0424cdc189a812e1) | [`HARDENING.md`](https://github.com/chainguard-actions/luckyPipewrench-pipelock/blob/v3.0.0/HARDENING.md) |
+| v3.1.0 | [`v3.1.0`](https://github.com/chainguard-actions/luckyPipewrench-pipelock/tree/v3.1.0) | [`e8a396d`](https://github.com/luckyPipewrench/pipelock/commit/e8a396d244af27b1367e116fa22fc61246884ab3) | [`HARDENING.md`](https://github.com/chainguard-actions/luckyPipewrench-pipelock/blob/v3.1.0/HARDENING.md) |
+| v3.4.0 | [`v3.4.0`](https://github.com/chainguard-actions/luckyPipewrench-pipelock/tree/v3.4.0) | [`4c748ab`](https://github.com/luckyPipewrench/pipelock/commit/4c748ab986d611138ce202ab800b16eca6fb589f) | [`HARDENING.md`](https://github.com/chainguard-actions/luckyPipewrench-pipelock/blob/v3.4.0/HARDENING.md) |
+| v3.5.0 | [`v3.5.0`](https://github.com/chainguard-actions/luckyPipewrench-pipelock/tree/v3.5.0) | [`ca05ed0`](https://github.com/luckyPipewrench/pipelock/commit/ca05ed06f360f5aac5518ab6ea2b11d729b70bee) | [`HARDENING.md`](https://github.com/chainguard-actions/luckyPipewrench-pipelock/blob/v3.5.0/HARDENING.md) |
+| v3.6.0 | [`v3.6.0`](https://github.com/chainguard-actions/luckyPipewrench-pipelock/tree/v3.6.0) | [`3e868ac`](https://github.com/luckyPipewrench/pipelock/commit/3e868ac5d5b62d3a2790958542171143af8a0e38) | [`HARDENING.md`](https://github.com/chainguard-actions/luckyPipewrench-pipelock/blob/v3.6.0/HARDENING.md) |
+| v3.7.0 | [`v3.7.0`](https://github.com/chainguard-actions/luckyPipewrench-pipelock/tree/v3.7.0) | [`47c14c5`](https://github.com/luckyPipewrench/pipelock/commit/47c14c59b14f835f53971d22941b556f44f2baa0) | [`HARDENING.md`](https://github.com/chainguard-actions/luckyPipewrench-pipelock/blob/v3.7.0/HARDENING.md) |
 
 ## Privacy
 
