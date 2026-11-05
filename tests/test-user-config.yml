@@ -1,0 +1,50 @@
+name: Test user-provided config
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      RUNNER_TEMP: /tmp/pipelock-test-temp
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean scan target
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/pipelock-scan-clean"
+          echo "# Clean project" > "$GITHUB_WORKSPACE/pipelock-scan-clean/README.md"
+      - id: generate
+        uses: .
+        continue-on-error: true
+        with:
+          version: '3.7.1'
+          directory: pipelock-scan-clean
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+      - name: Copy generated config into workspace
+        env:
+          GEN: ${{ steps.generate.outputs.config-path }}
+        run: |
+          echo "generated: $GEN"
+          if [ -z "$GEN" ] || [ ! -f "$GEN" ]; then echo "FAIL: no generated config"; exit 1; fi
+          cp "$GEN" "$GITHUB_WORKSPACE/user-pipelock.yaml"
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          version: '3.7.1'
+          directory: pipelock-scan-clean
+          config: user-pipelock.yaml
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+      - name: Assert config-path is the user-provided path
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          ACTUAL: ${{ steps.action.outputs.config-path }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          echo "outcome: $OUTCOME config-path: $ACTUAL audit-failed: $AUDIT_FAILED"
+          if [ "$OUTCOME" != "success" ] && [ "$OUTCOME" != "failure" ]; then echo "FAIL: unexpected outcome"; exit 1; fi
+          if [ "$ACTUAL" != "user-pipelock.yaml" ]; then echo "FAIL: expected 'user-pipelock.yaml'"; exit 1; fi
+          if [ "$AUDIT_FAILED" != "false" ]; then echo "FAIL: audit-failed should be false"; exit 1; fi
+          pipelock check --config user-pipelock.yaml || { echo "FAIL: user config does not validate"; exit 1; }
+          echo "PASS"
